@@ -1292,7 +1292,7 @@ fn create_sandbox() {
     panic!("Sandboxing is not supported on Windows, iOS, ARM targets and android.");
 }
 
-enum UserAgent {
+pub enum UserAgent {
     Desktop,
     Android,
     OpenHarmony,
@@ -1304,7 +1304,7 @@ fn get_servo_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn default_user_agent_string_for(agent: UserAgent) -> String {
+pub fn default_user_agent_string_for(agent: UserAgent) -> String {
     let servo_version = get_servo_version();
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(target_env = "ohos")))]
