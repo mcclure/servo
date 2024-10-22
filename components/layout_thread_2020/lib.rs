@@ -34,7 +34,7 @@ use layout::query::{
     process_node_geometry_request, process_node_scroll_area_request, process_offset_parent_query,
     process_resolved_font_style_query, process_resolved_style_request, process_text_index_request,
 };
-use layout::traversal::RecalcStyle;
+use layout::traversal::{RecalcStyle, RecalcCuervo};
 use layout::{layout_debug, BoxTree, FragmentTree};
 use log::{debug, error, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -768,10 +768,10 @@ impl LayoutThread {
                 .unwrap()
         };
 
-        let traversal = RecalcStyle::new(layout_context);
+        let traversal = RecalcCuervo::new(layout_context);
         let token = {
             let shared = DomTraversal::<ServoLayoutElement>::shared_context(&traversal);
-            RecalcStyle::pre_traverse(dirty_root, shared)
+            RecalcCuervo::pre_traverse(dirty_root, shared)
         };
 
         if token.should_traverse() {
@@ -785,7 +785,28 @@ impl LayoutThread {
             let box_tree = &mut *box_tree;
             let mut build_box_tree = || {
                 if !BoxTree::update(traversal.context(), dirty_root) {
-                    *box_tree = Some(Arc::new(BoxTree::construct(traversal.context(), root_node)));
+                    {
+                        let text_vec = traversal.vec.read().unwrap();
+                        let mut whitespace = 0;
+                        eprintln!("*** TEXT NODES UPDATED:");
+                        for s in &*text_vec {
+                            if !s.is_empty() {
+                                if (s.trim().is_empty()) {
+                                    whitespace += 1;
+                                } else {
+                                    eprintln!("{}", s.trim_end());
+                                }
+                            }
+                        }
+                        if whitespace > 0 {
+                            eprintln!("*** DONE ({whitespace} whitespace nodes omitted)");
+                        } else {
+                            eprintln!("*** DONE");
+                        }
+                    }
+
+                    let tree = BoxTree::construct( traversal.context(), root_node);
+                    *box_tree = Some( Arc::new(tree));
                 }
             };
             if let Some(pool) = rayon_pool {

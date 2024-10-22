@@ -7,6 +7,7 @@ use style::context::{SharedStyleContext, StyleContext};
 use style::data::ElementData;
 use style::dom::{NodeInfo, TElement, TNode};
 use style::traversal::{recalc_style_at, DomTraversal, PerLevelTraversalData};
+use std::sync::RwLock;
 
 use crate::context::LayoutContext;
 use crate::dom::DOMLayoutData;
@@ -47,6 +48,73 @@ where
         unsafe {
             node.initialize_style_and_layout_data::<DOMLayoutData>();
             if !node.is_text_node() {
+                let el = node.as_element().unwrap();
+                let mut data = el.mutate_data().unwrap();
+                recalc_style_at(self, traversal_data, context, el, &mut data, note_child);
+                el.unset_dirty_descendants();
+            }
+        }
+    }
+
+    #[inline]
+    fn needs_postorder_traversal() -> bool {
+        false
+    }
+
+    fn process_postorder(&self, _style_context: &mut StyleContext<E>, _node: E::ConcreteNode) {
+        panic!("this should never be called")
+    }
+
+    fn text_node_needs_traversal(node: E::ConcreteNode, parent_data: &ElementData) -> bool {
+        node.layout_data().is_none() || !parent_data.damage.is_empty()
+    }
+
+    fn shared_context(&self) -> &SharedStyleContext {
+        &self.context.style_context
+    }
+}
+
+// Style walker that logs all text nodes as it goes.
+pub struct RecalcCuervo<'a> {
+    context: LayoutContext<'a>,
+    pub vec: RwLock<Vec<String>> // This is almost certainly the wrong way to do this, and will likely lead to text nodes loading in the wrong order.
+}
+
+impl<'a> RecalcCuervo<'a> {
+    pub fn new(context: LayoutContext<'a>) -> Self {
+        Self { context , vec:Default::default() }
+    }
+
+    pub fn context(&self) -> &LayoutContext<'a> {
+        &self.context
+    }
+
+    pub fn destroy(self) -> LayoutContext<'a> {
+        self.context
+    }
+}
+
+#[allow(unsafe_code)]
+impl<'a, 'dom, E> DomTraversal<E> for RecalcCuervo<'a>
+where
+    E: TElement,
+    E::ConcreteNode: 'dom + LayoutNode<'dom>,
+{
+    fn process_preorder<F>(
+        &self,
+        traversal_data: &PerLevelTraversalData,
+        context: &mut StyleContext<E>,
+        node: E::ConcreteNode,
+        note_child: F,
+    ) where
+        F: FnMut(E::ConcreteNode),
+    {
+        unsafe {
+            node.initialize_style_and_layout_data::<DOMLayoutData>();
+            if node.is_text_node() {
+                use script_layout_interface::wrapper_traits::ThreadSafeLayoutNode;
+                self.vec.write().unwrap().push(node.to_threadsafe().node_text_content().to_string());
+            } else {
                 let el = node.as_element().unwrap();
                 let mut data = el.mutate_data().unwrap();
                 recalc_style_at(self, traversal_data, context, el, &mut data, note_child);
