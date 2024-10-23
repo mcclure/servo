@@ -52,6 +52,8 @@ pub enum LayoutMsg {
     /// Requests that the constellation inform the compositor that it needs to record
     /// the time when the frame with the given ID (epoch) is painted.
     PendingPaintMetric(PipelineId, Epoch),
+    /// Special message for hacked Cuervo text browser
+    CuervoReportStrings(Vec<String>),
 }
 
 impl fmt::Debug for LayoutMsg {
@@ -60,6 +62,7 @@ impl fmt::Debug for LayoutMsg {
         let variant = match *self {
             IFrameSizes(..) => "IFrameSizes",
             PendingPaintMetric(..) => "PendingPaintMetric",
+            CuervoReportStrings(..) => "CuervoReportStrings"
         };
         write!(formatter, "LayoutMsg::{}", variant)
     }

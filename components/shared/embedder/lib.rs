@@ -218,6 +218,8 @@ pub enum EmbedderMsg {
     PlayGamepadHapticEffect(usize, GamepadHapticEffectType, IpcSender<bool>),
     /// Request to stop a haptic effect on a connected gamepad.
     StopGamepadHapticEffect(usize, IpcSender<bool>),
+    // Special message for hacked Cuervo text browser
+    CuervoReportStrings(Vec<String>),
 }
 
 /// The variant of CompositorEvent that was delivered to a pipeline.
@@ -274,6 +276,7 @@ impl Debug for EmbedderMsg {
             EmbedderMsg::EventDelivered(..) => write!(f, "HitTestedEvent"),
             EmbedderMsg::PlayGamepadHapticEffect(..) => write!(f, "PlayGamepadHapticEffect"),
             EmbedderMsg::StopGamepadHapticEffect(..) => write!(f, "StopGamepadHapticEffect"),
+            EmbedderMsg::CuervoReportStrings(..) => write!(f, "CuervoReportStrings")
         }
     }
 }

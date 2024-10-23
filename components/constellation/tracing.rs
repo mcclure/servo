@@ -90,8 +90,7 @@ mod from_compositor {
                 Self::SetWebViewThrottled(_, _) => target!("SetWebViewThrottled"),
                 Self::IMEDismissed => target!("IMEDismissed"),
                 Self::ReadyToPresent(..) => target!("ReadyToPresent"),
-                Self::Gamepad(..) => target!("Gamepad"),
-            }
+                Self::Gamepad(..) => target!("Gamepad"),            }
         }
     }
 
@@ -239,6 +238,7 @@ mod from_script {
                 Self::EventDelivered(..) => target_variant!("EventDelivered"),
                 Self::PlayGamepadHapticEffect(..) => target_variant!("PlayGamepadHapticEffect"),
                 Self::StopGamepadHapticEffect(..) => target_variant!("StopGamepadHapticEffect"),
+                Self::CuervoReportStrings(..) => target!("CuervoReportStrings"),
             }
         }
     }
@@ -258,6 +258,7 @@ mod from_layout {
             match self {
                 Self::IFrameSizes(..) => target!("IFrameSizes"),
                 Self::PendingPaintMetric(..) => target!("PendingPaintMetric"),
+                Self::CuervoReportStrings(..) => target!("CuervoReportStrings"),
             }
         }
     }

@@ -783,26 +783,17 @@ impl LayoutThread {
             let root_node = root_element.as_node();
             let mut box_tree = self.box_tree.borrow_mut();
             let box_tree = &mut *box_tree;
+            let closure_constellation_chan = self.constellation_chan.to_owned();
             let mut build_box_tree = || {
                 if !BoxTree::update(traversal.context(), dirty_root) {
                     {
-                        let text_vec = traversal.vec.read().unwrap();
-                        let mut whitespace = 0;
-                        eprintln!("*** TEXT NODES UPDATED:");
-                        for s in &*text_vec {
-                            if !s.is_empty() {
-                                if (s.trim().is_empty()) {
-                                    whitespace += 1;
-                                } else {
-                                    eprintln!("{}", s.trim_end());
-                                }
+                        let text_vec = traversal.vec.read().unwrap().clone();
+                        let msg = ConstellationMsg::CuervoReportStrings(text_vec);
+                        (move || { // Black magic to move closure_constellation_chan but not box_tree
+                            if let Err(e) = closure_constellation_chan.send(msg) {
+                                warn!("Sending event to constellation failed ({:?}).", e);
                             }
-                        }
-                        if whitespace > 0 {
-                            eprintln!("*** DONE ({whitespace} whitespace nodes omitted)");
-                        } else {
-                            eprintln!("*** DONE");
-                        }
+                        })();
                     }
 
                     let tree = BoxTree::construct( traversal.context(), root_node);
