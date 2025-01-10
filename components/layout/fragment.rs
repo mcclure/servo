@@ -26,13 +26,13 @@ use range::*;
 use script_layout_interface::wrapper_traits::{
     PseudoElementType, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
-use script_layout_interface::{HTMLCanvasData, HTMLCanvasDataSource, HTMLMediaData, SVGSVGData};
+use script_layout_interface::{
+    HTMLCanvasData, HTMLCanvasDataSource, HTMLMediaData, MediaFrame, SVGSVGData,
+};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use servo_url::ServoUrl;
-use size_of_test::size_of_test;
 use style::computed_values::border_collapse::T as BorderCollapse;
 use style::computed_values::box_sizing::T as BoxSizing;
-use style::computed_values::clear::T as Clear;
 use style::computed_values::color::T as Color;
 use style::computed_values::display::T as Display;
 use style::computed_values::mix_blend_mode::T as MixBlendMode;
@@ -167,11 +167,6 @@ pub struct Fragment {
     pub established_reference_frame: Option<ClipScrollNodeIndex>,
 }
 
-#[cfg(debug_assertions)]
-size_of_test!(Fragment, 176);
-#[cfg(not(debug_assertions))]
-size_of_test!(Fragment, 152);
-
 impl Serialize for Fragment {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut serializer = serializer.serialize_struct("fragment", 3)?;
@@ -225,8 +220,6 @@ pub enum SpecificFragmentInfo {
     /// Other fragments can only be totally truncated or not truncated at all.
     TruncatedFragment(Box<TruncatedFragmentInfo>),
 }
-
-size_of_test!(SpecificFragmentInfo, 24);
 
 impl SpecificFragmentInfo {
     fn restyle_damage(&self) -> RestyleDamage {
@@ -353,8 +346,10 @@ impl InlineAbsoluteFragmentInfo {
 #[derive(Clone)]
 pub enum CanvasFragmentSource {
     WebGL(ImageKey),
-    Image(Option<Arc<Mutex<IpcSender<CanvasMsg>>>>),
+    Image(Arc<Mutex<IpcSender<CanvasMsg>>>),
     WebGPU(ImageKey),
+    /// Transparent black
+    Empty,
 }
 
 #[derive(Clone)]
@@ -369,10 +364,11 @@ impl CanvasFragmentInfo {
     pub fn new(data: HTMLCanvasData) -> CanvasFragmentInfo {
         let source = match data.source {
             HTMLCanvasDataSource::WebGL(texture_id) => CanvasFragmentSource::WebGL(texture_id),
-            HTMLCanvasDataSource::Image(ipc_sender) => CanvasFragmentSource::Image(
-                ipc_sender.map(|renderer| Arc::new(Mutex::new(renderer))),
-            ),
+            HTMLCanvasDataSource::Image(ipc_sender) => {
+                CanvasFragmentSource::Image(Arc::new(Mutex::new(ipc_sender)))
+            },
             HTMLCanvasDataSource::WebGPU(image_key) => CanvasFragmentSource::WebGPU(image_key),
+            HTMLCanvasDataSource::Empty => CanvasFragmentSource::Empty,
         };
 
         CanvasFragmentInfo {
@@ -386,7 +382,7 @@ impl CanvasFragmentInfo {
 
 #[derive(Clone)]
 pub struct MediaFragmentInfo {
-    pub current_frame: Option<(webrender_api::ImageKey, i32, i32)>,
+    pub current_frame: Option<MediaFrame>,
 }
 
 impl MediaFragmentInfo {
@@ -959,8 +955,8 @@ impl Fragment {
             QuantitiesIncludedInIntrinsicInlineSizes::INTRINSIC_INLINE_SIZE_INCLUDES_MARGINS,
         ) {
             let margin = style.logical_margin();
-            MaybeAuto::from_style(margin.inline_start, Au(0)).specified_or_zero() +
-                MaybeAuto::from_style(margin.inline_end, Au(0)).specified_or_zero()
+            MaybeAuto::from_margin(margin.inline_start, Au(0)).specified_or_zero() +
+                MaybeAuto::from_margin(margin.inline_end, Au(0)).specified_or_zero()
         } else {
             Au(0)
         };
@@ -1041,13 +1037,9 @@ impl Fragment {
                     Au(0)
                 }
             },
-            SpecificFragmentInfo::Media(ref info) => {
-                if let Some((_, width, _)) = info.current_frame {
-                    Au::from_px(width)
-                } else {
-                    Au(0)
-                }
-            },
+            SpecificFragmentInfo::Media(ref info) => info
+                .current_frame
+                .map_or(Au(0), |frame| Au::from_px(frame.width)),
             SpecificFragmentInfo::Canvas(ref info) => info.dom_width,
             SpecificFragmentInfo::Svg(ref info) => info.dom_width,
             // Note: Currently for replaced element with no intrinsic size,
@@ -1071,13 +1063,9 @@ impl Fragment {
                     Au(0)
                 }
             },
-            SpecificFragmentInfo::Media(ref info) => {
-                if let Some((_, _, height)) = info.current_frame {
-                    Au::from_px(height)
-                } else {
-                    Au(0)
-                }
-            },
+            SpecificFragmentInfo::Media(ref info) => info
+                .current_frame
+                .map_or(Au(0), |frame| Au::from_px(frame.height)),
             SpecificFragmentInfo::Canvas(ref info) => info.dom_height,
             SpecificFragmentInfo::Svg(ref info) => info.dom_height,
             SpecificFragmentInfo::Iframe(_) => Au::from_px(DEFAULT_REPLACED_HEIGHT),
@@ -1271,10 +1259,10 @@ impl Fragment {
         let logical_padding = self.style.logical_padding();
         let border_width = self.border_width();
         SpeculatedInlineContentEdgeOffsets {
-            start: MaybeAuto::from_style(logical_margin.inline_start, Au(0)).specified_or_zero() +
+            start: MaybeAuto::from_margin(logical_margin.inline_start, Au(0)).specified_or_zero() +
                 logical_padding.inline_start.to_used_value(Au(0)) +
                 border_width.inline_start,
-            end: MaybeAuto::from_style(logical_margin.inline_end, Au(0)).specified_or_zero() +
+            end: MaybeAuto::from_margin(logical_margin.inline_end, Au(0)).specified_or_zero() +
                 logical_padding.inline_end.to_used_value(Au(0)) +
                 border_width.inline_end,
         }
@@ -1346,9 +1334,9 @@ impl Fragment {
                 let (inline_start, inline_end) = {
                     let margin = self.style().logical_margin();
                     (
-                        MaybeAuto::from_style(margin.inline_start, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.inline_start, containing_block_inline_size)
                             .specified_or_zero(),
-                        MaybeAuto::from_style(margin.inline_end, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.inline_end, containing_block_inline_size)
                             .specified_or_zero(),
                     )
                 };
@@ -1366,7 +1354,7 @@ impl Fragment {
                 {
                     Au(0)
                 } else {
-                    MaybeAuto::from_style(margin.inline_start, containing_block_inline_size)
+                    MaybeAuto::from_margin(margin.inline_start, containing_block_inline_size)
                         .specified_or_zero()
                 };
                 let this_inline_end_margin = if !node
@@ -1375,7 +1363,7 @@ impl Fragment {
                 {
                     Au(0)
                 } else {
-                    MaybeAuto::from_style(margin.inline_end, containing_block_inline_size)
+                    MaybeAuto::from_margin(margin.inline_end, containing_block_inline_size)
                         .specified_or_zero()
                 };
 
@@ -1405,9 +1393,9 @@ impl Fragment {
                 let (block_start, block_end) = {
                     let margin = self.style().logical_margin();
                     (
-                        MaybeAuto::from_style(margin.block_start, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.block_start, containing_block_inline_size)
                             .specified_or_zero(),
-                        MaybeAuto::from_style(margin.block_end, containing_block_inline_size)
+                        MaybeAuto::from_margin(margin.block_end, containing_block_inline_size)
                             .specified_or_zero(),
                     )
                 };
@@ -1481,16 +1469,16 @@ impl Fragment {
         fn from_style(style: &ComputedValues, container_size: &LogicalSize<Au>) -> LogicalSize<Au> {
             let offsets = style.logical_position();
             let offset_i = if !offsets.inline_start.is_auto() {
-                MaybeAuto::from_style(offsets.inline_start, container_size.inline)
+                MaybeAuto::from_inset(offsets.inline_start, container_size.inline)
                     .specified_or_zero()
             } else {
-                -MaybeAuto::from_style(offsets.inline_end, container_size.inline)
+                -MaybeAuto::from_inset(offsets.inline_end, container_size.inline)
                     .specified_or_zero()
             };
-            let offset_b = if !offsets.block_start.is_auto() {
-                MaybeAuto::from_style(offsets.block_start, container_size.block).specified_or_zero()
+            let offset_b = if offsets.block_start.is_auto() {
+                MaybeAuto::from_inset(offsets.block_start, container_size.block).specified_or_zero()
             } else {
-                -MaybeAuto::from_style(offsets.block_end, container_size.block).specified_or_zero()
+                -MaybeAuto::from_inset(offsets.block_end, container_size.block).specified_or_zero()
             };
             LogicalSize::new(style.writing_mode, offset_i, offset_b)
         }
@@ -1518,13 +1506,7 @@ impl Fragment {
     /// FIXME(pcwalton): Just replace with the clear type from the style module for speed?
     #[inline(always)]
     pub fn clear(&self) -> Option<ClearType> {
-        let style = self.style();
-        match style.get_box().clear {
-            Clear::None => None,
-            Clear::Left => Some(ClearType::Left),
-            Clear::Right => Some(ClearType::Right),
-            Clear::Both => Some(ClearType::Both),
-        }
+        ClearType::from_style(self.style())
     }
 
     #[inline(always)]
@@ -3371,7 +3353,7 @@ impl<'a> Iterator for InlineStyleIterator<'a> {
     }
 }
 
-impl<'a> InlineStyleIterator<'a> {
+impl InlineStyleIterator<'_> {
     fn new(fragment: &Fragment) -> InlineStyleIterator {
         InlineStyleIterator {
             fragment,

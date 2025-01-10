@@ -18,7 +18,6 @@ use async_tungstenite::tokio::{client_async_tls_with_connector_and_config, Conne
 use async_tungstenite::WebSocketStream;
 use base64::Engine;
 use futures::future::TryFutureExt;
-use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use http::header::{self, HeaderName, HeaderValue};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
@@ -157,10 +156,10 @@ fn setup_dom_listener(
 ) -> UnboundedReceiver<DomMsg> {
     let (sender, receiver) = unbounded_channel();
 
-    ROUTER.add_route(
-        dom_action_receiver.to_opaque(),
+    ROUTER.add_typed_route(
+        dom_action_receiver,
         Box::new(move |message| {
-            let dom_action = message.to().expect("Ws dom_action message to deserialize");
+            let dom_action = message.expect("Ws dom_action message to deserialize");
             trace!("handling WS DOM action: {:?}", dom_action);
             match dom_action {
                 WebSocketDomAction::SendMessage(MessageData::Text(data)) => {
@@ -391,7 +390,7 @@ fn connect(
         ignore_certificate_errors,
         http_state.override_manager.clone(),
     );
-    tls_config.alpn_protocols = vec!["h2".to_string().into(), "http/1.1".to_string().into()];
+    tls_config.alpn_protocols = vec!["http/1.1".to_string().into()];
 
     let resource_event_sender2 = resource_event_sender.clone();
     match HANDLE.lock().unwrap().as_mut() {

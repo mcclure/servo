@@ -1,3 +1,13 @@
+import base64
+import random
+import urllib
+from datetime import datetime, timedelta, timezone
+
+from webdriver.bidi.modules.network import (
+    NetworkStringValue,
+    SetCookieHeader,
+)
+
 from .. import (
     any_bool,
     any_dict,
@@ -12,12 +22,7 @@ from .. import (
     recursive_compare,
 )
 
-from webdriver.bidi.modules.network import (
-    NetworkStringValue,
-    SetCookieHeader,
-)
 
-from datetime import datetime, timedelta, timezone
 
 def assert_bytes_value(bytes_value):
     assert bytes_value["type"] in ["string", "base64"]
@@ -32,34 +37,53 @@ def assert_headers(event_headers, expected_headers):
         assert next(h for h in event_headers if header == h) is not None
 
 
-def assert_timing_info(timing_info):
+def assert_timing_info(timing_info, expected_time_range=None):
+    # First assert time origin, which is reused to assert the following values.
+    time_origin = timing_info.get("timeOrigin")
+    any_number(time_origin)
+
+    def assert_timing(actual):
+        # Check that the timing is a number
+        any_number(actual)
+
+        # If a time range was provided, assert that the time is within the
+        # provided bounds.
+        # Unless timing is 0, which means the timing is not relevant for the
+        # current network event, or is not known yet.
+        if expected_time_range is not None and actual != 0:
+            # Add time_origin to actual to get the absolute time corresponding
+            # to the timing.
+            expected_time_range(actual + time_origin)
+
+    # Assert all other timings.
     recursive_compare(
         {
-            "timeOrigin": any_number,
-            "requestTime": any_number,
-            "redirectStart": any_number,
-            "redirectEnd": any_number,
-            "fetchStart": any_number,
-            "dnsStart": any_number,
-            "dnsEnd": any_number,
-            "connectStart": any_number,
-            "connectEnd": any_number,
-            "tlsStart": any_number,
-            "requestStart": any_number,
-            "responseStart": any_number,
-            "responseEnd": any_number,
+            "requestTime": assert_timing,
+            "redirectStart": assert_timing,
+            "redirectEnd": assert_timing,
+            "fetchStart": assert_timing,
+            "dnsStart": assert_timing,
+            "dnsEnd": assert_timing,
+            "connectStart": assert_timing,
+            "connectEnd": assert_timing,
+            "tlsStart": assert_timing,
+            "requestStart": assert_timing,
+            "responseStart": assert_timing,
+            "responseEnd": assert_timing,
         },
         timing_info,
     )
 
 
-def assert_request_data(request_data, expected_request):
+def assert_request_data(request_data, expected_request, expected_time_range):
     recursive_compare(
         {
             "bodySize": any_int_or_null,
             "cookies": any_list,
+            "destination": any_string,
             "headers": any_list,
             "headersSize": any_int,
+            "initiatorType": any_string_or_null,
             "method": any_string,
             "request": any_string,
             "timings": any_dict,
@@ -67,8 +91,6 @@ def assert_request_data(request_data, expected_request):
         },
         request_data,
     )
-
-    assert_timing_info(request_data["timings"])
 
     for cookie in request_data["cookies"]:
         assert_bytes_value(cookie["value"])
@@ -89,6 +111,8 @@ def assert_request_data(request_data, expected_request):
         # Remove headers before using recursive_compare, see comment for cookies
         del expected_request["headers"]
 
+    assert_timing_info(request_data["timings"], expected_time_range)
+
     recursive_compare(expected_request, request_data)
 
 
@@ -100,6 +124,7 @@ def assert_base_parameters(
     navigation=None,
     redirect_count=None,
     expected_request=None,
+    expected_time_range=None,
 ):
     recursive_compare(
         {
@@ -136,9 +161,9 @@ def assert_base_parameters(
     if redirect_count is not None:
         assert event["redirectCount"] == redirect_count
 
-    # Assert request data
+    # Assert request data (expected_time_range is optional)
     if expected_request is not None:
-        assert_request_data(event["request"], expected_request)
+        assert_request_data(event["request"], expected_request, expected_time_range)
 
 
 def assert_before_request_sent_event(
@@ -149,10 +174,11 @@ def assert_before_request_sent_event(
     navigation=None,
     redirect_count=None,
     expected_request=None,
+    expected_time_range=None,
 ):
     # Assert initiator
-    assert isinstance(event["initiator"], dict)
-    assert isinstance(event["initiator"]["type"], str)
+    if "initiator" in event:
+        assert isinstance(event["initiator"], dict)
 
     # Assert base parameters
     assert_base_parameters(
@@ -163,6 +189,7 @@ def assert_before_request_sent_event(
         navigation=navigation,
         redirect_count=redirect_count,
         expected_request=expected_request,
+        expected_time_range=expected_time_range,
     )
 
 
@@ -175,6 +202,7 @@ def assert_fetch_error_event(
     navigation=None,
     redirect_count=None,
     expected_request=None,
+    expected_time_range=None,
 ):
     # Assert errorText
     assert isinstance(event["errorText"], str)
@@ -191,6 +219,7 @@ def assert_fetch_error_event(
         navigation=navigation,
         redirect_count=redirect_count,
         expected_request=expected_request,
+        expected_time_range=expected_time_range,
     )
 
 
@@ -241,6 +270,7 @@ def assert_response_event(
     redirect_count=None,
     expected_request=None,
     expected_response=None,
+    expected_time_range=None,
 ):
     # Assert response data
     any_dict(event["response"])
@@ -256,6 +286,7 @@ def assert_response_event(
         navigation=navigation,
         redirect_count=redirect_count,
         expected_request=expected_request,
+        expected_time_range=expected_time_range,
     )
 
 
@@ -285,6 +316,22 @@ def create_header(overrides=None, value_overrides=None):
         header["value"].update(value_overrides)
 
     return header
+
+
+def get_cached_url(content_type, response):
+    """
+    Build a URL for a resource which will be fully cached.
+
+    :param content_type: Response content type eg "text/css".
+    :param response: Response body>
+
+    :return: Relative URL as a string, typically should be used with the
+        `url` fixture.
+    """
+    # `nocache` is not used in cached.py, it is here to bypass the browser cache
+    # from previous tests accessing the same URL.
+    query_string = f"status=200&contenttype={content_type}&response={response}&nocache={random.random()}"
+    return f"/webdriver/tests/support/http_handlers/cached.py?{query_string}"
 
 
 # Array of status and status text expected to be available in network events
@@ -326,23 +373,39 @@ HTTP_STATUS_AND_STATUS_TEXT = [
     (505, "HTTP Version Not Supported"),
 ]
 
+BASE_URL = "/webdriver/tests/bidi/network/support"
 PAGE_DATA_URL_HTML = "data:text/html,<div>foo</div>"
 PAGE_DATA_URL_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAA1BMVEX/TQBcNTh/AAAAAXRSTlPM0jRW/QAAAApJREFUeJxjYgAAAAYAAzY3fKgAAAAASUVORK5CYII="
-PAGE_EMPTY_HTML = "/webdriver/tests/bidi/network/support/empty.html"
-PAGE_EMPTY_IMAGE = "/webdriver/tests/bidi/network/support/empty.png"
-PAGE_EMPTY_SCRIPT = "/webdriver/tests/bidi/network/support/empty.js"
-PAGE_EMPTY_SVG = "/webdriver/tests/bidi/network/support/empty.svg"
-PAGE_EMPTY_TEXT = "/webdriver/tests/bidi/network/support/empty.txt"
+PAGE_EMPTY_HTML = f"{BASE_URL}/empty.html"
+PAGE_EMPTY_IMAGE = f"{BASE_URL}/empty.png"
+PAGE_EMPTY_SCRIPT = f"{BASE_URL}/empty.js"
+PAGE_EMPTY_SVG = f"{BASE_URL}/empty.svg"
+PAGE_EMPTY_TEXT = f"{BASE_URL}/empty.txt"
 PAGE_INVALID_URL = "https://not_a_valid_url.test/"
-PAGE_OTHER_TEXT = "/webdriver/tests/bidi/network/support/other.txt"
-PAGE_PROVIDE_RESPONSE_HTML = "/webdriver/tests/bidi/network/support/provide_response.html"
-PAGE_PROVIDE_RESPONSE_SCRIPT = "/webdriver/tests/bidi/network/support/provide_response.js"
-PAGE_PROVIDE_RESPONSE_STYLESHEET = "/webdriver/tests/bidi/network/support/provide_response.css"
+PAGE_INITIATOR = {
+    "HTML": f"{BASE_URL}/initiator/simple-initiator.html",
+    "SCRIPT": f"{BASE_URL}/initiator/simple-initiator-script.js",
+    "STYLESHEET": f"{BASE_URL}/initiator/simple-initiator-style.css",
+    "IMAGE": f"{BASE_URL}/initiator/simple-initiator-img.png",
+    "BACKGROUND": f"{BASE_URL}/initiator/simple-initiator-bg.png",
+}
+PAGE_OTHER_TEXT = f"{BASE_URL}/other.txt"
+PAGE_PROVIDE_RESPONSE_HTML = f"{BASE_URL}/provide_response.html"
+PAGE_PROVIDE_RESPONSE_SCRIPT = f"{BASE_URL}/provide_response.js"
+PAGE_PROVIDE_RESPONSE_STYLESHEET = f"{BASE_URL}/provide_response.css"
 PAGE_REDIRECT_HTTP_EQUIV = (
     "/webdriver/tests/bidi/network/support/redirect_http_equiv.html"
 )
 PAGE_REDIRECTED_HTML = "/webdriver/tests/bidi/network/support/redirected.html"
 PAGE_SERVICEWORKER_HTML = "/webdriver/tests/bidi/network/support/serviceworker.html"
+
+IMAGE_RESPONSE_BODY = urllib.parse.quote_plus(base64.b64decode(b"iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAYAAACNbyblAAAAHElEQVQI12P4//8/w38GIAXDIBKE0DHxgljNBAAO9TXL0Y4OHwAAAABJRU5ErkJggg=="))
+
+SCRIPT_CONSOLE_LOG = urllib.parse.quote_plus("console.log('test')")
+SCRIPT_CONSOLE_LOG_IN_MODULE = urllib.parse.quote_plus("export default function foo() { console.log('from module') }")
+
+STYLESHEET_GREY_BACKGROUND = urllib.parse.quote_plus("html, body { background-color: #ccc; }")
+STYLESHEET_RED_COLOR = urllib.parse.quote_plus("html, body { color: red; }")
 
 AUTH_REQUIRED_EVENT = "network.authRequired"
 BEFORE_REQUEST_SENT_EVENT = "network.beforeRequestSent"

@@ -7,12 +7,14 @@ use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSender;
 use profile_traits::ipc;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::TestRunnerBinding::TestRunnerMethods;
-use crate::dom::bindings::error::{Error, ErrorResult};
+use crate::dom::bindings::error::ErrorResult;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/tests#test-runner
 #[dom_struct]
@@ -28,7 +30,7 @@ impl TestRunner {
     }
 
     pub fn new(global: &GlobalScope) -> DomRoot<TestRunner> {
-        reflect_dom_object(Box::new(TestRunner::new_inherited()), global)
+        reflect_dom_object(Box::new(TestRunner::new_inherited()), global, CanGc::note())
     }
 
     fn get_bluetooth_thread(&self) -> IpcSender<BluetoothRequest> {
@@ -36,7 +38,7 @@ impl TestRunner {
     }
 }
 
-impl TestRunnerMethods for TestRunner {
+impl TestRunnerMethods<crate::DomTypeHolder> for TestRunner {
     // https://webbluetoothcg.github.io/web-bluetooth/tests#setBluetoothMockDataSet
     #[allow(non_snake_case)]
     fn SetBluetoothMockDataSet(&self, dataSetName: DOMString) -> ErrorResult {
@@ -46,7 +48,7 @@ impl TestRunnerMethods for TestRunner {
             .unwrap();
         match receiver.recv().unwrap() {
             Ok(()) => Ok(()),
-            Err(error) => Err(Error::from(error)),
+            Err(error) => Err(error.convert()),
         }
     }
 }

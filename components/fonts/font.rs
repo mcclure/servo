@@ -27,14 +27,12 @@ use style::values::computed::{FontStretch, FontStyle, FontWeight};
 use unicode_script::Script;
 use webrender_api::{FontInstanceFlags, FontInstanceKey};
 
-use crate::font_cache_thread::{FontIdentifier, FontSource};
-use crate::font_context::FontContext;
-use crate::font_template::{FontTemplateDescriptor, FontTemplateRef, FontTemplateRefMethods};
 use crate::platform::font::{FontTable, PlatformFont};
 pub use crate::platform::font_list::fallback_font_families;
 use crate::{
-    ByteIndex, EmojiPresentationPreference, FallbackFontSelectionOptions, GlyphData, GlyphId,
-    GlyphStore, Shaper,
+    ByteIndex, EmojiPresentationPreference, FallbackFontSelectionOptions, FontContext, FontData,
+    FontIdentifier, FontTemplateDescriptor, FontTemplateRef, FontTemplateRefMethods, GlyphData,
+    GlyphId, GlyphStore, LocalFontIdentifier, Shaper,
 };
 
 #[macro_export]
@@ -63,20 +61,44 @@ static TEXT_SHAPING_PERFORMANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // resources needed by the graphics layer to draw glyphs.
 
 pub trait PlatformFontMethods: Sized {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "PlatformFontMethods::new_from_template",
+            skip_all,
+            fields(servo_profiling = true),
+            level = "trace",
+        )
+    )]
     fn new_from_template(
         template: FontTemplateRef,
         pt_size: Option<Au>,
+        data: &Option<FontData>,
     ) -> Result<PlatformFont, &'static str> {
-        let data = template.data();
-        let face_index = template.identifier().index();
-        let font_identifier = template.borrow().identifier.clone();
-        Self::new_from_data(font_identifier, data, face_index, pt_size)
+        let template = template.borrow();
+        let font_identifier = template.identifier.clone();
+
+        match font_identifier {
+            FontIdentifier::Local(font_identifier) => {
+                Self::new_from_local_font_identifier(font_identifier, pt_size)
+            },
+            FontIdentifier::Web(_) => Self::new_from_data(
+                font_identifier,
+                data.as_ref()
+                    .expect("Should never create a web font without data."),
+                pt_size,
+            ),
+        }
     }
+
+    fn new_from_local_font_identifier(
+        font_identifier: LocalFontIdentifier,
+        pt_size: Option<Au>,
+    ) -> Result<PlatformFont, &'static str>;
 
     fn new_from_data(
         font_identifier: FontIdentifier,
-        data: Arc<Vec<u8>>,
-        face_index: u32,
+        data: &FontData,
         pt_size: Option<Au>,
     ) -> Result<PlatformFont, &'static str>;
 
@@ -88,8 +110,6 @@ pub trait PlatformFontMethods: Sized {
     fn glyph_h_advance(&self, _: GlyphId) -> Option<FractionalPixel>;
     fn glyph_h_kerning(&self, glyph0: GlyphId, glyph1: GlyphId) -> FractionalPixel;
 
-    /// Can this font do basic horizontal LTR shaping without Harfbuzz?
-    fn can_do_fast_shaping(&self) -> bool;
     fn metrics(&self) -> FontMetrics;
     fn table_for_tag(&self, _: FontTableTag) -> Option<FontTable>;
     fn typographic_bounds(&self, _: GlyphId) -> Rect<f32>;
@@ -215,15 +235,18 @@ impl malloc_size_of::MallocSizeOf for CachedShapeData {
     }
 }
 
-#[derive(Debug)]
 pub struct Font {
     pub handle: PlatformFont,
     pub template: FontTemplateRef,
     pub metrics: FontMetrics,
     pub descriptor: FontDescriptor,
+
+    /// The data for this font. This might be uninitialized for system fonts.
+    data: OnceLock<FontData>,
+
     shaper: OnceLock<Shaper>,
     cached_shape_data: RwLock<CachedShapeData>,
-    pub font_key: FontInstanceKey,
+    pub font_instance_key: OnceLock<FontInstanceKey>,
 
     /// If this is a synthesized small caps font, then this font reference is for
     /// the version of the font used to replace lowercase ASCII letters. It's up
@@ -234,6 +257,14 @@ pub struct Font {
     /// essentially equivalent to whether or not we use it for emoji presentation.
     /// This is cached, because getting table data is expensive.
     has_color_bitmap_or_colr_table: OnceLock<bool>,
+
+    /// Whether or not this font can do fast shaping, ie whether or not it has
+    /// a kern table, but no GSUB and GPOS tables. When this is true, Servo will
+    /// shape Latin horizontal left-to-right text without using Harfbuzz.
+    ///
+    /// FIXME: This should be removed entirely in favor of better caching if necessary.
+    /// See <https://github.com/servo/servo/pull/11273#issuecomment-222332873>.
+    can_do_fast_shaping: OnceLock<bool>,
 }
 
 impl malloc_size_of::MallocSizeOf for Font {
@@ -243,7 +274,9 @@ impl malloc_size_of::MallocSizeOf for Font {
         self.metrics.size_of(ops) +
             self.descriptor.size_of(ops) +
             self.cached_shape_data.read().size_of(ops) +
-            self.font_key.size_of(ops)
+            self.font_instance_key
+                .get()
+                .map_or(0, |key| key.size_of(ops))
     }
 }
 
@@ -251,21 +284,25 @@ impl Font {
     pub fn new(
         template: FontTemplateRef,
         descriptor: FontDescriptor,
+        data: Option<FontData>,
         synthesized_small_caps: Option<FontRef>,
     ) -> Result<Font, &'static str> {
-        let handle = PlatformFont::new_from_template(template.clone(), Some(descriptor.pt_size))?;
+        let handle =
+            PlatformFont::new_from_template(template.clone(), Some(descriptor.pt_size), &data)?;
         let metrics = handle.metrics();
 
         Ok(Font {
             handle,
             template,
-            shaper: OnceLock::new(),
-            descriptor,
             metrics,
+            descriptor,
+            data: data.map(OnceLock::from).unwrap_or_default(),
+            shaper: OnceLock::new(),
             cached_shape_data: Default::default(),
-            font_key: FontInstanceKey::default(),
+            font_instance_key: Default::default(),
             synthesized_small_caps,
             has_color_bitmap_or_colr_table: OnceLock::new(),
+            can_do_fast_shaping: OnceLock::new(),
         })
     }
 
@@ -283,6 +320,27 @@ impl Font {
             self.table_for_tag(SBIX).is_some() ||
                 self.table_for_tag(CBDT).is_some() ||
                 self.table_for_tag(COLR).is_some()
+        })
+    }
+
+    pub fn key(&self, font_context: &FontContext) -> FontInstanceKey {
+        *self
+            .font_instance_key
+            .get_or_init(|| font_context.create_font_instance_key(self))
+    }
+
+    /// Return the data for this `Font`. Note that this is currently highly inefficient for system
+    /// fonts and should not be used except in legacy canvas code.
+    pub fn data(&self) -> &FontData {
+        self.data.get_or_init(|| {
+            let FontIdentifier::Local(local_font_identifier) = self.identifier() else {
+                unreachable!("All web fonts should already have initialized data");
+            };
+            FontData::from_bytes(
+                &local_font_identifier
+                    .read_data_from_file()
+                    .unwrap_or_default(),
+            )
         })
     }
 }
@@ -381,10 +439,18 @@ impl Font {
             .shape_text(text, options, glyphs);
     }
 
-    fn can_do_fast_shaping(&self, text: &str, options: &ShapingOptions) -> bool {
+    /// Whether not a particular text and [`ShapingOptions`] combination can use
+    /// "fast shaping" ie shaping without Harfbuzz.
+    ///
+    /// Note: This will eventually be removed.
+    pub fn can_do_fast_shaping(&self, text: &str, options: &ShapingOptions) -> bool {
         options.script == Script::Latin &&
             !options.flags.contains(ShapingFlags::RTL_FLAG) &&
-            self.handle.can_do_fast_shaping() &&
+            *self.can_do_fast_shaping.get_or_init(|| {
+                self.table_for_tag(KERN).is_some() &&
+                    self.table_for_tag(GPOS).is_none() &&
+                    self.table_for_tag(GSUB).is_none()
+            }) &&
             text.is_ascii()
     }
 
@@ -409,7 +475,7 @@ impl Font {
             let offset = prev_glyph_id.map(|prev| {
                 let h_kerning = Au::from_f64_px(self.glyph_h_kerning(prev, glyph_id));
                 advance += h_kerning;
-                Point2D::new(h_kerning, Au(0))
+                Point2D::new(h_kerning, Au::zero())
             });
 
             let glyph = GlyphData::new(glyph_id, advance, offset, true, true);
@@ -486,10 +552,10 @@ impl Font {
         self.handle.typographic_bounds(glyph_id)
     }
 
-    #[allow(unsafe_code)]
-    pub fn get_baseline(&self) -> Option<FontBaseline> {
+    /// Get the [`FontBaseline`] for this font.
+    pub fn baseline(&self) -> Option<FontBaseline> {
         let this = self as *const Font;
-        unsafe { self.shaper.get_or_init(|| Shaper::new(this)).get_baseline() }
+        self.shaper.get_or_init(|| Shaper::new(this)).baseline()
     }
 }
 
@@ -498,7 +564,7 @@ pub type FontRef = Arc<Font>;
 /// A `FontGroup` is a prioritised list of fonts for a given set of font styles. It is used by
 /// `TextRun` to decide which font to render a character with. If none of the fonts listed in the
 /// styles are suitable, a fallback font may be used.
-#[derive(Debug, MallocSizeOf)]
+#[derive(MallocSizeOf)]
 pub struct FontGroup {
     descriptor: FontDescriptor,
     families: SmallVec<[FontGroupFamily; 8]>,
@@ -526,9 +592,9 @@ impl FontGroup {
     /// `codepoint`. If no such font is found, returns the first available font or fallback font
     /// (which will cause a "glyph not found" character to be rendered). If no font at all can be
     /// found, returns None.
-    pub fn find_by_codepoint<S: FontSource>(
+    pub fn find_by_codepoint(
         &mut self,
-        font_context: &FontContext<S>,
+        font_context: &FontContext,
         codepoint: char,
         next_codepoint: Option<char>,
     ) -> Option<FontRef> {
@@ -598,7 +664,7 @@ impl FontGroup {
     }
 
     /// Find the first available font in the group, or the first available fallback font.
-    pub fn first<S: FontSource>(&mut self, font_context: &FontContext<S>) -> Option<FontRef> {
+    pub fn first(&mut self, font_context: &FontContext) -> Option<FontRef> {
         // From https://drafts.csswg.org/css-fonts/#first-available-font:
         // > The first available font, used for example in the definition of font-relative lengths
         // > such as ex or in the definition of the line-height property, is defined to be the first
@@ -622,14 +688,13 @@ impl FontGroup {
     /// Attempts to find a font which matches the given `template_predicate` and `font_predicate`.
     /// This method mutates because we may need to load new font data in the process of finding
     /// a suitable font.
-    fn find<S, TemplatePredicate, FontPredicate>(
+    fn find<TemplatePredicate, FontPredicate>(
         &mut self,
-        font_context: &FontContext<S>,
+        font_context: &FontContext,
         template_predicate: TemplatePredicate,
         font_predicate: FontPredicate,
     ) -> Option<FontRef>
     where
-        S: FontSource,
         TemplatePredicate: Fn(FontTemplateRef) -> bool,
         FontPredicate: Fn(&FontRef) -> bool,
     {
@@ -651,15 +716,14 @@ impl FontGroup {
     /// `font_predicate`. The default family (i.e. "serif") will be tried first, followed by
     /// platform-specific family names. If a `codepoint` is provided, then its Unicode block may be
     /// used to refine the list of family names which will be tried.
-    fn find_fallback<S, TemplatePredicate, FontPredicate>(
+    fn find_fallback<TemplatePredicate, FontPredicate>(
         &mut self,
-        font_context: &FontContext<S>,
+        font_context: &FontContext,
         options: FallbackFontSelectionOptions,
         template_predicate: TemplatePredicate,
         font_predicate: FontPredicate,
     ) -> Option<FontRef>
     where
-        S: FontSource,
         TemplatePredicate: Fn(FontTemplateRef) -> bool,
         FontPredicate: Fn(&FontRef) -> bool,
     {
@@ -696,7 +760,7 @@ impl FontGroup {
 /// `unicode-range` descriptors. In this case, font selection will select a single member
 /// that contains the necessary unicode character. Unicode ranges are specified by the
 /// [`FontGroupFamilyMember::template`] member.
-#[derive(Debug, MallocSizeOf)]
+#[derive(MallocSizeOf)]
 struct FontGroupFamilyMember {
     #[ignore_malloc_size_of = "This measured in the FontContext template cache."]
     template: FontTemplateRef,
@@ -709,7 +773,7 @@ struct FontGroupFamilyMember {
 /// families listed in the `font-family` CSS property. The corresponding font data is lazy-loaded,
 /// only if actually needed. A single `FontGroupFamily` can have multiple fonts, in the case that
 /// individual fonts only cover part of the Unicode range.
-#[derive(Debug, MallocSizeOf)]
+#[derive(MallocSizeOf)]
 struct FontGroupFamily {
     family_descriptor: FontFamilyDescriptor,
     members: Option<Vec<FontGroupFamilyMember>>,
@@ -723,15 +787,14 @@ impl FontGroupFamily {
         }
     }
 
-    fn find<S, TemplatePredicate, FontPredicate>(
+    fn find<TemplatePredicate, FontPredicate>(
         &mut self,
         font_descriptor: &FontDescriptor,
-        font_context: &FontContext<S>,
+        font_context: &FontContext,
         template_predicate: &TemplatePredicate,
         font_predicate: &FontPredicate,
     ) -> Option<FontRef>
     where
-        S: FontSource,
         TemplatePredicate: Fn(FontTemplateRef) -> bool,
         FontPredicate: Fn(&FontRef) -> bool,
     {
@@ -754,10 +817,10 @@ impl FontGroupFamily {
             .next()
     }
 
-    fn members<S: FontSource>(
+    fn members(
         &mut self,
         font_descriptor: &FontDescriptor,
-        font_context: &FontContext<S>,
+        font_context: &FontContext,
     ) -> impl Iterator<Item = &mut FontGroupFamilyMember> {
         let family_descriptor = &self.family_descriptor;
         let members = self.members.get_or_insert_with(|| {
@@ -789,7 +852,7 @@ pub struct RunMetrics {
 impl RunMetrics {
     pub fn new(advance: Au, ascent: Au, descent: Au) -> RunMetrics {
         let bounds = Rect::new(
-            Point2D::new(Au(0), -ascent),
+            Point2D::new(Au::zero(), -ascent),
             Size2D::new(advance, ascent + descent),
         );
 
@@ -879,88 +942,4 @@ pub(crate) fn map_platform_values_to_style_values(mapping: &[(f64, f64)], value:
     }
 
     mapping[mapping.len() - 1].1
-}
-
-#[cfg(test)]
-mod test {
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn test_shape_text_fast() {
-        use std::fs::File;
-        use std::io::Read;
-        use std::path::PathBuf;
-        use std::sync::Arc;
-
-        use app_units::Au;
-        use euclid::num::Zero;
-        use servo_url::ServoUrl;
-        use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
-        use style::values::computed::{FontStretch, FontStyle, FontWeight};
-        use unicode_script::Script;
-
-        use crate::platform::font::PlatformFont;
-        use crate::{
-            Font, FontDescriptor, FontIdentifier, FontTemplate, GlyphStore, PlatformFontMethods,
-            ShapingFlags, ShapingOptions,
-        };
-
-        let path: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "tests",
-            "support",
-            "dejavu-fonts-ttf-2.37",
-            "ttf",
-            "DejaVuSans.ttf",
-        ]
-        .iter()
-        .collect();
-
-        let identifier = FontIdentifier::Web(ServoUrl::from_file_path(path.clone()).unwrap());
-        let file = File::open(path).unwrap();
-        let data: Arc<Vec<u8>> = Arc::new(file.bytes().map(|b| b.unwrap()).collect());
-        let platform_font =
-            PlatformFont::new_from_data(identifier.clone(), data.clone(), 0, None).unwrap();
-
-        let template = FontTemplate {
-            identifier,
-            descriptor: platform_font.descriptor(),
-            data: Some(data),
-            stylesheet: None,
-        };
-        let descriptor = FontDescriptor {
-            weight: FontWeight::normal(),
-            stretch: FontStretch::hundred(),
-            style: FontStyle::normal(),
-            variant: FontVariantCaps::Normal,
-            pt_size: Au::from_px(24),
-        };
-        let font = Font::new(
-            Arc::new(atomic_refcell::AtomicRefCell::new(template)),
-            descriptor,
-            None,
-        )
-        .unwrap();
-
-        let shaping_options = ShapingOptions {
-            letter_spacing: None,
-            word_spacing: Au::zero(),
-            script: Script::Latin,
-            flags: ShapingFlags::empty(),
-        };
-        let text = "WAVE";
-
-        assert!(font.can_do_fast_shaping(text, &shaping_options));
-
-        let mut expected_glyphs = GlyphStore::new(text.len(), false, false, false, false);
-        font.shape_text_harfbuzz(text, &shaping_options, &mut expected_glyphs);
-
-        let mut glyphs = GlyphStore::new(text.len(), false, false, false, false);
-        font.shape_text_fast(text, &shaping_options, &mut glyphs);
-
-        assert_eq!(glyphs.len(), expected_glyphs.len());
-        assert_eq!(
-            glyphs.total_advance().to_nearest_px(),
-            expected_glyphs.total_advance().to_nearest_px()
-        );
-    }
 }

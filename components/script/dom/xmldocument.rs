@@ -20,6 +20,7 @@ use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLD
 use crate::dom::location::Location;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#xmldocument
 #[dom_struct]
@@ -55,8 +56,8 @@ impl XMLDocument {
                 doc_loader,
                 None,
                 None,
-                None,
                 Default::default(),
+                false,
             ),
         }
     }
@@ -88,6 +89,7 @@ impl XMLDocument {
                 doc_loader,
             )),
             window,
+            CanGc::note(),
         );
         {
             let node = doc.upcast::<Node>();
@@ -97,7 +99,7 @@ impl XMLDocument {
     }
 }
 
-impl XMLDocumentMethods for XMLDocument {
+impl XMLDocumentMethods<crate::DomTypeHolder> for XMLDocument {
     // https://html.spec.whatwg.org/multipage/#dom-document-location
     fn GetLocation(&self) -> Option<DomRoot<Location>> {
         self.upcast::<Document>().GetLocation()

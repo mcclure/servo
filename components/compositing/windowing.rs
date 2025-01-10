@@ -8,21 +8,21 @@ use std::fmt::{Debug, Error, Formatter};
 use std::time::Duration;
 
 use base::id::{PipelineId, TopLevelBrowsingContextId};
-use embedder_traits::{EmbedderProxy, EventLoopWaker};
+use embedder_traits::EventLoopWaker;
 use euclid::Scale;
-use keyboard_types::KeyboardEvent;
+use keyboard_types::{CompositionEvent, KeyboardEvent};
 use libc::c_void;
 use net::protocols::ProtocolRegistry;
 use script_traits::{
-    GamepadEvent, MediaSessionActionType, MouseButton, TouchEventType, TouchId, TraversalDirection,
-    WheelDelta,
+    GamepadEvent, MediaSessionActionType, MouseButton, Theme, TouchEventType, TouchId,
+    TraversalDirection, WheelDelta,
 };
-use servo_geometry::DeviceIndependentPixel;
+use servo_geometry::{DeviceIndependentIntRect, DeviceIndependentIntSize, DeviceIndependentPixel};
 use servo_url::ServoUrl;
-use style_traits::DevicePixel;
-use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePoint, DeviceRect};
+use webrender_api::units::{
+    DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint, DeviceRect,
+};
 use webrender_api::ScrollLocation;
-use webrender_traits::RenderingContext;
 
 #[derive(Clone)]
 pub enum MouseWindowEvent {
@@ -54,6 +54,8 @@ pub enum EmbedderEvent {
     Refresh,
     /// Sent when the window is resized.
     WindowResize,
+    /// Sent when the platform theme changes.
+    ThemeChange(Theme),
     /// Sent when a navigation request from script is allowed/refused.
     AllowNavigationResponse(PipelineId, bool),
     /// Sent when a new URL is to be loaded.
@@ -83,6 +85,8 @@ pub enum EmbedderEvent {
     ExitFullScreen(TopLevelBrowsingContextId),
     /// Sent when a key input state changes
     Keyboard(KeyboardEvent),
+    /// Sent for IME composition updates
+    IMEComposition(CompositionEvent),
     /// Sent when Ctr+R/Apple+R is called to reload the current page.
     Reload(TopLevelBrowsingContextId),
     /// Create a new top-level browsing context.
@@ -128,6 +132,8 @@ pub enum EmbedderEvent {
     ReplaceNativeSurface(*mut c_void, DeviceIntSize),
     /// Sent when new Gamepad information is available.
     Gamepad(GamepadEvent),
+    /// Vertical Synchronization tick
+    Vsync,
 }
 
 impl Debug for EmbedderEvent {
@@ -136,7 +142,9 @@ impl Debug for EmbedderEvent {
             EmbedderEvent::Idle => write!(f, "Idle"),
             EmbedderEvent::Refresh => write!(f, "Refresh"),
             EmbedderEvent::WindowResize => write!(f, "Resize"),
+            EmbedderEvent::ThemeChange(..) => write!(f, "ThemeChange"),
             EmbedderEvent::Keyboard(..) => write!(f, "Keyboard"),
+            EmbedderEvent::IMEComposition(..) => write!(f, "IMEComposition"),
             EmbedderEvent::AllowNavigationResponse(..) => write!(f, "AllowNavigationResponse"),
             EmbedderEvent::LoadUrl(..) => write!(f, "LoadUrl"),
             EmbedderEvent::MouseWindowEventClass(..) => write!(f, "Mouse"),
@@ -187,6 +195,7 @@ impl Debug for EmbedderEvent {
             EmbedderEvent::InvalidateNativeSurface => write!(f, "InvalidateNativeSurface"),
             EmbedderEvent::ReplaceNativeSurface(..) => write!(f, "ReplaceNativeSurface"),
             EmbedderEvent::Gamepad(..) => write!(f, "Gamepad"),
+            EmbedderEvent::Vsync => write!(f, "Vsync"),
         }
     }
 }
@@ -208,16 +217,20 @@ pub trait WindowMethods {
     /// will want to avoid blocking on UI events, and just
     /// run the event loop at the vsync interval.
     fn set_animation_state(&self, _state: AnimationState);
-    /// Get the [`RenderingContext`] of this Window.
-    fn rendering_context(&self) -> RenderingContext;
 }
 
 pub trait EmbedderMethods {
     /// Returns a thread-safe object to wake up the window's event loop.
     fn create_event_loop_waker(&mut self) -> Box<dyn EventLoopWaker>;
 
+    #[cfg(feature = "webxr")]
     /// Register services with a WebXR Registry.
-    fn register_webxr(&mut self, _: &mut webxr::MainThreadRegistry, _: EmbedderProxy) {}
+    fn register_webxr(
+        &mut self,
+        _: &mut webxr::MainThreadRegistry,
+        _: embedder_traits::EmbedderProxy,
+    ) {
+    }
 
     /// Returns the user agent string to report in network requests.
     fn get_user_agent_string(&self) -> Option<String> {
@@ -241,11 +254,11 @@ pub struct EmbedderCoordinates {
     /// The pixel density of the display.
     pub hidpi_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     /// Size of the screen.
-    pub screen: DeviceIntSize,
+    pub screen_size: DeviceIndependentIntSize,
     /// Size of the available screen space (screen without toolbars and docks).
-    pub screen_avail: DeviceIntSize,
-    /// Size of the native window.
-    pub window: (DeviceIntSize, DeviceIntPoint),
+    pub available_screen_size: DeviceIndependentIntSize,
+    /// Position and size of the native window.
+    pub window_rect: DeviceIndependentIntRect,
     /// Size of the GL buffer in the window.
     pub framebuffer: DeviceIntSize,
     /// Coordinates of the document within the framebuffer.
@@ -278,23 +291,23 @@ impl EmbedderCoordinates {
 
 #[cfg(test)]
 mod test {
-    use euclid::{Point2D, Scale, Size2D};
+    use euclid::{Box2D, Point2D, Scale, Size2D};
     use webrender_api::units::DeviceIntRect;
 
     use super::EmbedderCoordinates;
 
     #[test]
     fn test() {
-        let pos = Point2D::new(0, 0);
-        let viewport = Size2D::new(800, 600);
-        let screen = Size2D::new(1080, 720);
+        let screen_size = Size2D::new(1080, 720);
+        let viewport = Box2D::from_origin_and_size(Point2D::zero(), Size2D::new(800, 600));
+        let window_rect = Box2D::from_origin_and_size(Point2D::zero(), Size2D::new(800, 600));
         let coordinates = EmbedderCoordinates {
             hidpi_factor: Scale::new(1.),
-            screen,
-            screen_avail: screen,
-            window: (viewport, pos),
-            framebuffer: viewport,
-            viewport: DeviceIntRect::from_origin_and_size(pos, viewport),
+            screen_size,
+            available_screen_size: screen_size,
+            window_rect,
+            framebuffer: viewport.size(),
+            viewport,
         };
 
         // Check if viewport conversion is correct.

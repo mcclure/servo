@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use app_units::Au;
 use geom::{FlexAxis, MainStartCrossStart};
 use serde::Serialize;
 use servo_arc::Arc as ServoArc;
@@ -12,13 +13,18 @@ use style::properties::longhands::flex_wrap::computed_value::T as FlexWrap;
 use style::properties::ComputedValues;
 use style::values::computed::{AlignContent, JustifyContent};
 use style::values::specified::align::AlignFlags;
+use style::values::specified::text::TextDecorationLine;
 
 use crate::cell::ArcRefCell;
-use crate::formatting_contexts::IndependentFormattingContext;
+use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
+use crate::context::LayoutContext;
+use crate::dom::{LayoutBox, NodeExt};
+use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
+use crate::formatting_contexts::{IndependentFormattingContext, IndependentLayout};
 use crate::fragment_tree::BaseFragmentInfo;
-use crate::positioned::AbsolutelyPositionedBox;
+use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
+use crate::ContainingBlock;
 
-mod construct;
 mod geom;
 mod layout;
 
@@ -94,14 +100,45 @@ pub(crate) struct FlexContainer {
 }
 
 impl FlexContainer {
-    pub(crate) fn new(
-        style: &ServoArc<ComputedValues>,
-        children: Vec<ArcRefCell<FlexLevelBox>>,
+    pub fn construct<'dom>(
+        context: &LayoutContext,
+        info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        contents: NonReplacedContents,
+        propagated_text_decoration_line: TextDecorationLine,
     ) -> Self {
+        let text_decoration_line =
+            propagated_text_decoration_line | info.style.clone_text_decoration_line();
+
+        let mut builder = ModernContainerBuilder::new(context, info, text_decoration_line);
+        contents.traverse(context, info, &mut builder);
+        let items = builder.finish();
+
+        let children = items
+            .into_iter()
+            .map(|item| {
+                let box_ = match item.kind {
+                    ModernItemKind::InFlow => ArcRefCell::new(FlexLevelBox::FlexItem(
+                        FlexItemBox::new(item.formatting_context),
+                    )),
+                    ModernItemKind::OutOfFlow => {
+                        let abs_pos_box =
+                            ArcRefCell::new(AbsolutelyPositionedBox::new(item.formatting_context));
+                        ArcRefCell::new(FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(abs_pos_box))
+                    },
+                };
+
+                if let Some(box_slot) = item.box_slot {
+                    box_slot.set(LayoutBox::FlexLevel(box_.clone()));
+                }
+
+                box_
+            })
+            .collect();
+
         Self {
             children,
-            style: style.clone(),
-            config: FlexContainerConfig::new(style),
+            style: info.style.clone(),
+            config: FlexContainerConfig::new(&info.style),
         }
     }
 }
@@ -112,17 +149,48 @@ pub(crate) enum FlexLevelBox {
     OutOfFlowAbsolutelyPositionedBox(ArcRefCell<AbsolutelyPositionedBox>),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct FlexItemBox {
     independent_formatting_context: IndependentFormattingContext,
+    #[serde(skip)]
+    block_content_size_cache: ArcRefCell<Option<CachedBlockSizeContribution>>,
+}
+
+impl std::fmt::Debug for FlexItemBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlexItemBox")
+    }
 }
 
 impl FlexItemBox {
+    fn new(independent_formatting_context: IndependentFormattingContext) -> Self {
+        Self {
+            independent_formatting_context,
+            block_content_size_cache: Default::default(),
+        }
+    }
+
     fn style(&self) -> &ServoArc<ComputedValues> {
         self.independent_formatting_context.style()
     }
 
     fn base_fragment_info(&self) -> BaseFragmentInfo {
         self.independent_formatting_context.base_fragment_info()
+    }
+}
+
+struct CachedBlockSizeContribution {
+    containing_block_inline_size: Au,
+    layout: IndependentLayout,
+    positioning_context: PositioningContext,
+}
+
+impl CachedBlockSizeContribution {
+    fn compatible_with_item_as_containing_block(
+        &self,
+        item_as_containing_block: &ContainingBlock,
+    ) -> bool {
+        item_as_containing_block.size.inline == self.containing_block_inline_size &&
+            item_as_containing_block.size.block.is_auto()
     }
 }

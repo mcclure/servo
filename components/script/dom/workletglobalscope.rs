@@ -15,20 +15,22 @@ use js::rust::Runtime;
 use net_traits::image_cache::ImageCache;
 use net_traits::ResourceThreads;
 use profile_traits::{mem, time};
-use script_traits::{Painter, ScriptMsg, ScriptToConstellationChan, TimerSchedulerMsg};
+use script_traits::{Painter, ScriptMsg, ScriptToConstellationChan};
 use servo_atoms::Atom;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::trace::CustomTraceable;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::identityhub::Identities;
 use crate::dom::paintworkletglobalscope::{PaintWorkletGlobalScope, PaintWorkletTask};
 use crate::dom::testworkletglobalscope::{TestWorkletGlobalScope, TestWorkletTask};
+#[cfg(feature = "webgpu")]
+use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::worklet::WorkletExecutor;
+use crate::messaging::MainThreadScriptMsg;
 use crate::script_module::ScriptFetchOptions;
-use crate::script_runtime::JSContext;
-use crate::script_thread::MainThreadScriptMsg;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 /// <https://drafts.css-houdini.org/worklets/#workletglobalscope>
@@ -39,16 +41,41 @@ pub struct WorkletGlobalScope {
     #[no_trace]
     base_url: ServoUrl,
     /// Sender back to the script thread
-    #[ignore_malloc_size_of = "channels are hard"]
-    #[no_trace]
     to_script_thread_sender: Sender<MainThreadScriptMsg>,
     /// Worklet task executor
     executor: WorkletExecutor,
 }
 
 impl WorkletGlobalScope {
+    /// Create a new heap-allocated `WorkletGlobalScope`.
+    pub(crate) fn new(
+        scope_type: WorkletGlobalScopeType,
+        runtime: &Runtime,
+        pipeline_id: PipelineId,
+        base_url: ServoUrl,
+        executor: WorkletExecutor,
+        init: &WorkletGlobalScopeInit,
+    ) -> DomRoot<WorkletGlobalScope> {
+        match scope_type {
+            WorkletGlobalScopeType::Test => DomRoot::upcast(TestWorkletGlobalScope::new(
+                runtime,
+                pipeline_id,
+                base_url,
+                executor,
+                init,
+            )),
+            WorkletGlobalScopeType::Paint => DomRoot::upcast(PaintWorkletGlobalScope::new(
+                runtime,
+                pipeline_id,
+                base_url,
+                executor,
+                init,
+            )),
+        }
+    }
+
     /// Create a new stack-allocated `WorkletGlobalScope`.
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         pipeline_id: PipelineId,
         base_url: ServoUrl,
         executor: WorkletExecutor,
@@ -65,15 +92,16 @@ impl WorkletGlobalScope {
                 init.mem_profiler_chan.clone(),
                 init.time_profiler_chan.clone(),
                 script_to_constellation_chan,
-                init.scheduler_chan.clone(),
                 init.resource_threads.clone(),
                 MutableOrigin::new(ImmutableOrigin::new_opaque()),
                 None,
                 Default::default(),
                 init.is_headless,
                 init.user_agent.clone(),
+                #[cfg(feature = "webgpu")]
                 init.gpu_id_hub.clone(),
                 init.inherited_secure_context,
+                false,
             ),
             base_url,
             to_script_thread_sender: init.to_script_thread_sender.clone(),
@@ -87,7 +115,7 @@ impl WorkletGlobalScope {
     }
 
     /// Evaluate a JS script in this global.
-    pub fn evaluate_js(&self, script: &str) -> bool {
+    pub fn evaluate_js(&self, script: &str, can_gc: CanGc) -> bool {
         debug!("Evaluating Dom in a worklet.");
         rooted!(in (*GlobalScope::get_cx()) let mut rval = UndefinedValue());
         self.globalscope.evaluate_js_on_global_with_result(
@@ -95,6 +123,7 @@ impl WorkletGlobalScope {
             rval.handle_mut(),
             ScriptFetchOptions::default_classic_script(&self.globalscope),
             self.globalscope.api_base_url(),
+            can_gc,
         )
     }
 
@@ -142,7 +171,7 @@ impl WorkletGlobalScope {
 
 /// Resources required by workletglobalscopes
 #[derive(Clone)]
-pub struct WorkletGlobalScopeInit {
+pub(crate) struct WorkletGlobalScopeInit {
     /// Channel to the main script thread
     pub to_script_thread_sender: Sender<MainThreadScriptMsg>,
     /// Channel to a resource thread
@@ -155,8 +184,6 @@ pub struct WorkletGlobalScopeInit {
     pub devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
     /// Messages to send to constellation
     pub to_constellation_sender: IpcSender<(PipelineId, ScriptMsg)>,
-    /// Message to send to the scheduler
-    pub scheduler_chan: IpcSender<TimerSchedulerMsg>,
     /// The image cache
     pub image_cache: Arc<dyn ImageCache>,
     /// True if in headless mode
@@ -164,7 +191,8 @@ pub struct WorkletGlobalScopeInit {
     /// An optional string allowing the user agent to be set for testing
     pub user_agent: Cow<'static, str>,
     /// Identity manager for WebGPU resources
-    pub gpu_id_hub: Arc<Identities>,
+    #[cfg(feature = "webgpu")]
+    pub gpu_id_hub: Arc<IdentityHub>,
     /// Is considered secure
     pub inherited_secure_context: Option<bool>,
 }
@@ -176,35 +204,6 @@ pub enum WorkletGlobalScopeType {
     Test,
     /// A paint worklet
     Paint,
-}
-
-impl WorkletGlobalScopeType {
-    /// Create a new heap-allocated `WorkletGlobalScope`.
-    pub fn new(
-        &self,
-        runtime: &Runtime,
-        pipeline_id: PipelineId,
-        base_url: ServoUrl,
-        executor: WorkletExecutor,
-        init: &WorkletGlobalScopeInit,
-    ) -> DomRoot<WorkletGlobalScope> {
-        match *self {
-            WorkletGlobalScopeType::Test => DomRoot::upcast(TestWorkletGlobalScope::new(
-                runtime,
-                pipeline_id,
-                base_url,
-                executor,
-                init,
-            )),
-            WorkletGlobalScopeType::Paint => DomRoot::upcast(PaintWorkletGlobalScope::new(
-                runtime,
-                pipeline_id,
-                base_url,
-                executor,
-                init,
-            )),
-        }
-    }
 }
 
 /// A task which can be performed in the context of a worklet global.

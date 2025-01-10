@@ -18,22 +18,14 @@ use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablecellelement::HTMLTableCellElement;
 use crate::dom::htmltableelement::HTMLTableElement;
 use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
-
-#[derive(JSTraceable)]
-struct CellsFilter;
-impl CollectionFilter for CellsFilter {
-    fn filter(&self, elem: &Element, root: &Node) -> bool {
-        (elem.is::<HTMLTableCellElement>()) &&
-            elem.upcast::<Node>().GetParentNode().as_deref() == Some(root)
-    }
-}
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLTableRowElement {
@@ -59,6 +51,7 @@ impl HTMLTableRowElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableRowElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableRowElement::new_inherited(
@@ -66,6 +59,7 @@ impl HTMLTableRowElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -82,7 +76,7 @@ impl HTMLTableRowElement {
     }
 }
 
-impl HTMLTableRowElementMethods for HTMLTableRowElement {
+impl HTMLTableRowElementMethods<crate::DomTypeHolder> for HTMLTableRowElement {
     // https://html.spec.whatwg.org/multipage/#dom-tr-bgcolor
     make_getter!(BgColor, "bgcolor");
 
@@ -92,19 +86,24 @@ impl HTMLTableRowElementMethods for HTMLTableRowElement {
     // https://html.spec.whatwg.org/multipage/#dom-tr-cells
     fn Cells(&self) -> DomRoot<HTMLCollection> {
         self.cells.or_init(|| {
-            let window = window_from_node(self);
-            let filter = Box::new(CellsFilter);
-            HTMLCollection::create(&window, self.upcast(), filter)
+            HTMLCollection::new_with_filter_fn(
+                &self.owner_window(),
+                self.upcast(),
+                |element, root| {
+                    (element.is::<HTMLTableCellElement>()) &&
+                        element.upcast::<Node>().GetParentNode().as_deref() == Some(root)
+                },
+            )
         })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tr-insertcell
-    fn InsertCell(&self, index: i32) -> Fallible<DomRoot<HTMLElement>> {
+    fn InsertCell(&self, index: i32, can_gc: CanGc) -> Fallible<DomRoot<HTMLElement>> {
         let node = self.upcast::<Node>();
         node.insert_cell_or_row(
             index,
             || self.Cells(),
-            || HTMLTableCellElement::new(local_name!("td"), None, &node.owner_doc(), None),
+            || HTMLTableCellElement::new(local_name!("td"), None, &node.owner_doc(), None, can_gc),
         )
     }
 

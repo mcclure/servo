@@ -32,7 +32,6 @@ use crate::dom::promise::Promise;
 use crate::dom::window::Window;
 use crate::realms::InRealm;
 use crate::script_runtime::CanGc;
-use crate::task_source::TaskSource;
 
 #[dom_struct]
 pub struct OfflineAudioContext {
@@ -44,7 +43,6 @@ pub struct OfflineAudioContext {
     pending_rendering_promise: DomRefCell<Option<Rc<Promise>>>,
 }
 
-#[allow(non_snake_case)]
 impl OfflineAudioContext {
     #[allow(crown::unrooted_must_root)]
     fn new_inherited(
@@ -97,8 +95,11 @@ impl OfflineAudioContext {
             can_gc,
         ))
     }
+}
 
-    pub fn Constructor(
+impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
+    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -114,7 +115,8 @@ impl OfflineAudioContext {
         )
     }
 
-    pub fn Constructor_(
+    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext-numberofchannels-length-samplerate
+    fn Constructor_(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -131,9 +133,7 @@ impl OfflineAudioContext {
             can_gc,
         )
     }
-}
 
-impl OfflineAudioContextMethods for OfflineAudioContext {
     // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-oncomplete
     event_handler!(complete, GetOncomplete, SetOncomplete);
 
@@ -143,8 +143,8 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-startrendering
-    fn StartRendering(&self, comp: InRealm) -> Rc<Promise> {
-        let promise = Promise::new_in_current_realm(comp);
+    fn StartRendering(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
+        let promise = Promise::new_in_current_realm(comp, can_gc);
         if self.rendering_started.get() {
             promise.reject_error(Error::InvalidState);
             return promise;
@@ -170,16 +170,16 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
             }));
 
         let this = Trusted::new(self);
-        let global = self.global();
-        let window = global.as_window();
-        let (task_source, canceller) = window
+        let task_source = self
+            .global()
             .task_manager()
-            .dom_manipulation_task_source_with_canceller();
+            .dom_manipulation_task_source()
+            .to_sendable();
         Builder::new()
             .name("OfflineACResolver".to_owned())
             .spawn(move || {
                 let _ = receiver.recv();
-                let _ = task_source.queue_with_canceller(
+                task_source.queue(
                     task!(resolve: move || {
                         let this = this.root();
                         let processed_audio = processed_audio.lock().unwrap();
@@ -196,7 +196,8 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
                             this.channel_count,
                             this.length,
                             *this.context.SampleRate(),
-                            Some(processed_audio.as_slice()));
+                            Some(processed_audio.as_slice()),
+                            CanGc::note());
                         (*this.pending_rendering_promise.borrow_mut()).take().unwrap().resolve_native(&buffer);
                         let global = &this.global();
                         let window = global.as_window();
@@ -204,10 +205,9 @@ impl OfflineAudioContextMethods for OfflineAudioContext {
                                                                      atom!("complete"),
                                                                      EventBubbles::DoesNotBubble,
                                                                      EventCancelable::NotCancelable,
-                                                                     &buffer);
-                        event.upcast::<Event>().fire(this.upcast());
-                    }),
-                    &canceller,
+                                                                     &buffer, CanGc::note());
+                        event.upcast::<Event>().fire(this.upcast(), CanGc::note());
+                    })
                 );
             })
             .unwrap();

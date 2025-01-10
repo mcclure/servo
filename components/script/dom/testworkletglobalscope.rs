@@ -31,7 +31,7 @@ pub struct TestWorkletGlobalScope {
 
 impl TestWorkletGlobalScope {
     #[allow(unsafe_code)]
-    pub fn new(
+    pub(crate) fn new(
         runtime: &Runtime,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
@@ -65,7 +65,7 @@ impl TestWorkletGlobalScope {
     }
 }
 
-impl TestWorkletGlobalScopeMethods for TestWorkletGlobalScope {
+impl TestWorkletGlobalScopeMethods<crate::DomTypeHolder> for TestWorkletGlobalScope {
     fn RegisterKeyValue(&self, key: DOMString, value: DOMString) {
         debug!("Registering test worklet key/value {}/{}.", key, value);
         self.lookup_table

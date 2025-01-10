@@ -66,11 +66,13 @@ mod from_compositor {
                 },
                 Self::IsReadyToSaveImage(..) => target!("IsReadyToSaveImage"),
                 Self::Keyboard(..) => target!("Keyboard"),
+                Self::IMECompositionEvent(..) => target!("IMECompositionEvent"),
                 Self::AllowNavigationResponse(..) => target!("AllowNavigationResponse"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
                 Self::ClearCache => target!("ClearCache"),
                 Self::TraverseHistory(..) => target!("TraverseHistory"),
                 Self::WindowSize(..) => target!("WindowSize"),
+                Self::ThemeChange(..) => target!("ThemeChange"),
                 Self::TickAnimation(..) => target!("TickAnimation"),
                 Self::WebDriverCommand(..) => target!("WebDriverCommand"),
                 Self::Reload(..) => target!("Reload"),
@@ -180,13 +182,13 @@ mod from_script {
                 Self::PipelineExited => target!("PipelineExited"),
                 Self::ForwardDOMMessage(..) => target!("ForwardDOMMessage"),
                 Self::ScheduleJob(..) => target!("ScheduleJob"),
-                Self::GetClientWindow(..) => target!("GetClientWindow"),
-                Self::GetScreenSize(..) => target!("GetScreenSize"),
-                Self::GetScreenAvailSize(..) => target!("GetScreenAvailSize"),
                 Self::MediaSessionEvent(..) => target!("MediaSessionEvent"),
+                #[cfg(feature = "webgpu")]
                 Self::RequestAdapter(..) => target!("RequestAdapter"),
+                #[cfg(feature = "webgpu")]
                 Self::GetWebGPUChan(..) => target!("GetWebGPUChan"),
                 Self::TitleChanged(..) => target!("TitleChanged"),
+                Self::IFrameSizes(..) => target!("IFrameSizes"),
             }
         }
     }
@@ -256,7 +258,6 @@ mod from_layout {
     impl LogTarget for script_traits::LayoutMsg {
         fn log_target(&self) -> &'static str {
             match self {
-                Self::IFrameSizes(..) => target!("IFrameSizes"),
                 Self::PendingPaintMetric(..) => target!("PendingPaintMetric"),
                 Self::CuervoReportStrings(..) => target!("CuervoReportStrings"),
             }

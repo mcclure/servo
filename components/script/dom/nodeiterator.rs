@@ -16,6 +16,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, MutDom};
 use crate::dom::document::Document;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct NodeIterator {
@@ -25,7 +26,7 @@ pub struct NodeIterator {
     reference_node: MutDom<Node>,
     pointer_before_reference_node: Cell<bool>,
     what_to_show: u32,
-    #[ignore_malloc_size_of = "Can't measure due to #6870"]
+    #[ignore_malloc_size_of = "Rc<NodeFilter> has shared ownership, so its size cannot be measured accurately"]
     filter: Filter,
     active: Cell<bool>,
 }
@@ -52,6 +53,7 @@ impl NodeIterator {
         reflect_dom_object(
             Box::new(NodeIterator::new_inherited(root_node, what_to_show, filter)),
             document.window(),
+            CanGc::note(),
         )
     }
 
@@ -69,7 +71,7 @@ impl NodeIterator {
     }
 }
 
-impl NodeIteratorMethods for NodeIterator {
+impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
     // https://dom.spec.whatwg.org/#dom-nodeiterator-root
     fn Root(&self) -> DomRoot<Node> {
         DomRoot::from_ref(&*self.root_node)

@@ -19,6 +19,7 @@ use crate::dom::htmlformelement::HTMLFormElement;
 use crate::dom::node::Node;
 use crate::dom::radionodelist::RadioNodeList;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLFormControlsCollection {
@@ -48,18 +49,19 @@ impl HTMLFormControlsCollection {
         reflect_dom_object(
             Box::new(HTMLFormControlsCollection::new_inherited(form, filter)),
             window,
+            CanGc::note(),
         )
-    }
-
-    // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
-    // HTMLFormControlsCollection) implements Length
-    #[allow(non_snake_case)]
-    pub fn Length(&self) -> u32 {
-        self.collection.Length()
     }
 }
 
-impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
+impl HTMLFormControlsCollectionMethods<crate::DomTypeHolder> for HTMLFormControlsCollection {
+    // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
+    // HTMLFormControlsCollection) implements Length
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
+    fn Length(&self) -> u32 {
+        self.collection.Length()
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-htmlformcontrolscollection-nameditem
     fn NamedItem(&self, name: DOMString) -> Option<RadioNodeListOrElement> {
         // Step 1

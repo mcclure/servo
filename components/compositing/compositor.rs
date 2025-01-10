@@ -9,48 +9,48 @@ use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::iter::once;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::{PipelineId, TopLevelBrowsingContextId, WebViewId};
 use base::{Epoch, WebRenderEpochToU16};
 use compositing_traits::{
-    CompositionPipeline, CompositorMsg, CompositorReceiver, ConstellationMsg,
-    ForwardedToCompositorMsg, SendableFrameTree,
+    CompositionPipeline, CompositorMsg, CompositorReceiver, ConstellationMsg, SendableFrameTree,
 };
 use crossbeam_channel::Sender;
 use embedder_traits::Cursor;
 use euclid::{Point2D, Rect, Scale, Transform3D, Vector2D};
 use fnv::{FnvHashMap, FnvHashSet};
 use image::{DynamicImage, ImageFormat};
-use ipc_channel::ipc;
+use ipc_channel::ipc::{self, IpcSharedMemory};
 use libc::c_void;
 use log::{debug, error, info, trace, warn};
 use pixels::{CorsStatus, Image, PixelFormat};
-use profile_traits::time::{self as profile_time, profile, ProfilerCategory};
+use profile_traits::time::{self as profile_time, ProfilerCategory};
+use profile_traits::time_profile;
 use script_traits::CompositorEvent::{MouseButtonEvent, MouseMoveEvent, TouchEvent, WheelEvent};
 use script_traits::{
     AnimationState, AnimationTickType, ConstellationControlMsg, MouseButton, MouseEventType,
     ScrollState, TouchEventType, TouchId, WheelDelta, WindowSizeData, WindowSizeType,
 };
 use servo_geometry::{DeviceIndependentPixel, FramebufferUintLength};
-use style_traits::{CSSPixel, DevicePixel, PinchZoomFactor};
-use tracing::{span, Level};
+use style_traits::{CSSPixel, PinchZoomFactor};
 use webrender::{CaptureBits, RenderApi, Transaction};
 use webrender_api::units::{
-    DeviceIntPoint, DeviceIntSize, DevicePoint, DeviceRect, LayoutPoint, LayoutRect, LayoutSize,
-    LayoutVector2D, WorldPoint,
+    DeviceIntPoint, DeviceIntSize, DevicePixel, DevicePoint, DeviceRect, LayoutPoint, LayoutRect,
+    LayoutSize, LayoutVector2D, WorldPoint,
 };
 use webrender_api::{
     self, BuiltDisplayList, DirtyRect, DisplayListPayload, DocumentId, Epoch as WebRenderEpoch,
-    ExternalScrollId, FontInstanceOptions, HitTestFlags, PipelineId as WebRenderPipelineId,
-    PropertyBinding, ReferenceFrameKind, RenderReasons, SampledScrollOffset, ScrollLocation,
-    SpaceAndClipInfo, SpatialId, SpatialTreeItemKey, TransformStyle,
+    ExternalScrollId, FontInstanceFlags, FontInstanceKey, FontInstanceOptions, FontKey,
+    HitTestFlags, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
+    RenderReasons, SampledScrollOffset, ScrollLocation, SpaceAndClipInfo, SpatialId,
+    SpatialTreeItemKey, TransformStyle,
 };
 use webrender_traits::display_list::{HitTestInfo, ScrollTree};
 use webrender_traits::{
-    CanvasToCompositorMsg, CompositorHitTestResult, FontToCompositorMsg, ImageUpdate,
-    NetToCompositorMsg, RenderingContext, ScriptToCompositorMsg, SerializedImageUpdate,
+    CompositorHitTestResult, CrossProcessCompositorMessage, ImageUpdate, RenderingContext,
     UntrustedNodeAddress,
 };
 
@@ -170,15 +170,16 @@ pub struct IOCompositor<Window: WindowMethods + ?Sized> {
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,
 
+    #[cfg(feature = "webxr")]
     /// Some XR devices want to run on the main thread.
     pub webxr_main_thread: webxr::MainThreadRegistry,
 
-    /// Map of the pending paint metrics per Layout.
-    /// The Layout for each specific pipeline expects the compositor to
-    /// paint frames with specific given IDs (epoch). Once the compositor paints
-    /// these frames, it records the paint time for each of them and sends the
-    /// metric to the corresponding Layout.
-    pending_paint_metrics: HashMap<PipelineId, Epoch>,
+    /// A per-pipeline queue of display lists that have not yet been rendered by WebRender. Layout
+    /// expects WebRender to paint each given epoch. Once the compositor paints a frame with that
+    /// epoch's display list, it will be removed from the queue and the paint time will be recorded
+    /// as a metric. In case new display lists come faster than painting a metric might never be
+    /// recorded.
+    pending_paint_metrics: HashMap<PipelineId, Vec<Epoch>>,
 
     /// The coordinates of the native window, its view and the screen.
     embedder_coordinates: EmbedderCoordinates,
@@ -362,33 +363,13 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
         composite_target: CompositeTarget,
         exit_after_load: bool,
         convert_mouse_to_touch: bool,
-        top_level_browsing_context_id: TopLevelBrowsingContextId,
         version_string: String,
     ) -> Self {
-        let embedder_coordinates = window.get_coordinates();
-        let mut webviews = WebViewManager::default();
-        webviews
-            .add(
-                top_level_browsing_context_id,
-                WebView {
-                    pipeline_id: None,
-                    rect: embedder_coordinates.get_viewport().to_f32(),
-                },
-            )
-            .expect("Infallible with a new WebViewManager");
-        let msg = ConstellationMsg::WebViewOpened(top_level_browsing_context_id);
-        if let Err(e) = state.constellation_chan.send(msg) {
-            warn!("Sending event to constellation failed ({:?}).", e);
-        }
-        webviews
-            .show(top_level_browsing_context_id)
-            .expect("Infallible due to add");
-
         let compositor = IOCompositor {
             embedder_coordinates: window.get_coordinates(),
             window,
             port: state.receiver,
-            webviews,
+            webviews: WebViewManager::default(),
             pipeline_details: HashMap::new(),
             composition_request: CompositionRequest::NoCompositingNecessary,
             touch_handler: TouchHandler::new(),
@@ -410,6 +391,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             webrender_api: state.webrender_api,
             rendering_context: state.rendering_context,
             webrender_gl: state.webrender_gl,
+            #[cfg(feature = "webxr")]
             webxr_main_thread: state.webxr_main_thread,
             pending_paint_metrics: HashMap::new(),
             cursor: Cursor::None,
@@ -608,7 +590,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                 let _ = sender.send(());
             },
 
-            CompositorMsg::NewWebRenderFrameReady(recomposite_needed) => {
+            CompositorMsg::NewWebRenderFrameReady(_document_id, recomposite_needed) => {
                 self.pending_frames -= 1;
 
                 if recomposite_needed {
@@ -648,32 +630,14 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             },
 
             CompositorMsg::PendingPaintMetric(pipeline_id, epoch) => {
-                self.pending_paint_metrics.insert(pipeline_id, epoch);
+                self.pending_paint_metrics
+                    .entry(pipeline_id)
+                    .or_default()
+                    .push(epoch);
             },
 
-            CompositorMsg::GetClientWindow(req) => {
-                if let Err(e) = req.send(self.embedder_coordinates.window) {
-                    warn!("Sending response to get client window failed ({:?}).", e);
-                }
-            },
-
-            CompositorMsg::GetScreenSize(req) => {
-                if let Err(e) = req.send(self.embedder_coordinates.screen) {
-                    warn!("Sending response to get screen size failed ({:?}).", e);
-                }
-            },
-
-            CompositorMsg::GetScreenAvailSize(req) => {
-                if let Err(e) = req.send(self.embedder_coordinates.screen_avail) {
-                    warn!(
-                        "Sending response to get screen avail size failed ({:?}).",
-                        e
-                    );
-                }
-            },
-
-            CompositorMsg::Forwarded(msg) => {
-                self.handle_webrender_message(msg);
+            CompositorMsg::CrossProcess(cross_proces_message) => {
+                self.handle_cross_process_message(cross_proces_message);
             },
         }
 
@@ -682,12 +646,13 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
 
     /// Accept messages from content processes that need to be relayed to the WebRender
     /// instance in the parent process.
-    #[tracing::instrument(skip(self), fields(servo_profiling = true))]
-    fn handle_webrender_message(&mut self, msg: ForwardedToCompositorMsg) {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
+    fn handle_cross_process_message(&mut self, msg: CrossProcessCompositorMessage) {
         match msg {
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::SendInitialTransaction(
-                pipeline,
-            )) => {
+            CrossProcessCompositorMessage::SendInitialTransaction(pipeline) => {
                 let mut txn = Transaction::new();
                 txn.set_display_list(WebRenderEpoch(0), (pipeline, Default::default()));
                 self.generate_frame(&mut txn, RenderReasons::SCENE);
@@ -695,11 +660,11 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                     .send_transaction(self.webrender_document, txn);
             },
 
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::SendScrollNode(
+            CrossProcessCompositorMessage::SendScrollNode(
                 pipeline_id,
                 point,
                 external_scroll_id,
-            )) => {
+            ) => {
                 let pipeline_id = pipeline_id.into();
                 let pipeline_details = match self.pipeline_details.get_mut(&pipeline_id) {
                     Some(details) => details,
@@ -731,11 +696,11 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                     .send_transaction(self.webrender_document, txn);
             },
 
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::SendDisplayList {
+            CrossProcessCompositorMessage::SendDisplayList {
                 display_list_info,
                 display_list_descriptor,
                 display_list_receiver,
-            }) => {
+            } => {
                 // This must match the order from the sender, currently in `shared/script/lib.rs`.
                 let items_data = match display_list_receiver.recv() {
                     Ok(display_list_data) => display_list_data,
@@ -770,12 +735,12 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                     display_list_descriptor,
                 );
 
-                let span = span!(
-                    Level::TRACE,
+                #[cfg(feature = "tracing")]
+                let _span = tracing::trace_span!(
                     "ScriptToCompositorMsg::BuiltDisplayList",
-                    servo_profiling = true
-                );
-                let _enter = span.enter();
+                    servo_profiling = true,
+                )
+                .entered();
                 let pipeline_id = display_list_info.pipeline_id;
                 let details = self.pipeline_details(pipeline_id.into());
                 details.most_recent_display_list_epoch = Some(display_list_info.epoch);
@@ -791,12 +756,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                     .send_transaction(self.webrender_document, transaction);
             },
 
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::HitTest(
-                pipeline,
-                point,
-                flags,
-                sender,
-            )) => {
+            CrossProcessCompositorMessage::HitTest(pipeline, point, flags, sender) => {
                 // When a display list is sent to WebRender, it starts scene building in a
                 // separate thread and then that display list is available for hit testing.
                 // Without flushing scene building, any hit test we do might be done against
@@ -813,27 +773,20 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                 let _ = sender.send(result);
             },
 
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::GenerateImageKey(sender)) |
-            ForwardedToCompositorMsg::Net(NetToCompositorMsg::GenerateImageKey(sender)) => {
+            CrossProcessCompositorMessage::GenerateImageKey(sender) => {
                 let _ = sender.send(self.webrender_api.generate_image_key());
             },
 
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::UpdateImages(updates)) => {
+            CrossProcessCompositorMessage::UpdateImages(updates) => {
                 let mut txn = Transaction::new();
                 for update in updates {
                     match update {
-                        SerializedImageUpdate::AddImage(key, desc, data) => {
-                            match data.to_image_data() {
-                                Ok(data) => txn.add_image(key, desc, data, None),
-                                Err(e) => warn!("error when sending image data: {:?}", e),
-                            }
+                        ImageUpdate::AddImage(key, desc, data) => {
+                            txn.add_image(key, desc, data.into(), None)
                         },
-                        SerializedImageUpdate::DeleteImage(key) => txn.delete_image(key),
-                        SerializedImageUpdate::UpdateImage(key, desc, data) => {
-                            match data.to_image_data() {
-                                Ok(data) => txn.update_image(key, desc, data, &DirtyRect::All),
-                                Err(e) => warn!("error when sending image data: {:?}", e),
-                            }
+                        ImageUpdate::DeleteImage(key) => txn.delete_image(key),
+                        ImageUpdate::UpdateImage(key, desc, data) => {
+                            txn.update_image(key, desc, data.into(), &DirtyRect::All)
                         },
                     }
                 }
@@ -841,10 +794,27 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                     .send_transaction(self.webrender_document, txn);
             },
 
-            ForwardedToCompositorMsg::Layout(ScriptToCompositorMsg::RemoveFonts(
-                keys,
-                instance_keys,
-            )) => {
+            CrossProcessCompositorMessage::AddFont(font_key, data, index) => {
+                self.add_font(font_key, index, data);
+            },
+
+            CrossProcessCompositorMessage::AddSystemFont(font_key, native_handle) => {
+                let mut transaction = Transaction::new();
+                transaction.add_native_font(font_key, native_handle);
+                self.webrender_api
+                    .send_transaction(self.webrender_document, transaction);
+            },
+
+            CrossProcessCompositorMessage::AddFontInstance(
+                font_instance_key,
+                font_key,
+                size,
+                flags,
+            ) => {
+                self.add_font_instance(font_instance_key, font_key, size, flags);
+            },
+
+            CrossProcessCompositorMessage::RemoveFonts(keys, instance_keys) => {
                 let mut transaction = Transaction::new();
 
                 for instance in instance_keys.into_iter() {
@@ -858,85 +828,43 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                     .send_transaction(self.webrender_document, transaction);
             },
 
-            ForwardedToCompositorMsg::Net(NetToCompositorMsg::AddImage(key, desc, data)) => {
+            CrossProcessCompositorMessage::AddImage(key, desc, data) => {
                 let mut txn = Transaction::new();
-                txn.add_image(key, desc, data, None);
+                txn.add_image(key, desc, data.into(), None);
                 self.webrender_api
                     .send_transaction(self.webrender_document, txn);
             },
 
-            ForwardedToCompositorMsg::Font(FontToCompositorMsg::AddFontInstance(
-                font_key,
-                size,
-                flags,
-                sender,
-            )) => {
-                let key = self.webrender_api.generate_font_instance_key();
-                let mut transaction = Transaction::new();
-
-                let font_instance_options = FontInstanceOptions {
-                    flags,
-                    ..Default::default()
-                };
-                transaction.add_font_instance(
-                    key,
-                    font_key,
-                    size,
-                    Some(font_instance_options),
-                    None,
-                    Vec::new(),
-                );
-
-                self.webrender_api
-                    .send_transaction(self.webrender_document, transaction);
-                let _ = sender.send(key);
+            CrossProcessCompositorMessage::GenerateFontKeys(
+                number_of_font_keys,
+                number_of_font_instance_keys,
+                result_sender,
+            ) => {
+                let font_keys = (0..number_of_font_keys)
+                    .map(|_| self.webrender_api.generate_font_key())
+                    .collect();
+                let font_instance_keys = (0..number_of_font_instance_keys)
+                    .map(|_| self.webrender_api.generate_font_instance_key())
+                    .collect();
+                let _ = result_sender.send((font_keys, font_instance_keys));
             },
-
-            ForwardedToCompositorMsg::Font(FontToCompositorMsg::AddFont(
-                key_sender,
-                index,
-                bytes_receiver,
-            )) => {
-                let font_key = self.webrender_api.generate_font_key();
-                let mut transaction = Transaction::new();
-                let bytes = bytes_receiver.recv().unwrap_or_default();
-                transaction.add_raw_font(font_key, bytes, index);
-                self.webrender_api
-                    .send_transaction(self.webrender_document, transaction);
-                let _ = key_sender.send(font_key);
-            },
-
-            ForwardedToCompositorMsg::Font(FontToCompositorMsg::AddSystemFont(
-                key_sender,
-                native_handle,
-            )) => {
-                let font_key = self.webrender_api.generate_font_key();
-                let mut transaction = Transaction::new();
-                transaction.add_native_font(font_key, native_handle);
-                self.webrender_api
-                    .send_transaction(self.webrender_document, transaction);
-                let _ = key_sender.send(font_key);
-            },
-
-            ForwardedToCompositorMsg::Canvas(CanvasToCompositorMsg::GenerateKey(sender)) => {
-                let _ = sender.send(self.webrender_api.generate_image_key());
-            },
-
-            ForwardedToCompositorMsg::Canvas(CanvasToCompositorMsg::UpdateImages(updates)) => {
-                let mut txn = Transaction::new();
-                for update in updates {
-                    match update {
-                        ImageUpdate::AddImage(key, descriptor, data) => {
-                            txn.add_image(key, descriptor, data, None)
-                        },
-                        ImageUpdate::UpdateImage(key, descriptor, data) => {
-                            txn.update_image(key, descriptor, data, &DirtyRect::All)
-                        },
-                        ImageUpdate::DeleteImage(key) => txn.delete_image(key),
-                    }
+            CrossProcessCompositorMessage::GetClientWindowRect(req) => {
+                if let Err(e) = req.send(self.embedder_coordinates.window_rect) {
+                    warn!("Sending response to get client window failed ({:?}).", e);
                 }
-                self.webrender_api
-                    .send_transaction(self.webrender_document, txn);
+            },
+            CrossProcessCompositorMessage::GetScreenSize(req) => {
+                if let Err(e) = req.send(self.embedder_coordinates.screen_size) {
+                    warn!("Sending response to get screen size failed ({:?}).", e);
+                }
+            },
+            CrossProcessCompositorMessage::GetAvailableScreenSize(req) => {
+                if let Err(e) = req.send(self.embedder_coordinates.available_screen_size) {
+                    warn!(
+                        "Sending response to get screen avail size failed ({:?}).",
+                        e
+                    );
+                }
             },
         }
     }
@@ -961,47 +889,50 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                 self.remove_pipeline_root_layer(pipeline_id);
                 let _ = sender.send(());
             },
-            CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFontInstance(_, _, _, sender),
-            )) => {
-                let _ = sender.send(self.webrender_api.generate_font_instance_key());
-            },
-            CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFont(sender, _, _),
-            )) => {
-                let _ = sender.send(self.webrender_api.generate_font_key());
-            },
-            CompositorMsg::Forwarded(ForwardedToCompositorMsg::Canvas(
-                CanvasToCompositorMsg::GenerateKey(sender),
+            CompositorMsg::CrossProcess(CrossProcessCompositorMessage::GenerateImageKey(
+                sender,
             )) => {
                 let _ = sender.send(self.webrender_api.generate_image_key());
             },
-            CompositorMsg::GetClientWindow(sender) => {
-                if let Err(e) = sender.send(self.embedder_coordinates.window) {
+            CompositorMsg::CrossProcess(CrossProcessCompositorMessage::GenerateFontKeys(
+                number_of_font_keys,
+                number_of_font_instance_keys,
+                result_sender,
+            )) => {
+                let font_keys = (0..number_of_font_keys)
+                    .map(|_| self.webrender_api.generate_font_key())
+                    .collect();
+                let font_instance_keys = (0..number_of_font_instance_keys)
+                    .map(|_| self.webrender_api.generate_font_instance_key())
+                    .collect();
+                let _ = result_sender.send((font_keys, font_instance_keys));
+            },
+            CompositorMsg::CrossProcess(CrossProcessCompositorMessage::GetClientWindowRect(
+                req,
+            )) => {
+                if let Err(e) = req.send(self.embedder_coordinates.window_rect) {
                     warn!("Sending response to get client window failed ({:?}).", e);
                 }
             },
-            CompositorMsg::GetScreenSize(sender) => {
-                if let Err(e) = sender.send(self.embedder_coordinates.screen) {
+            CompositorMsg::CrossProcess(CrossProcessCompositorMessage::GetScreenSize(req)) => {
+                if let Err(e) = req.send(self.embedder_coordinates.screen_size) {
                     warn!("Sending response to get screen size failed ({:?}).", e);
                 }
             },
-            CompositorMsg::GetScreenAvailSize(sender) => {
-                if let Err(e) = sender.send(self.embedder_coordinates.screen_avail) {
+            CompositorMsg::CrossProcess(CrossProcessCompositorMessage::GetAvailableScreenSize(
+                req,
+            )) => {
+                if let Err(e) = req.send(self.embedder_coordinates.available_screen_size) {
                     warn!(
                         "Sending response to get screen avail size failed ({:?}).",
                         e
                     );
                 }
             },
-            CompositorMsg::NewWebRenderFrameReady(_) => {
+            CompositorMsg::NewWebRenderFrameReady(..) => {
                 // Subtract from the number of pending frames, but do not do any compositing.
                 self.pending_frames -= 1;
             },
-            CompositorMsg::PendingPaintMetric(pipeline_id, epoch) => {
-                self.pending_paint_metrics.insert(pipeline_id, epoch);
-            },
-
             _ => {
                 debug!("Ignoring message ({:?} while shutting down", msg);
             },
@@ -1409,7 +1340,11 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
 
         if self.embedder_coordinates.viewport != old_coords.viewport {
             let mut transaction = Transaction::new();
-            transaction.set_document_view(self.embedder_coordinates.get_viewport());
+            let size = self.embedder_coordinates.get_viewport();
+            transaction.set_document_view(size);
+            if let Err(e) = self.rendering_context.resize(size.size().to_untyped()) {
+                warn!("Failed to resize surface: {e:?}");
+            }
             self.webrender_api
                 .send_transaction(self.webrender_document, transaction);
         }
@@ -1478,10 +1413,9 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
     }
 
     fn hit_test_at_point(&self, point: DevicePoint) -> Option<CompositorHitTestResult> {
-        return self
-            .hit_test_at_point_with_flags_and_pipeline(point, HitTestFlags::empty(), None)
+        self.hit_test_at_point_with_flags_and_pipeline(point, HitTestFlags::empty(), None)
             .first()
-            .cloned();
+            .cloned()
     }
 
     fn hit_test_at_point_with_flags_and_pipeline(
@@ -1852,7 +1786,11 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                 pipeline_ids.push(*pipeline_id);
             }
         }
-        let animation_state = if pipeline_ids.is_empty() && !self.webxr_main_thread.running() {
+        #[cfg(feature = "webxr")]
+        let webxr_running = self.webxr_main_thread.running();
+        #[cfg(not(feature = "webxr"))]
+        let webxr_running = false;
+        let animation_state = if pipeline_ids.is_empty() && !webxr_running {
             windowing::AnimationState::Idle
         } else {
             windowing::AnimationState::Animating
@@ -1917,11 +1855,8 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             return;
         }
 
-        self.page_zoom = Scale::new(
-            (self.page_zoom.get() * magnification)
-                .max(MIN_ZOOM)
-                .min(MAX_ZOOM),
-        );
+        self.page_zoom =
+            Scale::new((self.page_zoom.get() * magnification).clamp(MIN_ZOOM, MAX_ZOOM));
         self.update_after_zoom_or_hidpi_change();
     }
 
@@ -1946,6 +1881,16 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
         // TODO: Scroll to keep the center in view?
         self.pending_scroll_zoom_events
             .push(ScrollZoomEvent::PinchZoom(magnification));
+    }
+
+    /// On a Window refresh tick (e.g. vsync)
+    pub fn on_vsync(&mut self) {
+        if let Some(fling_action) = self.touch_handler.on_vsync() {
+            self.on_scroll_window_event(
+                ScrollLocation::Delta(fling_action.delta),
+                fling_action.cursor,
+            );
+        }
     }
 
     fn send_scroll_positions_to_layout_for_pipeline(&self, pipeline_id: &PipelineId) {
@@ -2062,7 +2007,10 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
     /// Returns Ok if composition was performed or Err if it was not possible to composite for some
     /// reason. When the target is [CompositeTarget::SharedMemory], the image is read back from the
     /// GPU and returned as Ok(Some(png::Image)), otherwise we return Ok(None).
-    #[tracing::instrument(skip(self), fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn composite_specific_target(
         &mut self,
         target: CompositeTarget,
@@ -2131,7 +2079,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             self.assert_gl_framebuffer_complete();
         }
 
-        profile(
+        time_profile!(
             ProfilerCategory::Compositing,
             None,
             self.time_profiler_chan.clone(),
@@ -2148,48 +2096,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             },
         );
 
-        // If there are pending paint metrics, we check if any of the painted epochs is one of the
-        // ones that the paint metrics recorder is expecting. In that case, we get the current
-        // time, inform layout about it and remove the pending metric from the list.
-        if !self.pending_paint_metrics.is_empty() {
-            let paint_time = CrossProcessInstant::now();
-            let mut to_remove = Vec::new();
-            // For each pending paint metrics pipeline id
-            for (id, pending_epoch) in &self.pending_paint_metrics {
-                // we get the last painted frame id from webrender
-                if let Some(WebRenderEpoch(epoch)) = self
-                    .webrender
-                    .current_epoch(self.webrender_document, id.into())
-                {
-                    // and check if it is the one layout is expecting,
-                    let epoch = Epoch(epoch);
-                    if *pending_epoch != epoch {
-                        warn!(
-                            "{}: paint metrics: pending {:?} should be {:?}",
-                            id, pending_epoch, epoch
-                        );
-                        continue;
-                    }
-                    // in which case, we remove it from the list of pending metrics,
-                    to_remove.push(*id);
-                    if let Some(pipeline) = self.pipeline(*id) {
-                        // and inform layout with the measured paint time.
-                        if let Err(e) =
-                            pipeline
-                                .script_chan
-                                .send(ConstellationControlMsg::SetEpochPaintTime(
-                                    *id, epoch, paint_time,
-                                ))
-                        {
-                            warn!("Sending RequestLayoutPaintMetric message to layout failed ({e:?}).");
-                        }
-                    }
-                }
-            }
-            for id in to_remove.iter() {
-                self.pending_paint_metrics.remove(id);
-            }
-        }
+        self.send_pending_paint_metrics_messages_after_composite();
 
         let (x, y, width, height) = if let Some(rect) = page_rect {
             let rect = self.device_pixels_per_page_pixel().transform_rect(&rect);
@@ -2247,7 +2154,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
                 })
             },
             CompositeTarget::PngFile(path) => {
-                profile(
+                time_profile!(
                     ProfilerCategory::ImageSaving,
                     None,
                     self.time_profiler_chan.clone(),
@@ -2275,12 +2182,10 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             },
         };
 
-        let span = span!(
-            Level::TRACE,
-            "ConstellationMsg::ReadyToPresent",
-            servo_profiling = true
-        );
-        let _enter = span.enter();
+        #[cfg(feature = "tracing")]
+        let _span =
+            tracing::trace_span!("ConstellationMsg::ReadyToPresent", servo_profiling = true)
+                .entered();
         // Notify embedder that servo is ready to present.
         // Embedder should call `present` to tell compositor to continue rendering.
         self.waiting_on_present = true;
@@ -2297,6 +2202,72 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
         Ok(rv)
     }
 
+    /// Send all pending paint metrics messages after a composite operation, which may advance
+    /// the epoch for pipelines in the WebRender scene.
+    ///
+    /// If there are pending paint metrics, we check if any of the painted epochs is one
+    /// of the ones that the paint metrics recorder is expecting. In that case, we get the
+    /// current time, inform the constellation about it and remove the pending metric from
+    /// the list.
+    fn send_pending_paint_metrics_messages_after_composite(&mut self) {
+        if self.pending_paint_metrics.is_empty() {
+            return;
+        }
+
+        let paint_time = CrossProcessInstant::now();
+        let mut pipelines_to_remove = Vec::new();
+        let pending_paint_metrics = &mut self.pending_paint_metrics;
+
+        // For each pending paint metrics pipeline id, determine the current
+        // epoch and update paint timing if necessary.
+        for (pipeline_id, pending_epochs) in pending_paint_metrics.iter_mut() {
+            let Some(WebRenderEpoch(current_epoch)) = self
+                .webrender
+                .current_epoch(self.webrender_document, pipeline_id.into())
+            else {
+                continue;
+            };
+
+            // If the pipeline is unknown, stop trying to send paint metrics for it.
+            let Some(pipeline) = self
+                .pipeline_details
+                .get(pipeline_id)
+                .and_then(|pipeline_details| pipeline_details.pipeline.as_ref())
+            else {
+                pipelines_to_remove.push(*pipeline_id);
+                continue;
+            };
+
+            let current_epoch = Epoch(current_epoch);
+            let Some(index) = pending_epochs
+                .iter()
+                .position(|epoch| *epoch == current_epoch)
+            else {
+                continue;
+            };
+
+            // Remove all epochs that were pending before the current epochs. They were not and will not,
+            // be painted.
+            pending_epochs.drain(0..index);
+
+            if let Err(error) =
+                pipeline
+                    .script_chan
+                    .send(ConstellationControlMsg::SetEpochPaintTime(
+                        *pipeline_id,
+                        current_epoch,
+                        paint_time,
+                    ))
+            {
+                warn!("Sending RequestLayoutPaintMetric message to layout failed ({error:?}).");
+            }
+        }
+
+        for pipeline_id in pipelines_to_remove.iter() {
+            self.pending_paint_metrics.remove(pipeline_id);
+        }
+    }
+
     /// Return the OpenGL framebuffer name of the most-recently-completed frame when compositing to
     /// [`CompositeTarget::Fbo`], or None otherwise.
     pub fn offscreen_framebuffer_id(&self) -> Option<gleam::gl::GLuint> {
@@ -2305,14 +2276,14 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             .map(|info| info.framebuffer_id())
     }
 
-    #[tracing::instrument(skip(self), fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     pub fn present(&mut self) {
-        let span = span!(
-            Level::TRACE,
-            "Compositor Present Surface",
-            servo_profiling = true
-        );
-        let _enter = span.enter();
+        #[cfg(feature = "tracing")]
+        let _span =
+            tracing::trace_span!("Compositor Present Surface", servo_profiling = true).entered();
         if let Err(err) = self.rendering_context.present() {
             warn!("Failed to present surface: {:?}", err);
         }
@@ -2374,19 +2345,22 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
         );
     }
 
-    #[tracing::instrument(skip(self), fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     pub fn receive_messages(&mut self) -> bool {
         // Check for new messages coming from the other threads in the system.
         let mut compositor_messages = vec![];
         let mut found_recomposite_msg = false;
         while let Some(msg) = self.port.try_recv_compositor_msg() {
             match msg {
-                CompositorMsg::NewWebRenderFrameReady(_) if found_recomposite_msg => {
+                CompositorMsg::NewWebRenderFrameReady(..) if found_recomposite_msg => {
                     // Only take one of duplicate NewWebRendeFrameReady messages, but do subtract
                     // one frame from the pending frames.
                     self.pending_frames -= 1;
                 },
-                CompositorMsg::NewWebRenderFrameReady(_) => {
+                CompositorMsg::NewWebRenderFrameReady(..) => {
                     found_recomposite_msg = true;
                     compositor_messages.push(msg)
                 },
@@ -2401,7 +2375,10 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
         true
     }
 
-    #[tracing::instrument(skip(self), fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     pub fn perform_updates(&mut self) -> bool {
         if self.shutdown_state == ShutdownState::FinishedShuttingDown {
             return false;
@@ -2421,6 +2398,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
             CompositionRequest::CompositeNow(_) => self.composite(),
         }
 
+        #[cfg(feature = "webxr")]
         // Run the WebXR main thread
         self.webxr_main_thread.run_one_frame();
 
@@ -2440,7 +2418,7 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
     pub fn repaint_synchronously(&mut self) {
         while self.shutdown_state != ShutdownState::ShuttingDown {
             let msg = self.port.recv_compositor_msg();
-            let need_recomposite = matches!(msg, CompositorMsg::NewWebRenderFrameReady(_));
+            let need_recomposite = matches!(msg, CompositorMsg::NewWebRenderFrameReady(..));
             let keep_going = self.handle_browser_message(msg);
             if need_recomposite {
                 self.composite();
@@ -2518,5 +2496,38 @@ impl<Window: WindowMethods + ?Sized> IOCompositor<Window> {
         {
             eprintln!("Unable to write servo version for WebRender Capture: {error:?}");
         }
+    }
+
+    fn add_font_instance(
+        &mut self,
+        instance_key: FontInstanceKey,
+        font_key: FontKey,
+        size: f32,
+        flags: FontInstanceFlags,
+    ) {
+        let mut transaction = Transaction::new();
+
+        let font_instance_options = FontInstanceOptions {
+            flags,
+            ..Default::default()
+        };
+        transaction.add_font_instance(
+            instance_key,
+            font_key,
+            size,
+            Some(font_instance_options),
+            None,
+            Vec::new(),
+        );
+
+        self.webrender_api
+            .send_transaction(self.webrender_document, transaction);
+    }
+
+    fn add_font(&mut self, font_key: FontKey, index: u32, data: Arc<IpcSharedMemory>) {
+        let mut transaction = Transaction::new();
+        transaction.add_raw_font(font_key, (**data).into(), index);
+        self.webrender_api
+            .send_transaction(self.webrender_document, transaction);
     }
 }

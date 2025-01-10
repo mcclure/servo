@@ -17,6 +17,7 @@ use crate::dom::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::node::Node;
 use crate::dom::nodelist::{NodeList, NodeListType, RadioList, RadioListMode};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct RadioNodeList {
@@ -33,7 +34,11 @@ impl RadioNodeList {
 
     #[allow(crown::unrooted_must_root)]
     pub fn new(window: &Window, list_type: NodeListType) -> DomRoot<RadioNodeList> {
-        reflect_dom_object(Box::new(RadioNodeList::new_inherited(list_type)), window)
+        reflect_dom_object(
+            Box::new(RadioNodeList::new_inherited(list_type)),
+            window,
+            CanGc::note(),
+        )
     }
 
     pub fn new_controls_except_image_inputs(
@@ -61,16 +66,15 @@ impl RadioNodeList {
             NodeListType::Radio(RadioList::new(form, RadioListMode::Images, name.clone())),
         )
     }
-
-    // https://dom.spec.whatwg.org/#dom-nodelist-length
-    // https://github.com/servo/servo/issues/5875
-    #[allow(non_snake_case)]
-    pub fn Length(&self) -> u32 {
-        self.node_list.Length()
-    }
 }
 
-impl RadioNodeListMethods for RadioNodeList {
+impl RadioNodeListMethods<crate::DomTypeHolder> for RadioNodeList {
+    // https://dom.spec.whatwg.org/#dom-nodelist-length
+    // https://github.com/servo/servo/issues/5875
+    fn Length(&self) -> u32 {
+        self.node_list.Length()
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-radionodelist-value
     fn Value(&self) -> DOMString {
         self.upcast::<NodeList>()

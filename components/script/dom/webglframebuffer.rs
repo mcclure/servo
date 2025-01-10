@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![allow(unused_imports)]
+
 // https://www.khronos.org/registry/webgl/specs/latest/1.0/webgl.idl
 use std::cell::Cell;
 
@@ -11,6 +13,7 @@ use canvas_traits::webgl::{
 };
 use dom_struct::dom_struct;
 use euclid::Size2D;
+#[cfg(feature = "webxr")]
 use webxr_api::Viewport;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -22,7 +25,9 @@ use crate::dom::webglobject::WebGLObject;
 use crate::dom::webglrenderbuffer::WebGLRenderbuffer;
 use crate::dom::webglrenderingcontext::{Operation, WebGLRenderingContext};
 use crate::dom::webgltexture::WebGLTexture;
+#[cfg(feature = "webxr")]
 use crate::dom::xrsession::XRSession;
+use crate::script_runtime::CanGc;
 
 pub enum CompleteForRendering {
     Complete,
@@ -108,6 +113,7 @@ pub struct WebGLFramebuffer {
     is_initialized: Cell<bool>,
     // Framebuffers for XR keep a reference to the XR session.
     // https://github.com/immersive-web/webxr/issues/856
+    #[cfg(feature = "webxr")]
     xr_session: MutNullableDom<XRSession>,
 }
 
@@ -128,6 +134,7 @@ impl WebGLFramebuffer {
             color_read_buffer: DomRefCell::new(constants::COLOR_ATTACHMENT0),
             color_draw_buffers: DomRefCell::new(vec![constants::COLOR_ATTACHMENT0]),
             is_initialized: Cell::new(false),
+            #[cfg(feature = "webxr")]
             xr_session: Default::default(),
         }
     }
@@ -142,6 +149,7 @@ impl WebGLFramebuffer {
 
     // TODO: depth, stencil and alpha
     // https://github.com/servo/servo/issues/24498
+    #[cfg(feature = "webxr")]
     pub fn maybe_new_webxr(
         session: &XRSession,
         context: &WebGLRenderingContext,
@@ -158,6 +166,7 @@ impl WebGLFramebuffer {
         reflect_dom_object(
             Box::new(WebGLFramebuffer::new_inherited(context, id)),
             &*context.global(),
+            CanGc::note(),
         )
     }
 }
@@ -167,8 +176,14 @@ impl WebGLFramebuffer {
         self.id
     }
 
+    #[cfg(feature = "webxr")]
     fn is_in_xr_session(&self) -> bool {
         self.xr_session.get().is_some()
+    }
+
+    #[cfg(not(feature = "webxr"))]
+    fn is_in_xr_session(&self) -> bool {
+        false
     }
 
     pub fn validate_transparent(&self) -> WebGLResult<()> {
@@ -217,6 +232,25 @@ impl WebGLFramebuffer {
 
     pub fn size(&self) -> Option<(i32, i32)> {
         self.size.get()
+    }
+
+    pub fn get_attachment_formats(&self) -> WebGLResult<(Option<u32>, Option<u32>, Option<u32>)> {
+        if self.check_status() != constants::FRAMEBUFFER_COMPLETE {
+            return Err(WebGLError::InvalidFramebufferOperation);
+        }
+        let color = match self.attachment(constants::COLOR_ATTACHMENT0) {
+            Some(WebGLFramebufferAttachmentRoot::Renderbuffer(rb)) => Some(rb.internal_format()),
+            _ => None,
+        };
+        let depth = match self.attachment(constants::DEPTH_ATTACHMENT) {
+            Some(WebGLFramebufferAttachmentRoot::Renderbuffer(rb)) => Some(rb.internal_format()),
+            _ => None,
+        };
+        let stencil = match self.attachment(constants::STENCIL_ATTACHMENT) {
+            Some(WebGLFramebufferAttachmentRoot::Renderbuffer(rb)) => Some(rb.internal_format()),
+            _ => None,
+        };
+        Ok((color, depth, stencil))
     }
 
     fn check_attachment_constraints<'a>(
@@ -445,15 +479,16 @@ impl WebGLFramebuffer {
     pub fn check_status(&self) -> u32 {
         // For opaque framebuffers, check to see if the XR session is currently processing an rAF
         // https://immersive-web.github.io/webxr/#opaque-framebuffer
+        #[cfg(feature = "webxr")]
         if let Some(xr_session) = self.xr_session.get() {
-            if xr_session.is_outside_raf() {
+            return if xr_session.is_outside_raf() {
                 constants::FRAMEBUFFER_UNSUPPORTED
             } else {
                 constants::FRAMEBUFFER_COMPLETE
-            }
-        } else {
-            self.status.get()
+            };
         }
+
+        self.status.get()
         // TODO: if a framebuffer has an attachment which is invalid due to
         // being outside a webxr rAF, should this make the framebuffer incomplete?
         // https://github.com/immersive-web/layers/issues/196
@@ -467,6 +502,7 @@ impl WebGLFramebuffer {
 
         // XR framebuffers are complete inside an rAF
         // https://github.com/immersive-web/webxr/issues/854
+        #[cfg(feature = "webxr")]
         if self.xr_session.get().is_some() {
             return CompleteForRendering::Complete;
         }

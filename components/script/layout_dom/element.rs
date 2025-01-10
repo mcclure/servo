@@ -56,7 +56,7 @@ pub struct ServoLayoutElement<'dom> {
     element: LayoutDom<'dom, Element>,
 }
 
-impl<'dom> fmt::Debug for ServoLayoutElement<'dom> {
+impl fmt::Debug for ServoLayoutElement<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "<{}", self.element.local_name())?;
         if let Some(id) = self.id() {
@@ -89,12 +89,24 @@ impl<'dom> ServoLayoutElement<'dom> {
         self.as_node().style_data()
     }
 
+    /// Unset the snapshot flags on the underlying DOM object for this element.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
     pub unsafe fn unset_snapshot_flags(&self) {
         self.as_node()
             .node
             .set_flag(NodeFlags::HAS_SNAPSHOT | NodeFlags::HANDLED_SNAPSHOT, false);
     }
 
+    /// Unset the snapshot flags on the underlying DOM object for this element.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
     pub unsafe fn set_has_snapshot(&self) {
         self.as_node().node.set_flag(NodeFlags::HAS_SNAPSHOT, true);
     }
@@ -128,20 +140,41 @@ impl<'dom> ServoLayoutElement<'dom> {
     }
 }
 
+pub struct DomChildrenIncludingShadowDom<N> {
+    children: DomChildren<N>,
+    children_in_shadow_root: Option<DomChildren<N>>,
+}
+
+impl<N> Iterator for DomChildrenIncludingShadowDom<N>
+where
+    N: TNode,
+{
+    type Item = N;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.children
+            .next()
+            .or_else(|| self.children_in_shadow_root.as_mut()?.next())
+    }
+}
+
 impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
     type ConcreteNode = ServoLayoutNode<'dom>;
-    type TraversalChildrenIterator = DomChildren<Self::ConcreteNode>;
+    type TraversalChildrenIterator = DomChildrenIncludingShadowDom<Self::ConcreteNode>;
 
     fn as_node(&self) -> ServoLayoutNode<'dom> {
         ServoLayoutNode::from_layout_js(self.element.upcast())
     }
 
     fn traversal_children(&self) -> LayoutIterator<Self::TraversalChildrenIterator> {
-        LayoutIterator(if let Some(shadow) = self.shadow_root() {
-            shadow.as_node().dom_children()
-        } else {
-            self.as_node().dom_children()
-        })
+        let children = DomChildrenIncludingShadowDom {
+            children: self.as_node().dom_children(),
+            children_in_shadow_root: self
+                .shadow_root()
+                .map(|shadow| shadow.as_node().dom_children()),
+        };
+
+        LayoutIterator(children)
     }
 
     fn is_html_element(&self) -> bool {
@@ -767,7 +800,7 @@ impl<'dom> ThreadSafeLayoutElement<'dom> for ServoThreadSafeLayoutElement<'dom> 
 ///
 /// Note that the element implementation is needed only for selector matching,
 /// not for inheritance (styles are inherited appropriately).
-impl<'dom> ::selectors::Element for ServoThreadSafeLayoutElement<'dom> {
+impl ::selectors::Element for ServoThreadSafeLayoutElement<'_> {
     type Impl = SelectorImpl;
 
     fn opaque(&self) -> ::selectors::OpaqueElement {
@@ -814,8 +847,7 @@ impl<'dom> ::selectors::Element for ServoThreadSafeLayoutElement<'dom> {
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        debug!("ServoThreadSafeLayoutElement::is_html_element_in_html_document called");
-        true
+        self.element.is_html_element_in_html_document()
     }
 
     #[inline]

@@ -15,7 +15,7 @@ use js::rust::HandleObject;
 use mime::{self, Mime};
 use net_traits::http_percent_encode;
 use net_traits::request::Referrer;
-use script_traits::{HistoryEntryReplacement, LoadData, LoadOrigin};
+use script_traits::{LoadData, LoadOrigin, NavigationHistoryBehavior};
 use servo_atoms::Atom;
 use servo_rand::random;
 use style::attr::AttrValue;
@@ -24,6 +24,7 @@ use style_dom::ElementState;
 
 use super::bindings::trace::{HashMapTracedValues, NoTrace};
 use crate::body::Extractable;
+use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::AttrBinding::Attr_Binding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
@@ -37,6 +38,7 @@ use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputE
 use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{NodeConstants, NodeMethods};
 use crate::dom::bindings::codegen::Bindings::NodeListBinding::NodeListMethods;
+use crate::dom::bindings::codegen::Bindings::RadioNodeListBinding::RadioNodeListMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes::RadioNodeListOrElement;
 use crate::dom::bindings::error::{Error, Fallible};
@@ -55,8 +57,6 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
 use crate::dom::formdata::FormData;
 use crate::dom::formdataevent::FormDataEvent;
-use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlanchorelement::{get_element_noopener, get_element_target};
 use crate::dom::htmlbuttonelement::HTMLButtonElement;
 use crate::dom::htmlcollection::CollectionFilter;
 use crate::dom::htmldatalistelement::HTMLDataListElement;
@@ -72,16 +72,16 @@ use crate::dom::htmloutputelement::HTMLOutputElement;
 use crate::dom::htmlselectelement::HTMLSelectElement;
 use crate::dom::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::node::{
-    document_from_node, window_from_node, Node, NodeFlags, UnbindContext,
-    VecPreOrderInsertionHelper,
+    BindContext, Node, NodeFlags, NodeTraits, UnbindContext, VecPreOrderInsertionHelper,
 };
 use crate::dom::nodelist::{NodeList, RadioListMode};
 use crate::dom::radionodelist::RadioNodeList;
 use crate::dom::submitevent::SubmitEvent;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
+use crate::links::{get_element_target, LinkRelations};
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
-use crate::task_source::TaskSource;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 pub struct GenerationId(u32);
@@ -95,9 +95,15 @@ pub struct HTMLFormElement {
     elements: DomOnceCell<HTMLFormControlsCollection>,
     generation_id: Cell<GenerationId>,
     controls: DomRefCell<Vec<Dom<Element>>>,
+
+    #[allow(clippy::type_complexity)]
     past_names_map: DomRefCell<HashMapTracedValues<Atom, (Dom<Element>, NoTrace<Instant>)>>,
+
     firing_submission_events: Cell<bool>,
     rel_list: MutNullableDom<DOMTokenList>,
+
+    #[no_trace]
+    relations: Cell<LinkRelations>,
 }
 
 impl HTMLFormElement {
@@ -121,6 +127,7 @@ impl HTMLFormElement {
             past_names_map: DomRefCell::new(HashMapTracedValues::new()),
             firing_submission_events: Cell::new(false),
             rel_list: Default::default(),
+            relations: Cell::new(LinkRelations::empty()),
         }
     }
 
@@ -130,11 +137,13 @@ impl HTMLFormElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFormElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLFormElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -191,7 +200,7 @@ impl HTMLFormElement {
     }
 }
 
-impl HTMLFormElementMethods for HTMLFormElement {
+impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
     // https://html.spec.whatwg.org/multipage/#dom-form-acceptcharset
     make_getter!(AcceptCharset, "accept-charset");
 
@@ -205,7 +214,13 @@ impl HTMLFormElementMethods for HTMLFormElement {
     make_setter!(SetAction, "action");
 
     // https://html.spec.whatwg.org/multipage/#dom-form-autocomplete
-    make_enumerated_getter!(Autocomplete, "autocomplete", "on", "off");
+    make_enumerated_getter!(
+        Autocomplete,
+        "autocomplete",
+        "on" | "off",
+        missing => "on",
+        invalid => "on"
+    );
 
     // https://html.spec.whatwg.org/multipage/#dom-form-autocomplete
     make_setter!(SetAutocomplete, "autocomplete");
@@ -214,8 +229,9 @@ impl HTMLFormElementMethods for HTMLFormElement {
     make_enumerated_getter!(
         Enctype,
         "enctype",
-        "application/x-www-form-urlencoded",
-        "text/plain" | "multipart/form-data"
+        "application/x-www-form-urlencoded" | "text/plain" | "multipart/form-data",
+        missing => "application/x-www-form-urlencoded",
+        invalid => "application/x-www-form-urlencoded"
     );
 
     // https://html.spec.whatwg.org/multipage/#dom-fs-enctype
@@ -232,7 +248,13 @@ impl HTMLFormElementMethods for HTMLFormElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-fs-method
-    make_enumerated_getter!(Method, "method", "get", "post" | "dialog");
+    make_enumerated_getter!(
+        Method,
+        "method",
+        "get" | "post" | "dialog",
+        missing => "get",
+        invalid => "get"
+    );
 
     // https://html.spec.whatwg.org/multipage/#dom-fs-method
     make_setter!(SetMethod, "method");
@@ -259,12 +281,16 @@ impl HTMLFormElementMethods for HTMLFormElement {
     make_getter!(Rel, "rel");
 
     // https://html.spec.whatwg.org/multipage/#the-form-element:concept-form-submit
-    fn Submit(&self) {
-        self.submit(SubmittedFrom::FromForm, FormSubmitterElement::Form(self));
+    fn Submit(&self, can_gc: CanGc) {
+        self.submit(
+            SubmittedFrom::FromForm,
+            FormSubmitterElement::Form(self),
+            can_gc,
+        );
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-form-requestsubmit
-    fn RequestSubmit(&self, submitter: Option<&HTMLElement>) -> Fallible<()> {
+    fn RequestSubmit(&self, submitter: Option<&HTMLElement>, can_gc: CanGc) -> Fallible<()> {
         let submitter: FormSubmitterElement = match submitter {
             Some(submitter_element) => {
                 // Step 1.1
@@ -320,13 +346,13 @@ impl HTMLFormElementMethods for HTMLFormElement {
             },
         };
         // Step 3
-        self.submit(SubmittedFrom::NotFromForm, submitter);
+        self.submit(SubmittedFrom::NotFromForm, submitter, can_gc);
         Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-form-reset
-    fn Reset(&self) {
-        self.reset(ResetFrom::FromForm);
+    fn Reset(&self, can_gc: CanGc) {
+        self.reset(ResetFrom::FromForm, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-form-elements
@@ -393,7 +419,7 @@ impl HTMLFormElementMethods for HTMLFormElement {
             let filter = Box::new(ElementsFilter {
                 form: DomRoot::from_ref(self),
             });
-            let window = window_from_node(self);
+            let window = self.owner_window();
             HTMLFormControlsCollection::new(&window, self, filter)
         }))
     }
@@ -411,7 +437,7 @@ impl HTMLFormElementMethods for HTMLFormElement {
 
     // https://html.spec.whatwg.org/multipage/#the-form-element%3Adetermine-the-value-of-a-named-property
     fn NamedGetter(&self, name: DOMString) -> Option<RadioNodeListOrElement> {
-        let window = window_from_node(self);
+        let window = self.owner_window();
 
         let name = Atom::from(name);
 
@@ -454,15 +480,15 @@ impl HTMLFormElementMethods for HTMLFormElement {
         );
 
         // Step 6
-        return Some(RadioNodeListOrElement::Element(DomRoot::from_ref(
+        Some(RadioNodeListOrElement::Element(DomRoot::from_ref(
             element_node.downcast::<Element>().unwrap(),
-        )));
+        )))
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-a-rel
-    fn SetRel(&self, rel: DOMString) {
+    fn SetRel(&self, rel: DOMString, can_gc: CanGc) {
         self.upcast::<Element>()
-            .set_tokenlist_attribute(&local_name!("rel"), rel);
+            .set_tokenlist_attribute(&local_name!("rel"), rel, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-a-rellist
@@ -615,13 +641,13 @@ impl HTMLFormElementMethods for HTMLFormElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-form-checkvalidity>
-    fn CheckValidity(&self) -> bool {
-        self.static_validation().is_ok()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.static_validation(can_gc).is_ok()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-form-reportvalidity>
-    fn ReportValidity(&self) -> bool {
-        self.interactive_validation().is_ok()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.interactive_validation(can_gc).is_ok()
     }
 }
 
@@ -659,7 +685,7 @@ impl HTMLFormElement {
         }
 
         // Step 1, 3
-        document_from_node(self).encoding()
+        self.owner_document().encoding()
     }
 
     // https://html.spec.whatwg.org/multipage/#text/plain-encoding-algorithm
@@ -691,7 +717,12 @@ impl HTMLFormElement {
     }
 
     /// [Form submission](https://html.spec.whatwg.org/multipage/#concept-form-submit)
-    pub fn submit(&self, submit_method_flag: SubmittedFrom, submitter: FormSubmitterElement) {
+    pub fn submit(
+        &self,
+        submit_method_flag: SubmittedFrom,
+        submitter: FormSubmitterElement,
+        can_gc: CanGc,
+    ) {
         // Step 1
         if self.upcast::<Element>().cannot_navigate() {
             return;
@@ -702,7 +733,7 @@ impl HTMLFormElement {
             return;
         }
         // Step 3
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
         let base = doc.base_url();
         // TODO: Handle browsing contexts (Step 4, 5)
         // Step 6
@@ -714,7 +745,7 @@ impl HTMLFormElement {
             // Step 6.2
             self.firing_submission_events.set(true);
             // Step 6.3
-            if !submitter.no_validate(self) && self.interactive_validation().is_err() {
+            if !submitter.no_validate(self) && self.interactive_validation(can_gc).is_err() {
                 self.firing_submission_events.set(false);
                 return;
             }
@@ -740,9 +771,10 @@ impl HTMLFormElement {
                 true,
                 true,
                 submitter_button.map(DomRoot::from_ref),
+                can_gc,
             );
             let event = event.upcast::<Event>();
-            event.fire(self.upcast::<EventTarget>());
+            event.fire(self.upcast::<EventTarget>(), can_gc);
 
             // Step 6.6
             self.firing_submission_events.set(false);
@@ -760,7 +792,7 @@ impl HTMLFormElement {
         let encoding = self.pick_encoding();
 
         // Step 8
-        let mut form_data = match self.get_form_dataset(Some(submitter), Some(encoding)) {
+        let mut form_data = match self.get_form_dataset(Some(submitter), Some(encoding), can_gc) {
             Some(form_data) => form_data,
             None => return,
         };
@@ -798,8 +830,10 @@ impl HTMLFormElement {
             };
 
         // Step 18
-        let noopener =
-            get_element_noopener(self.upcast::<Element>(), target_attribute_value.clone());
+        let noopener = self
+            .relations
+            .get()
+            .get_element_noopener(target_attribute_value.as_ref());
 
         // Step 19
         let source = doc.browsing_context().unwrap();
@@ -821,9 +855,9 @@ impl HTMLFormElement {
             LoadOrigin::Script(doc.origin().immutable().clone()),
             action_components,
             None,
-            target_window.upcast::<GlobalScope>().get_referrer(),
+            target_window.as_global_scope().get_referrer(),
             target_document.get_referrer_policy(),
-            Some(target_window.upcast::<GlobalScope>().is_secure_context()),
+            Some(target_window.as_global_scope().is_secure_context()),
         );
 
         // Step 22
@@ -848,6 +882,7 @@ impl HTMLFormElement {
                     enctype,
                     encoding,
                     target_window,
+                    can_gc,
                 );
             },
             // https://html.spec.whatwg.org/multipage/#submit-get-action
@@ -898,6 +933,7 @@ impl HTMLFormElement {
         enctype: FormEncType,
         encoding: &'static Encoding,
         target: &Window,
+        can_gc: CanGc,
     ) {
         let boundary = generate_boundary();
         let bytes = match enctype {
@@ -935,7 +971,7 @@ impl HTMLFormElement {
         let global = self.global();
 
         let request_body = bytes
-            .extract(&global)
+            .extract(&global, can_gc)
             .expect("Couldn't extract body.")
             .into_net_request_body()
             .0;
@@ -972,12 +1008,11 @@ impl HTMLFormElement {
             Some(ref link_types) if link_types.Value().contains("noreferrer") => {
                 Referrer::NoReferrer
             },
-            _ => target.upcast::<GlobalScope>().get_referrer(),
+            _ => target.as_global_scope().get_referrer(),
         };
 
         let referrer_policy = target.Document().get_referrer_policy();
-        let pipeline_id = target.upcast::<GlobalScope>().pipeline_id();
-        load_data.creator_pipeline_id = Some(pipeline_id);
+        load_data.creator_pipeline_id = Some(target.pipeline_id());
         load_data.referrer = referrer;
         load_data.referrer_policy = referrer_policy;
 
@@ -991,25 +1026,26 @@ impl HTMLFormElement {
             window
                 .root()
                 .load_url(
-                    HistoryEntryReplacement::Disabled,
+                    NavigationHistoryBehavior::Push,
                     false,
                     load_data,
+                    CanGc::note(),
                 );
         });
 
         // Step 3.
         target
+            .global()
             .task_manager()
             .dom_manipulation_task_source()
-            .queue(task, target.upcast())
-            .unwrap();
+            .queue(task)
     }
 
     /// Interactively validate the constraints of form elements
     /// <https://html.spec.whatwg.org/multipage/#interactively-validate-the-constraints>
-    fn interactive_validation(&self) -> Result<(), ()> {
+    fn interactive_validation(&self, can_gc: CanGc) -> Result<(), ()> {
         // Step 1-2
-        let unhandled_invalid_controls = match self.static_validation() {
+        let unhandled_invalid_controls = match self.static_validation(can_gc) {
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
@@ -1023,7 +1059,7 @@ impl HTMLFormElement {
             }
             if first {
                 if let Some(html_elem) = elem.downcast::<HTMLElement>() {
-                    html_elem.Focus();
+                    html_elem.Focus(can_gc);
                     first = false;
                 }
             }
@@ -1037,7 +1073,7 @@ impl HTMLFormElement {
 
     /// Statitically validate the constraints of form elements
     /// <https://html.spec.whatwg.org/multipage/#statically-validate-the-constraints>
-    fn static_validation(&self) -> Result<(), Vec<DomRoot<Element>>> {
+    fn static_validation(&self, can_gc: CanGc) -> Result<(), Vec<DomRoot<Element>>> {
         let controls = self.controls.borrow();
         // Step 1-3
         let invalid_controls = controls
@@ -1064,7 +1100,7 @@ impl HTMLFormElement {
             .filter_map(|field| {
                 let event = field
                     .upcast::<EventTarget>()
-                    .fire_cancelable_event(atom!("invalid"));
+                    .fire_cancelable_event(atom!("invalid"), can_gc);
                 if !event.DefaultPrevented() {
                     return Some(field);
                 }
@@ -1094,10 +1130,7 @@ impl HTMLFormElement {
             let child = child.upcast::<Node>();
 
             // Step 5.1: The field element has a datalist element ancestor.
-            if child
-                .ancestors()
-                .any(|a| DomRoot::downcast::<HTMLDataListElement>(a).is_some())
-            {
+            if child.ancestors().any(|a| a.is::<HTMLDataListElement>()) {
                 continue;
             }
             if let NodeTypeId::Element(ElementTypeId::HTMLElement(element)) = child.type_id() {
@@ -1171,6 +1204,7 @@ impl HTMLFormElement {
         &self,
         submitter: Option<FormSubmitterElement>,
         encoding: Option<&'static Encoding>,
+        can_gc: CanGc,
     ) -> Option<Vec<FormDatum>> {
         // Step 1
         if self.constructing_entry_list.get() {
@@ -1183,10 +1217,10 @@ impl HTMLFormElement {
         // Step 3-6
         let ret = self.get_unclean_dataset(submitter, encoding);
 
-        let window = window_from_node(self);
+        let window = self.owner_window();
 
         // Step 6
-        let form_data = FormData::new(Some(ret), &window.global());
+        let form_data = FormData::new(Some(ret), &window.global(), can_gc);
 
         // Step 7
         let event = FormDataEvent::new(
@@ -1195,9 +1229,12 @@ impl HTMLFormElement {
             EventBubbles::Bubbles,
             EventCancelable::NotCancelable,
             &form_data,
+            can_gc,
         );
 
-        event.upcast::<Event>().fire(self.upcast::<EventTarget>());
+        event
+            .upcast::<Event>()
+            .fire(self.upcast::<EventTarget>(), can_gc);
 
         // Step 8
         self.constructing_entry_list.set(false);
@@ -1206,7 +1243,7 @@ impl HTMLFormElement {
         Some(form_data.datums())
     }
 
-    pub fn reset(&self, _reset_method_flag: ResetFrom) {
+    pub fn reset(&self, _reset_method_flag: ResetFrom, can_gc: CanGc) {
         // https://html.spec.whatwg.org/multipage/#locked-for-reset
         if self.marked_for_reset.get() {
             return;
@@ -1216,7 +1253,7 @@ impl HTMLFormElement {
 
         let event = self
             .upcast::<EventTarget>()
-            .fire_bubbling_cancelable_event(atom!("reset"));
+            .fire_bubbling_cancelable_event(atom!("reset"), CanGc::note());
         if event.DefaultPrevented() {
             return;
         }
@@ -1244,7 +1281,7 @@ impl HTMLFormElement {
                 NodeTypeId::Element(ElementTypeId::HTMLElement(
                     HTMLElementTypeId::HTMLOutputElement,
                 )) => {
-                    child.downcast::<HTMLOutputElement>().unwrap().reset();
+                    child.downcast::<HTMLOutputElement>().unwrap().reset(can_gc);
                 },
                 NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLElement)) => {
                     let html_element = child.downcast::<HTMLElement>().unwrap();
@@ -1343,7 +1380,7 @@ pub enum FormSubmitterElement<'a> {
     // (including custom elements) that can be passed as submitter.
 }
 
-impl<'a> FormSubmitterElement<'a> {
+impl FormSubmitterElement<'_> {
     fn action(&self) -> DOMString {
         match *self {
             FormSubmitterElement::Form(form) => form.Action(),
@@ -1503,7 +1540,7 @@ pub trait FormControl: DomObject {
 
         let new_owner = if self.is_listed() && has_form_id && elem.is_connected() {
             // Step 3
-            let doc = document_from_node(node);
+            let doc = node.owner_document();
             let form_id = elem.get_string_attribute(&local_name!("form"));
             doc.GetElementById(form_id)
                 .and_then(DomRoot::downcast::<HTMLFormElement>)
@@ -1556,8 +1593,8 @@ pub trait FormControl: DomObject {
         let node = elem.upcast::<Node>();
 
         if self.is_listed() && !form_id.is_empty() && node.is_connected() {
-            let doc = document_from_node(node);
-            doc.register_form_id_listener(form_id, self);
+            node.owner_document()
+                .register_form_id_listener(form_id, self);
         }
     }
 
@@ -1566,8 +1603,8 @@ pub trait FormControl: DomObject {
         let form_id = elem.get_string_attribute(&local_name!("form"));
 
         if self.is_listed() && !form_id.is_empty() {
-            let doc = document_from_node(elem.upcast::<Node>());
-            doc.unregister_form_id_listener(form_id, self);
+            elem.owner_document()
+                .unregister_form_id_listener(form_id, self);
         }
     }
 
@@ -1684,6 +1721,27 @@ impl VirtualMethods for HTMLFormElement {
                 .unwrap()
                 .parse_plain_attribute(name, value),
         }
+    }
+
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
+        self.super_type().unwrap().attribute_mutated(attr, mutation);
+
+        match *attr.local_name() {
+            local_name!("rel") | local_name!("rev") => {
+                self.relations
+                    .set(LinkRelations::for_element(self.upcast()));
+            },
+            _ => {},
+        }
+    }
+
+    fn bind_to_tree(&self, context: &BindContext) {
+        if let Some(s) = self.super_type() {
+            s.bind_to_tree(context);
+        }
+
+        self.relations
+            .set(LinkRelations::for_element(self.upcast()));
     }
 }
 

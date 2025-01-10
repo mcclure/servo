@@ -46,8 +46,9 @@ impl File {
         blob_impl: BlobImpl,
         name: DOMString,
         modified: Option<SystemTime>,
+        can_gc: CanGc,
     ) -> DomRoot<File> {
-        Self::new_with_proto(global, None, blob_impl, name, modified, CanGc::note())
+        Self::new_with_proto(global, None, blob_impl, name, modified, can_gc)
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -70,7 +71,11 @@ impl File {
     }
 
     // Construct from selected file message from file manager thread
-    pub fn new_from_selected(window: &Window, selected: SelectedFile) -> DomRoot<File> {
+    pub fn new_from_selected(
+        window: &Window,
+        selected: SelectedFile,
+        can_gc: CanGc,
+    ) -> DomRoot<File> {
         let name = DOMString::from(
             selected
                 .filename
@@ -88,12 +93,27 @@ impl File {
             ),
             name,
             Some(selected.modified),
+            can_gc,
         )
     }
 
+    pub fn file_bytes(&self) -> Result<Vec<u8>, ()> {
+        self.blob.get_bytes()
+    }
+
+    pub fn name(&self) -> &DOMString {
+        &self.name
+    }
+
+    pub fn file_type(&self) -> String {
+        self.blob.type_string()
+    }
+}
+
+impl FileMethods<crate::DomTypeHolder> for File {
     // https://w3c.github.io/FileAPI/#file-constructor
     #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -126,12 +146,6 @@ impl File {
         ))
     }
 
-    pub fn name(&self) -> &DOMString {
-        &self.name
-    }
-}
-
-impl FileMethods for File {
     // https://w3c.github.io/FileAPI/#dfn-name
     fn Name(&self) -> DOMString {
         self.name.clone()

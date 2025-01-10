@@ -53,7 +53,10 @@ mod dummy {
 pub use self::dummy::LIVE_REFERENCES;
 
 /// A pointer to a Rust DOM object that needs to be destroyed.
-struct TrustedReference(*const libc::c_void);
+#[derive(MallocSizeOf)]
+struct TrustedReference(
+    #[ignore_malloc_size_of = "This is a shared reference."] *const libc::c_void,
+);
 unsafe impl Send for TrustedReference {}
 
 impl TrustedReference {
@@ -158,10 +161,13 @@ impl TrustedPromise {
 /// DOM object is guaranteed to live at least as long as the last outstanding
 /// `Trusted<T>` instance.
 #[crown::unrooted_must_root_lint::allow_unrooted_interior]
+#[derive(MallocSizeOf)]
 pub struct Trusted<T: DomObject> {
     /// A pointer to the Rust DOM object of type T, but void to allow
     /// sending `Trusted<T>` between threads, regardless of T's sendability.
+    #[conditional_malloc_size_of]
     refcount: Arc<TrustedReference>,
+    #[ignore_malloc_size_of = "These are shared by all `Trusted` types."]
     owner_thread: *const LiveDOMReferences,
     phantom: PhantomData<T>,
 }
@@ -253,12 +259,13 @@ impl LiveDOMReferences {
     /// ptr must be a pointer to a type that implements DOMObject.
     /// This is not enforced by the type system to reduce duplicated generic code,
     /// which is acceptable since this method is internal to this module.
+    #[allow(clippy::arc_with_non_send_sync)]
     unsafe fn addref(&self, ptr: *const libc::c_void) -> Arc<TrustedReference> {
         let mut table = self.reflectable_table.borrow_mut();
         let capacity = table.capacity();
         let len = table.len();
         if (0 < capacity) && (capacity <= len) {
-            info!("growing refcounted references by {}", len);
+            trace!("growing refcounted references by {}", len);
             remove_nulls(&mut table);
             table.reserve(len);
         }
@@ -287,7 +294,7 @@ fn remove_nulls<K: Eq + Hash + Clone, V>(table: &mut HashMap<K, Weak<V>>) {
         .filter(|&(_, value)| Weak::upgrade(value).is_none())
         .map(|(key, _)| key.clone())
         .collect();
-    info!("removing {} refcounted references", to_remove.len());
+    trace!("removing {} refcounted references", to_remove.len());
     for key in to_remove {
         table.remove(&key);
     }
@@ -296,7 +303,7 @@ fn remove_nulls<K: Eq + Hash + Clone, V>(table: &mut HashMap<K, Weak<V>>) {
 /// A JSTraceDataOp for tracing reflectors held in LIVE_REFERENCES
 #[allow(crown::unrooted_must_root)]
 pub unsafe fn trace_refcounted_objects(tracer: *mut JSTracer) {
-    info!("tracing live refcounted references");
+    trace!("tracing live refcounted references");
     LIVE_REFERENCES.with(|r| {
         let r = r.borrow();
         let live_references = r.as_ref().unwrap();

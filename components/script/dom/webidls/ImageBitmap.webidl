@@ -14,20 +14,20 @@
 interface ImageBitmap {
   readonly attribute unsigned long width;
   readonly attribute unsigned long height;
-  //void close();
+  undefined close();
 };
 
 typedef (CanvasImageSource or
          Blob or
          ImageData) ImageBitmapSource;
 
-enum ImageOrientation { "none", "flipY" };
+enum ImageOrientation { "from-image", "flipY" };
 enum PremultiplyAlpha { "none", "premultiply", "default" };
 enum ColorSpaceConversion { "none", "default" };
 enum ResizeQuality { "pixelated", "low", "medium", "high" };
 
 dictionary ImageBitmapOptions {
-  ImageOrientation imageOrientation = "none";
+  ImageOrientation imageOrientation = "from-image";
   PremultiplyAlpha premultiplyAlpha = "default";
   ColorSpaceConversion colorSpaceConversion = "default";
   [EnforceRange] unsigned long resizeWidth;

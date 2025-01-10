@@ -14,6 +14,7 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct Client {
@@ -39,7 +40,11 @@ impl Client {
     }
 
     pub fn new(window: &Window) -> DomRoot<Client> {
-        reflect_dom_object(Box::new(Client::new_inherited(window.get_url())), window)
+        reflect_dom_object(
+            Box::new(Client::new_inherited(window.get_url())),
+            window,
+            CanGc::note(),
+        )
     }
 
     pub fn creation_url(&self) -> ServoUrl {
@@ -56,7 +61,7 @@ impl Client {
     }
 }
 
-impl ClientMethods for Client {
+impl ClientMethods<crate::DomTypeHolder> for Client {
     // https://w3c.github.io/ServiceWorker/#client-url-attribute
     fn Url(&self) -> USVString {
         USVString(self.url.as_str().to_owned())

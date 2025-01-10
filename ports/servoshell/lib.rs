@@ -4,21 +4,18 @@
 
 use cfg_if::cfg_if;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[macro_use]
-extern crate sig;
-
 #[cfg(test)]
 mod test;
 
 #[cfg(not(target_os = "android"))]
 mod backtrace;
+#[cfg(not(target_env = "ohos"))]
 mod crash_handler;
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub(crate) mod desktop;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod egl;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 mod panic_hook;
 mod parser;
 mod prefs;
@@ -41,27 +38,42 @@ pub fn main() {
     desktop::cli::main()
 }
 
+pub fn init_crypto() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Error initializing crypto provider");
+}
+
 pub fn init_tracing() {
     #[cfg(feature = "tracing")]
     {
+        use tracing_subscriber::layer::SubscriberExt;
         let subscriber = tracing_subscriber::registry();
 
         #[cfg(feature = "tracing-perfetto")]
         let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
             // Set up a PerfettoLayer for performance tracing.
             // The servo.pftrace file can be uploaded to https://ui.perfetto.dev for analysis.
             let file = std::fs::File::create("servo.pftrace").unwrap();
-            let perfetto_layer = tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(file));
+            let perfetto_layer = tracing_perfetto::PerfettoLayer::new(std::sync::Mutex::new(file))
+                .with_filter_by_marker(|field_name| field_name == "servo_profiling")
+                .with_debug_annotations(true);
             subscriber.with(perfetto_layer)
         };
 
         #[cfg(feature = "tracing-hitrace")]
         let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
             // Set up a HitraceLayer for performance tracing.
             subscriber.with(HitraceLayer::default())
         };
+
+        // Filter events and spans by the directives in SERVO_TRACING, using EnvFilter as a global filter.
+        // <https://docs.rs/tracing-subscriber/0.3.18/tracing_subscriber/layer/index.html#global-filtering>
+        let filter = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(tracing::level_filters::LevelFilter::OFF.into())
+            .with_env_var("SERVO_TRACING")
+            .from_env_lossy();
+        let subscriber = subscriber.with(filter);
 
         // Same as SubscriberInitExt::init, but avoids initialising the tracing-log compat layer,
         // since it would break Servo’s FromScriptLogger and FromCompositorLogger.

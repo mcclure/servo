@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::LazyCell;
 use std::convert::From;
 use std::fmt;
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
@@ -9,11 +10,15 @@ use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 use app_units::Au;
 use serde::Serialize;
 use style::logical_geometry::{BlockFlowDirection, InlineBaseDirection, WritingMode};
-use style::values::computed::{CSSPixelLength, LengthPercentage};
+use style::values::computed::{
+    CSSPixelLength, LengthPercentage, MaxSize as StyleMaxSize, Size as StyleSize,
+};
 use style::values::generics::length::GenericLengthPercentageOrAuto as AutoOr;
 use style::Zero;
 use style_traits::CSSPixel;
 
+use crate::sizing::ContentSizes;
+use crate::style_ext::Clamp;
 use crate::ContainingBlock;
 
 pub type PhysicalPoint<U> = euclid::Point2D<U, CSSPixel>;
@@ -52,6 +57,38 @@ impl<T: fmt::Debug> fmt::Debug for LogicalVec2<T> {
         f.write_str(", b: ")?;
         self.block.fmt(f)?;
         f.write_str(" }")
+    }
+}
+
+impl<T: Default> Default for LogicalVec2<T> {
+    fn default() -> Self {
+        Self {
+            inline: T::default(),
+            block: T::default(),
+        }
+    }
+}
+
+impl<T> LogicalVec2<T> {
+    pub fn map_inline_and_block_axes<U>(
+        &self,
+        inline_f: impl FnOnce(&T) -> U,
+        block_f: impl FnOnce(&T) -> U,
+    ) -> LogicalVec2<U> {
+        LogicalVec2 {
+            inline: inline_f(&self.inline),
+            block: block_f(&self.block),
+        }
+    }
+}
+
+impl<T: Clone> LogicalVec2<Size<T>> {
+    pub fn map_inline_and_block_sizes<U>(
+        &self,
+        inline_f: impl FnOnce(T) -> U,
+        block_f: impl FnOnce(T) -> U,
+    ) -> LogicalVec2<Size<U>> {
+        self.map_inline_and_block_axes(|size| size.map(inline_f), |size| size.map(block_f))
     }
 }
 
@@ -136,89 +173,6 @@ impl<T: Clone> LogicalVec2<AutoOr<T>> {
     }
 }
 
-impl LogicalVec2<LengthPercentageOrAuto<'_>> {
-    pub(crate) fn percentages_relative_to(
-        &self,
-        containing_block: &ContainingBlock,
-    ) -> LogicalVec2<AuOrAuto> {
-        LogicalVec2 {
-            inline: self
-                .inline
-                .map(|value| value.to_used_value(containing_block.inline_size)),
-            block: {
-                self.block
-                    .non_auto()
-                    .and_then(|value| {
-                        value.maybe_to_used_value(containing_block.block_size.non_auto())
-                    })
-                    .map_or(AuOrAuto::Auto, AuOrAuto::LengthPercentage)
-            },
-        }
-    }
-}
-
-impl LogicalVec2<LengthPercentageOrAuto<'_>> {
-    pub(crate) fn percentages_relative_to_basis(
-        &self,
-        basis: &LogicalVec2<Au>,
-    ) -> LogicalVec2<AuOrAuto> {
-        LogicalVec2 {
-            inline: self.inline.map(|value| value.to_used_value(basis.inline)),
-            block: self.block.map(|value| value.to_used_value(basis.block)),
-        }
-    }
-}
-
-impl LogicalVec2<LengthPercentageOrAuto<'_>> {
-    pub(crate) fn maybe_percentages_relative_to_basis(
-        &self,
-        basis: &LogicalVec2<Option<Au>>,
-    ) -> LogicalVec2<AuOrAuto> {
-        LogicalVec2 {
-            inline: self
-                .inline
-                .non_auto()
-                .and_then(|value| value.maybe_to_used_value(basis.inline))
-                .map_or(AuOrAuto::Auto, AuOrAuto::LengthPercentage),
-            block: self
-                .block
-                .non_auto()
-                .and_then(|value| value.maybe_to_used_value(basis.block))
-                .map_or(AuOrAuto::Auto, AuOrAuto::LengthPercentage),
-        }
-    }
-}
-
-impl LogicalVec2<Option<&'_ LengthPercentage>> {
-    pub(crate) fn percentages_relative_to(
-        &self,
-        containing_block: &ContainingBlock,
-    ) -> LogicalVec2<Option<Au>> {
-        LogicalVec2 {
-            inline: self
-                .inline
-                .map(|lp| lp.to_used_value(containing_block.inline_size)),
-            block: self
-                .block
-                .and_then(|lp| lp.maybe_to_used_value(containing_block.block_size.non_auto())),
-        }
-    }
-}
-
-impl LogicalVec2<Option<&'_ LengthPercentage>> {
-    pub(crate) fn maybe_percentages_relative_to_basis(
-        &self,
-        basis: &LogicalVec2<Option<Au>>,
-    ) -> LogicalVec2<Option<Au>> {
-        LogicalVec2 {
-            inline: self
-                .inline
-                .and_then(|v| v.maybe_to_used_value(basis.inline)),
-            block: self.block.and_then(|v| v.maybe_to_used_value(basis.block)),
-        }
-    }
-}
-
 impl<T: Zero> LogicalRect<T> {
     pub fn zero() -> Self {
         Self {
@@ -265,31 +219,6 @@ impl<T: Copy + Neg<Output = T>> LogicalVec2<T> {
             PhysicalVec::new(self.block, self.inline)
         } else {
             PhysicalVec::new(-self.block, self.inline)
-        }
-    }
-}
-
-impl LogicalVec2<Au> {
-    #[inline]
-    pub fn to_physical_point(
-        &self,
-        containing_block: Option<&ContainingBlock>,
-    ) -> PhysicalPoint<Au> {
-        let mode = containing_block.map_or_else(WritingMode::horizontal_tb, |containing_block| {
-            containing_block.style.writing_mode
-        });
-        if mode.is_vertical() {
-            // TODO: Bottom-to-top writing modes are not supported yet.
-            PhysicalPoint::new(self.block, self.inline)
-        } else {
-            let y = self.block;
-            let x = match containing_block {
-                Some(containing_block) if !mode.is_bidi_ltr() => {
-                    containing_block.inline_size - self.inline
-                },
-                _ => self.inline,
-            };
-            PhysicalPoint::new(x, y)
         }
     }
 }
@@ -414,7 +343,7 @@ impl<T: Copy> LogicalSides<T> {
     }
 }
 
-impl LogicalSides<&'_ LengthPercentage> {
+impl LogicalSides<LengthPercentage> {
     pub fn percentages_relative_to(&self, basis: Au) -> LogicalSides<Au> {
         self.map(|value| value.to_used_value(basis))
     }
@@ -554,7 +483,10 @@ impl<T> LogicalRect<T> {
 }
 
 impl LogicalRect<Au> {
-    pub fn to_physical(&self, containing_block: Option<&ContainingBlock<'_>>) -> PhysicalRect<Au> {
+    pub(crate) fn as_physical(
+        &self,
+        containing_block: Option<&ContainingBlock<'_>>,
+    ) -> PhysicalRect<Au> {
         let mode = containing_block.map_or_else(WritingMode::horizontal_tb, |containing_block| {
             containing_block.style.writing_mode
         });
@@ -570,7 +502,7 @@ impl LogicalRect<Au> {
             let y = self.start_corner.block;
             let x = match containing_block {
                 Some(containing_block) if !mode.is_bidi_ltr() => {
-                    containing_block.inline_size - self.max_inline_position()
+                    containing_block.size.inline - self.max_inline_position()
                 },
                 _ => self.start_corner.inline,
             };
@@ -651,7 +583,7 @@ impl ToLogicalWithContainingBlock<LogicalVec2<Au>> for PhysicalPoint<Au> {
                 inline: if writing_mode.is_bidi_ltr() {
                     self.x
                 } else {
-                    containing_block.inline_size - self.x
+                    containing_block.size.inline - self.x
                 },
                 block: self.y,
             }
@@ -680,7 +612,7 @@ impl ToLogicalWithContainingBlock<LogicalRect<Au>> for PhysicalRect<Au> {
             if writing_mode.is_bidi_ltr() {
                 inline_start = self.origin.x;
             } else {
-                inline_start = containing_block.inline_size - (self.origin.x + self.size.width);
+                inline_start = containing_block.size.inline - (self.origin.x + self.size.width);
             }
         }
         LogicalRect {
@@ -690,5 +622,366 @@ impl ToLogicalWithContainingBlock<LogicalRect<Au>> for PhysicalRect<Au> {
             },
             size: LogicalVec2 { inline, block },
         }
+    }
+}
+
+/// The possible values accepted by the sizing properties.
+/// <https://drafts.csswg.org/css-sizing/#sizing-properties>
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Size<T> {
+    /// Represents an `auto` value for the preferred and minimum size properties,
+    /// or `none` for the maximum size properties.
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-auto>
+    /// <https://drafts.csswg.org/css-sizing/#valdef-max-width-none>
+    Initial,
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-min-content>
+    MinContent,
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-max-content>
+    MaxContent,
+    /// <https://drafts.csswg.org/css-sizing-4/#valdef-width-fit-content>
+    FitContent,
+    /// <https://drafts.csswg.org/css-sizing-4/#valdef-width-stretch>
+    Stretch,
+    /// Represents a numeric `<length-percentage>`, but resolved as a `T`.
+    /// <https://drafts.csswg.org/css-sizing/#valdef-width-length-percentage-0>
+    Numeric(T),
+}
+
+impl<T: Copy> Copy for Size<T> {}
+
+impl<T> Default for Size<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::Initial
+    }
+}
+
+impl<T> Size<T> {
+    #[inline]
+    pub(crate) fn is_numeric(&self) -> bool {
+        matches!(self, Self::Numeric(_))
+    }
+
+    #[inline]
+    pub(crate) fn is_initial(&self) -> bool {
+        matches!(self, Self::Initial)
+    }
+}
+
+impl<T: Clone> Size<T> {
+    #[inline]
+    pub(crate) fn to_numeric(&self) -> Option<T> {
+        match self {
+            Self::Numeric(numeric) => Some(numeric).cloned(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_auto_or(&self) -> AutoOr<T> {
+        self.to_numeric()
+            .map_or(AutoOr::Auto, AutoOr::LengthPercentage)
+    }
+
+    #[inline]
+    pub fn map<U>(&self, f: impl FnOnce(T) -> U) -> Size<U> {
+        match self {
+            Size::Initial => Size::Initial,
+            Size::MinContent => Size::MinContent,
+            Size::MaxContent => Size::MaxContent,
+            Size::FitContent => Size::FitContent,
+            Size::Stretch => Size::Stretch,
+            Size::Numeric(numeric) => Size::Numeric(f(numeric.clone())),
+        }
+    }
+
+    #[inline]
+    pub fn maybe_map<U>(&self, f: impl FnOnce(T) -> Option<U>) -> Option<Size<U>> {
+        Some(match self {
+            Size::Numeric(numeric) => Size::Numeric(f(numeric.clone())?),
+            _ => self.map(|_| unreachable!("This shouldn't be called for keywords")),
+        })
+    }
+}
+
+impl From<StyleSize> for Size<LengthPercentage> {
+    fn from(size: StyleSize) -> Self {
+        match size {
+            StyleSize::LengthPercentage(length) => Size::Numeric(length.0),
+            StyleSize::Auto => Size::Initial,
+            StyleSize::MinContent => Size::MinContent,
+            StyleSize::MaxContent => Size::MaxContent,
+            StyleSize::FitContent => Size::FitContent,
+            StyleSize::Stretch => Size::Stretch,
+            StyleSize::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+        }
+    }
+}
+
+impl From<StyleMaxSize> for Size<LengthPercentage> {
+    fn from(max_size: StyleMaxSize) -> Self {
+        match max_size {
+            StyleMaxSize::LengthPercentage(length) => Size::Numeric(length.0),
+            StyleMaxSize::None => Size::Initial,
+            StyleMaxSize::MinContent => Size::MinContent,
+            StyleMaxSize::MaxContent => Size::MaxContent,
+            StyleMaxSize::FitContent => Size::FitContent,
+            StyleMaxSize::Stretch => Size::Stretch,
+            StyleMaxSize::AnchorSizeFunction(_) => unreachable!("anchor-size() should be disabled"),
+        }
+    }
+}
+
+impl LogicalVec2<Size<LengthPercentage>> {
+    pub(crate) fn percentages_relative_to(
+        &self,
+        containing_block: &ContainingBlock,
+    ) -> LogicalVec2<Size<Au>> {
+        self.map_inline_and_block_axes(
+            |inline_size| inline_size.map(|lp| lp.to_used_value(containing_block.size.inline)),
+            |block_size| {
+                block_size
+                    .maybe_map(|lp| lp.maybe_to_used_value(containing_block.size.block.non_auto()))
+                    .unwrap_or_default()
+            },
+        )
+    }
+
+    pub(crate) fn maybe_percentages_relative_to_basis(
+        &self,
+        basis: &LogicalVec2<Option<Au>>,
+    ) -> LogicalVec2<Size<Au>> {
+        LogicalVec2 {
+            inline: self
+                .inline
+                .maybe_map(|v| v.maybe_to_used_value(basis.inline))
+                .unwrap_or_default(),
+            block: self
+                .block
+                .maybe_map(|v| v.maybe_to_used_value(basis.block))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn percentages_relative_to_basis(
+        &self,
+        basis: &LogicalVec2<Au>,
+    ) -> LogicalVec2<Size<Au>> {
+        LogicalVec2 {
+            inline: self.inline.map(|value| value.to_used_value(basis.inline)),
+            block: self.block.map(|value| value.to_used_value(basis.block)),
+        }
+    }
+}
+
+impl Size<Au> {
+    /// Resolves any size into a numerical value.
+    #[inline]
+    pub(crate) fn resolve<F: FnOnce() -> ContentSizes>(
+        &self,
+        initial_behavior: Self,
+        stretch_size: Au,
+        content_size: &LazyCell<ContentSizes, F>,
+    ) -> Au {
+        if self.is_initial() {
+            assert!(!initial_behavior.is_initial());
+            initial_behavior.resolve_non_initial(stretch_size, content_size)
+        } else {
+            self.resolve_non_initial(stretch_size, content_size)
+        }
+        .unwrap()
+    }
+
+    /// Resolves a non-initial size into a numerical value.
+    /// Returns `None` if the size is the initial one.
+    #[inline]
+    pub(crate) fn resolve_non_initial<F: FnOnce() -> ContentSizes>(
+        &self,
+        stretch_size: Au,
+        content_size: &LazyCell<ContentSizes, F>,
+    ) -> Option<Au> {
+        match self {
+            Self::Initial => None,
+            Self::MinContent => Some(content_size.min_content),
+            Self::MaxContent => Some(content_size.max_content),
+            Self::FitContent => Some(content_size.shrink_to_fit(stretch_size)),
+            Self::Stretch => Some(stretch_size),
+            Self::Numeric(numeric) => Some(*numeric),
+        }
+    }
+
+    /// Tries to resolve an extrinsic size into a numerical value.
+    /// Extrinsic sizes are those based on the context of an element, without regard for its contents.
+    /// <https://drafts.csswg.org/css-sizing-3/#extrinsic>
+    ///
+    /// Returns `None` if either:
+    /// - The size is intrinsic.
+    /// - The size is the initial one.
+    ///   TODO: should we allow it to behave as `stretch` instead of assuming it's intrinsic?
+    /// - The provided `stretch_size` is `None` but we need its value.
+    #[inline]
+    pub(crate) fn maybe_resolve_extrinsic(&self, stretch_size: Option<Au>) -> Option<Au> {
+        match self {
+            Self::Initial | Self::MinContent | Self::MaxContent | Self::FitContent => None,
+            Self::Stretch => stretch_size,
+            Self::Numeric(numeric) => Some(*numeric),
+        }
+    }
+}
+
+/// Represents the sizing constraint that the preferred, min and max sizing properties
+/// impose on one axis.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) enum SizeConstraint {
+    /// Represents a definite preferred size, clamped by minimum and maximum sizes (if any).
+    Definite(Au),
+    /// Represents an indefinite preferred size that allows a range of values between
+    /// the first argument (minimum size) and the second one (maximum size).
+    MinMax(Au, Option<Au>),
+}
+
+impl Default for SizeConstraint {
+    #[inline]
+    fn default() -> Self {
+        Self::MinMax(Au::default(), None)
+    }
+}
+
+impl SizeConstraint {
+    #[inline]
+    pub(crate) fn new(preferred_size: Option<Au>, min_size: Au, max_size: Option<Au>) -> Self {
+        preferred_size.map_or_else(
+            || Self::MinMax(min_size, max_size),
+            |size| Self::Definite(size.clamp_between_extremums(min_size, max_size)),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn to_definite(self) -> Option<Au> {
+        match self {
+            Self::Definite(size) => Some(size),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn to_auto_or(self) -> AutoOr<Au> {
+        self.to_definite()
+            .map_or(AutoOr::Auto, AutoOr::LengthPercentage)
+    }
+}
+
+impl From<AuOrAuto> for SizeConstraint {
+    fn from(size: AuOrAuto) -> Self {
+        size.non_auto()
+            .map(SizeConstraint::Definite)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Sizes {
+    /// <https://drafts.csswg.org/css-sizing-3/#preferred-size-properties>
+    pub preferred: Size<Au>,
+    /// <https://drafts.csswg.org/css-sizing-3/#min-size-properties>
+    pub min: Size<Au>,
+    /// <https://drafts.csswg.org/css-sizing-3/#max-size-properties>
+    pub max: Size<Au>,
+}
+
+impl Sizes {
+    #[inline]
+    pub(crate) fn new(preferred: Size<Au>, min: Size<Au>, max: Size<Au>) -> Self {
+        Self {
+            preferred,
+            min,
+            max,
+        }
+    }
+
+    /// Resolves the three sizes into a single numerical value.
+    #[inline]
+    pub(crate) fn resolve(
+        &self,
+        automatic_size: Size<Au>,
+        automatic_minimum_size: Au,
+        stretch_size: Au,
+        get_content_size: impl FnOnce() -> ContentSizes,
+    ) -> Au {
+        let (preferred, min, max) = self.resolve_each(
+            automatic_size,
+            automatic_minimum_size,
+            stretch_size,
+            get_content_size,
+        );
+        preferred.clamp_between_extremums(min, max)
+    }
+
+    /// Resolves each of the three sizes into a numerical value, separately.
+    #[inline]
+    pub(crate) fn resolve_each(
+        &self,
+        automatic_size: Size<Au>,
+        automatic_minimum_size: Au,
+        stretch_size: Au,
+        get_content_size: impl FnOnce() -> ContentSizes,
+    ) -> (Au, Au, Option<Au>) {
+        // The provided `get_content_size` is a FnOnce but we may need its result multiple times.
+        // A LazyCell will only invoke it once if needed, and then reuse the result.
+        let content_size = LazyCell::new(get_content_size);
+        (
+            self.preferred
+                .resolve(automatic_size, stretch_size, &content_size),
+            self.min
+                .resolve_non_initial(stretch_size, &content_size)
+                .unwrap_or(automatic_minimum_size),
+            self.max.resolve_non_initial(stretch_size, &content_size),
+        )
+    }
+
+    /// Tries to extrinsically resolve the three sizes into a single [`SizeConstraint`].
+    /// Values that are intrinsic or need `stretch_size` when it's `None` are handled as such:
+    /// - On the preferred size, they make the returned value be an indefinite [`SizeConstraint::MinMax`].
+    /// - On the min size, they are treated as `auto`, enforcing the automatic minimum size.
+    /// - On the max size, they are treated as `none`, enforcing no maximum.
+    #[inline]
+    pub(crate) fn resolve_extrinsic(
+        &self,
+        automatic_size: Size<Au>,
+        automatic_minimum_size: Au,
+        stretch_size: Option<Au>,
+    ) -> SizeConstraint {
+        let (preferred, min, max) =
+            self.resolve_each_extrinsic(automatic_size, automatic_minimum_size, stretch_size);
+        SizeConstraint::new(preferred, min, max)
+    }
+
+    /// Tries to extrinsically resolve each of the three sizes into a numerical value, separately.
+    /// This can't resolve values that are intrinsic or need `stretch_size` but it's `None`.
+    /// - The 1st returned value is the resolved preferred size. If it can't be resolved then
+    ///   the returned value is `None`. Note that this is different than treating it as `auto`.
+    ///   TODO: This needs to be discussed in <https://github.com/w3c/csswg-drafts/issues/11387>.
+    /// - The 2nd returned value is the resolved minimum size. If it can't be resolved then we
+    ///   treat it as the initial `auto`, returning the automatic minimum size.
+    /// - The 3rd returned value is the resolved maximum size. If it can't be resolved then we
+    ///   treat it as the initial `none`, returning `None`.
+    #[inline]
+    pub(crate) fn resolve_each_extrinsic(
+        &self,
+        automatic_size: Size<Au>,
+        automatic_minimum_size: Au,
+        stretch_size: Option<Au>,
+    ) -> (Option<Au>, Au, Option<Au>) {
+        (
+            if self.preferred.is_initial() {
+                automatic_size.maybe_resolve_extrinsic(stretch_size)
+            } else {
+                self.preferred.maybe_resolve_extrinsic(stretch_size)
+            },
+            self.min
+                .maybe_resolve_extrinsic(stretch_size)
+                .unwrap_or(automatic_minimum_size),
+            self.max.maybe_resolve_extrinsic(stretch_size),
+        )
     }
 }

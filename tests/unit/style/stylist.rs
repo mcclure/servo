@@ -14,6 +14,8 @@ use style::properties::style_structs::Font;
 use style::properties::{
     longhands, ComputedValues, Importance, PropertyDeclaration, PropertyDeclarationBlock,
 };
+use style::queries::values::PrefersColorScheme;
+use style::rule_tree::StyleSource;
 use style::selector_map::SelectorMap;
 use style::selector_parser::{SelectorImpl, SelectorParser};
 use style::servo::media_queries::FontMetricsProvider;
@@ -79,7 +81,7 @@ fn get_mock_rules(css_selectors: &[&str]) -> (Vec<Vec<Rule>>, SharedRwLock) {
                         Rule::new(
                             s.clone(),
                             AncestorHashes::new(s, QuirksMode::NoQuirks),
-                            locked.clone(),
+                            StyleSource::from_declarations(rule.block.clone()),
                             i as u32,
                             LayerId::root(),
                             ContainerConditionId::none(),
@@ -255,6 +257,7 @@ fn mock_stylist() -> Stylist {
         Scale::new(1.0),
         Box::new(DummyMetricsProvider),
         initial_style,
+        PrefersColorScheme::Light,
     );
     Stylist::new(device, QuirksMode::NoQuirks)
 }

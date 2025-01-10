@@ -15,7 +15,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webglobject::WebGLObject;
 use crate::dom::webglrenderingcontext::{Operation, WebGLRenderingContext};
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct WebGLQuery {
@@ -48,6 +48,7 @@ impl WebGLQuery {
         reflect_dom_object(
             Box::new(Self::new_inherited(context, id)),
             &*context.global(),
+            CanGc::note(),
         )
     }
 
@@ -170,13 +171,10 @@ impl WebGLQuery {
                 this.update_results(&context);
             });
 
-            let global = self.global();
-            global
-                .as_window()
+            self.global()
                 .task_manager()
                 .dom_manipulation_task_source()
-                .queue(task, global.upcast())
-                .unwrap();
+                .queue(task);
         }
 
         match pname {

@@ -5,9 +5,12 @@
 import os
 import sys
 import json
+import re
 
 SCRIPT_PATH = os.path.abspath(os.path.dirname(__file__))
 SERVO_ROOT = os.path.abspath(os.path.join(SCRIPT_PATH, "..", "..", "..", "..", ".."))
+
+FILTER_PATTERN = re.compile("// skip-unless ([A-Z_]+)\n")
 
 
 def main():
@@ -16,7 +19,10 @@ def main():
     sys.path.insert(0, os.path.join(SERVO_ROOT, "third_party", "ply"))
 
     css_properties_json, out_dir = sys.argv[1:]
-    doc_servo = os.path.join(SERVO_ROOT, "target", "doc", "servo")
+    # Four dotdots: /path/to/target(4)/debug(3)/build(2)/style-*(1)/out
+    # Do not ascend above the target dir, because it may not be called target
+    # or even have a parent (see CARGO_TARGET_DIR).
+    doc_servo = os.path.join(out_dir, "..", "..", "..", "..", "doc")
     webidls_dir = os.path.join(SCRIPT_PATH, "..", "..", "webidls")
     config_file = "Bindings.conf"
 
@@ -29,7 +35,14 @@ def main():
     for webidl in webidls:
         filename = os.path.join(webidls_dir, webidl)
         with open(filename, "r", encoding="utf-8") as f:
-            parser.parse(f.read(), filename)
+            contents = f.read()
+            filter_match = FILTER_PATTERN.search(contents)
+            if filter_match:
+                env_var = filter_match.group(1)
+                if not os.environ.get(env_var):
+                    continue
+
+            parser.parse(contents, filename)
 
     add_css_properties_attributes(css_properties_json, parser)
     parser_results = parser.finish()
@@ -45,6 +58,8 @@ def main():
         ("InheritTypes", "InheritTypes.rs"),
         ("Bindings", "Bindings/mod.rs"),
         ("UnionTypes", "UnionTypes.rs"),
+        ("DomTypes", "DomTypes.rs"),
+        ("DomTypeHolder", "DomTypeHolder.rs"),
     ]:
         generate(config, name, os.path.join(out_dir, filename))
     make_dir(doc_servo)

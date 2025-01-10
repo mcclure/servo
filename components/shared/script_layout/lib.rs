@@ -21,16 +21,15 @@ use base::cross_process_instant::CrossProcessInstant;
 use base::id::{BrowsingContextId, PipelineId};
 use base::Epoch;
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
-use crossbeam_channel::Sender;
 use euclid::default::{Point2D, Rect};
 use euclid::Size2D;
-use fonts::FontCacheThread;
+use fnv::FnvHashMap;
+use fonts::{FontContext, SystemFontServiceProxy};
 use ipc_channel::ipc::IpcSender;
 use libc::c_void;
 use malloc_size_of_derive::MallocSizeOf;
 use metrics::PaintTimeMetrics;
 use net_traits::image_cache::{ImageCache, PendingImageId};
-use net_traits::ResourceThreads;
 use profile_traits::mem::Report;
 use profile_traits::time;
 use script_traits::{
@@ -48,12 +47,13 @@ use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::Device;
 use style::properties::style_structs::Font;
 use style::properties::PropertyId;
+use style::queries::values::PrefersColorScheme;
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::stylesheets::Stylesheet;
 use style::Atom;
 use style_traits::CSSPixel;
 use webrender_api::ImageKey;
-use webrender_traits::WebRenderScriptApi;
+use webrender_traits::CrossProcessCompositorApi;
 
 pub type GenericLayoutData = dyn Any + Send + Sync;
 
@@ -104,7 +104,11 @@ pub enum LayoutElementType {
     HTMLInputElement,
     HTMLMediaElement,
     HTMLObjectElement,
+    HTMLOptGroupElement,
+    HTMLOptionElement,
     HTMLParagraphElement,
+    HTMLPreElement,
+    HTMLSelectElement,
     HTMLTableCellElement,
     HTMLTableColElement,
     HTMLTableElement,
@@ -116,8 +120,10 @@ pub enum LayoutElementType {
 
 pub enum HTMLCanvasDataSource {
     WebGL(ImageKey),
-    Image(Option<IpcSender<CanvasMsg>>),
+    Image(IpcSender<CanvasMsg>),
     WebGPU(ImageKey),
+    /// transparent black
+    Empty,
 }
 
 pub struct HTMLCanvasData {
@@ -157,8 +163,21 @@ pub struct PendingImage {
     pub origin: ImmutableOrigin,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MediaFrame {
+    pub image_key: webrender_api::ImageKey,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub struct MediaMetadata {
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct HTMLMediaData {
-    pub current_frame: Option<(ImageKey, i32, i32)>,
+    pub current_frame: Option<MediaFrame>,
+    pub metadata: Option<MediaMetadata>,
 }
 
 pub struct LayoutConfig {
@@ -168,10 +187,9 @@ pub struct LayoutConfig {
     pub constellation_chan: IpcSender<LayoutMsg>,
     pub script_chan: IpcSender<ConstellationControlMsg>,
     pub image_cache: Arc<dyn ImageCache>,
-    pub resource_threads: ResourceThreads,
-    pub font_cache_thread: FontCacheThread,
+    pub font_context: Arc<FontContext>,
     pub time_profiler_chan: time::ProfilerChan,
-    pub webrender_api_sender: WebRenderScriptApi,
+    pub compositor_api: CrossProcessCompositorApi,
     pub paint_time_metrics: PaintTimeMetrics,
     pub window_size: WindowSizeData,
 }
@@ -184,9 +202,6 @@ pub trait Layout {
     /// Get a reference to this Layout's Stylo `Device` used to handle media queries and
     /// resolve font metrics.
     fn device(&self) -> &Device;
-
-    /// Whether or not this layout is waiting for fonts from loaded stylesheets to finish loading.
-    fn waiting_for_web_fonts_to_load(&self) -> bool;
 
     /// The currently laid out Epoch that this Layout has finished.
     fn current_epoch(&self) -> Epoch;
@@ -218,7 +233,7 @@ pub trait Layout {
     fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>);
 
     /// Requests a reflow.
-    fn reflow(&mut self, script_reflow: ScriptReflow);
+    fn reflow(&mut self, reflow_request: ReflowRequest) -> Option<ReflowResult>;
 
     /// Tells layout that script has added some paint worklet modules.
     fn register_paint_worklet_modules(
@@ -237,11 +252,7 @@ pub trait Layout {
     fn query_content_box(&self, node: OpaqueNode) -> Option<Rect<Au>>;
     fn query_content_boxes(&self, node: OpaqueNode) -> Vec<Rect<Au>>;
     fn query_client_rect(&self, node: OpaqueNode) -> Rect<i32>;
-    fn query_element_inner_text(&self, node: TrustedNodeAddress) -> String;
-    fn query_inner_window_dimension(
-        &self,
-        context: BrowsingContextId,
-    ) -> Option<Size2D<f32, CSSPixel>>;
+    fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
     fn query_nodes_from_point(
         &self,
         point: Point2D<f32>,
@@ -275,7 +286,7 @@ pub trait ScriptThreadFactory {
     fn create(
         state: InitialScriptState,
         layout_factory: Arc<dyn LayoutFactory>,
-        font_cache_thread: FontCacheThread,
+        system_font_service: Arc<SystemFontServiceProxy>,
         load_data: LoadData,
         user_agent: Cow<'static, str>,
     );
@@ -303,16 +314,24 @@ pub enum QueryMsg {
     NodesFromPointQuery,
     ResolvedStyleQuery,
     StyleQuery,
-    ElementInnerTextQuery,
+    ElementInnerOuterTextQuery,
     ResolvedFontStyleQuery,
     InnerWindowDimensionsQuery,
 }
 
-/// Any query to perform with this reflow.
+/// The goal of a reflow request.
+///
+/// Please do not add any other types of reflows. In general, all reflow should
+/// go through the *update the rendering* step of the HTML specification. Exceptions
+/// should have careful review.
 #[derive(Debug, PartialEq)]
 pub enum ReflowGoal {
-    Full,
-    TickAnimations,
+    /// A reflow has been requesting by the *update the rendering* step of the HTML
+    /// event loop. This nominally driven by the display's VSync.
+    UpdateTheRendering,
+
+    /// Script has done a layout query and this reflow ensurs that layout is up-to-date
+    /// with the latest changes to the DOM.
     LayoutQuery(QueryMsg),
 
     /// Tells layout about a single new scrolling offset from the script. The rest will
@@ -325,9 +344,9 @@ impl ReflowGoal {
     /// be present or false if it only needs stacking-relative positions.
     pub fn needs_display_list(&self) -> bool {
         match *self {
-            ReflowGoal::Full | ReflowGoal::TickAnimations | ReflowGoal::UpdateScrollNode(_) => true,
+            ReflowGoal::UpdateTheRendering | ReflowGoal::UpdateScrollNode(_) => true,
             ReflowGoal::LayoutQuery(ref querymsg) => match *querymsg {
-                QueryMsg::ElementInnerTextQuery |
+                QueryMsg::ElementInnerOuterTextQuery |
                 QueryMsg::InnerWindowDimensionsQuery |
                 QueryMsg::NodesFromPointQuery |
                 QueryMsg::ResolvedStyleQuery |
@@ -347,11 +366,11 @@ impl ReflowGoal {
     /// false if a layout_thread display list is sufficient.
     pub fn needs_display(&self) -> bool {
         match *self {
-            ReflowGoal::Full | ReflowGoal::TickAnimations | ReflowGoal::UpdateScrollNode(_) => true,
+            ReflowGoal::UpdateTheRendering | ReflowGoal::UpdateScrollNode(_) => true,
             ReflowGoal::LayoutQuery(ref querymsg) => match *querymsg {
                 QueryMsg::NodesFromPointQuery |
                 QueryMsg::TextIndexQuery |
-                QueryMsg::ElementInnerTextQuery => true,
+                QueryMsg::ElementInnerOuterTextQuery => true,
                 QueryMsg::ContentBox |
                 QueryMsg::ContentBoxes |
                 QueryMsg::ClientRectQuery |
@@ -373,16 +392,29 @@ pub struct Reflow {
     pub page_clip_rect: Rect<Au>,
 }
 
+#[derive(Clone, Debug, MallocSizeOf)]
+pub struct IFrameSize {
+    pub browsing_context_id: BrowsingContextId,
+    pub pipeline_id: PipelineId,
+    pub size: Size2D<f32, CSSPixel>,
+}
+
+pub type IFrameSizes = FnvHashMap<BrowsingContextId, IFrameSize>;
+
 /// Information derived from a layout pass that needs to be returned to the script thread.
 #[derive(Debug, Default)]
-pub struct ReflowComplete {
+pub struct ReflowResult {
     /// The list of images that were encountered that are in progress.
     pub pending_images: Vec<PendingImage>,
+    /// The list of iframes in this layout and their sizes, used in order
+    /// to communicate them with the Constellation and also the `Window`
+    /// element of their content pages.
+    pub iframe_sizes: IFrameSizes,
 }
 
 /// Information needed for a script-initiated reflow.
 #[derive(Debug)]
-pub struct ScriptReflow {
+pub struct ReflowRequest {
     /// General reflow data.
     pub reflow_info: Reflow,
     /// The document node.
@@ -393,8 +425,6 @@ pub struct ScriptReflow {
     pub stylesheets_changed: bool,
     /// The current window size.
     pub window_size: WindowSizeData,
-    /// The channel that we send a notification to.
-    pub script_join_chan: Sender<ReflowComplete>,
     /// The goal of this reflow.
     pub reflow_goal: ReflowGoal,
     /// The number of objects in the dom #10110
@@ -407,6 +437,8 @@ pub struct ScriptReflow {
     pub animation_timeline_value: f64,
     /// The set of animations for this document.
     pub animations: DocumentAnimationSet,
+    /// The theme for the window
+    pub theme: PrefersColorScheme,
 }
 
 /// A pending restyle.

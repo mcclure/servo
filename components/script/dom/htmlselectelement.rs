@@ -34,11 +34,12 @@ use crate::dom::htmlformelement::{FormControl, FormDatum, FormDatumValue, HTMLFo
 use crate::dom::htmloptgroupelement::HTMLOptGroupElement;
 use crate::dom::htmloptionelement::HTMLOptionElement;
 use crate::dom::htmloptionscollection::HTMLOptionsCollection;
-use crate::dom::node::{window_from_node, BindContext, Node, UnbindContext};
+use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::nodelist::NodeList;
 use crate::dom::validation::{is_barred_by_datalist_ancestor, Validatable};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct OptionsFilter;
@@ -97,6 +98,7 @@ impl HTMLSelectElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLSelectElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLSelectElement::new_inherited(
@@ -104,6 +106,7 @@ impl HTMLSelectElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -216,7 +219,7 @@ impl HTMLSelectElement {
     }
 }
 
-impl HTMLSelectElementMethods for HTMLSelectElement {
+impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
     // https://html.spec.whatwg.org/multipage/#dom-select-add
     fn Add(
         &self,
@@ -276,7 +279,7 @@ impl HTMLSelectElementMethods for HTMLSelectElement {
     // https://html.spec.whatwg.org/multipage/#dom-select-options
     fn Options(&self) -> DomRoot<HTMLOptionsCollection> {
         self.options.or_init(|| {
-            let window = window_from_node(self);
+            let window = self.owner_window();
             HTMLOptionsCollection::new(&window, self, Box::new(OptionsFilter))
         })
     }
@@ -287,8 +290,8 @@ impl HTMLSelectElementMethods for HTMLSelectElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-select-length
-    fn SetLength(&self, length: u32) {
-        self.Options().SetLength(length)
+    fn SetLength(&self, length: u32, can_gc: CanGc) {
+        self.Options().SetLength(length, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-select-item
@@ -302,8 +305,13 @@ impl HTMLSelectElementMethods for HTMLSelectElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-select-setter
-    fn IndexedSetter(&self, index: u32, value: Option<&HTMLOptionElement>) -> ErrorResult {
-        self.Options().IndexedSetter(index, value)
+    fn IndexedSetter(
+        &self,
+        index: u32,
+        value: Option<&HTMLOptionElement>,
+        can_gc: CanGc,
+    ) -> ErrorResult {
+        self.Options().IndexedSetter(index, value, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-select-nameditem
@@ -390,13 +398,13 @@ impl HTMLSelectElementMethods for HTMLSelectElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -502,7 +510,7 @@ impl Validatable for HTMLSelectElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast()))
     }
 
     fn is_instance_validatable(&self) -> bool {

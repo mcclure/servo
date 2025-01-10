@@ -17,14 +17,15 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::customelementregistry::CallbackReaction;
 use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
 use crate::dom::htmllegendelement::HTMLLegendElement;
-use crate::dom::node::{window_from_node, Node, ShadowIncluding};
+use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
 #[dom_struct]
@@ -58,6 +59,7 @@ impl HTMLFieldSetElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFieldSetElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLFieldSetElement::new_inherited(
@@ -65,6 +67,7 @@ impl HTMLFieldSetElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -82,20 +85,14 @@ impl HTMLFieldSetElement {
     }
 }
 
-impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
+impl HTMLFieldSetElementMethods<crate::DomTypeHolder> for HTMLFieldSetElement {
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-elements
     fn Elements(&self) -> DomRoot<HTMLCollection> {
-        #[derive(JSTraceable, MallocSizeOf)]
-        struct ElementsFilter;
-        impl CollectionFilter for ElementsFilter {
-            fn filter<'a>(&self, elem: &'a Element, _root: &'a Node) -> bool {
-                elem.downcast::<HTMLElement>()
-                    .is_some_and(HTMLElement::is_listed_element)
-            }
-        }
-        let filter = Box::new(ElementsFilter);
-        let window = window_from_node(self);
-        HTMLCollection::create(&window, self.upcast(), filter)
+        HTMLCollection::new_with_filter_fn(&self.owner_window(), self.upcast(), |element, _| {
+            element
+                .downcast::<HTMLElement>()
+                .is_some_and(HTMLElement::is_listed_element)
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-disabled
@@ -126,13 +123,13 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -219,7 +216,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                                 );
                             }
                         }
-                        element.update_sequentially_focusable_status();
+                        element.update_sequentially_focusable_status(CanGc::note());
                     }
                 } else {
                     for field in fields {
@@ -240,10 +237,10 @@ impl VirtualMethods for HTMLFieldSetElement {
                                 );
                             }
                         }
-                        element.update_sequentially_focusable_status();
+                        element.update_sequentially_focusable_status(CanGc::note());
                     }
                 }
-                element.update_sequentially_focusable_status();
+                element.update_sequentially_focusable_status(CanGc::note());
             },
             local_name!("form") => {
                 self.form_attribute_mutated(mutation);
@@ -274,7 +271,7 @@ impl Validatable for HTMLFieldSetElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast()))
     }
 
     fn is_instance_validatable(&self) -> bool {

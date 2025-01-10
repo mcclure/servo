@@ -9,6 +9,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, DomSlice};
 use crate::dom::gamepadbutton::GamepadButton;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 // https://w3c.github.io/gamepad/#gamepadbutton-interface
 #[dom_struct]
@@ -27,11 +28,15 @@ impl GamepadButtonList {
     }
 
     pub fn new(global: &GlobalScope, list: &[&GamepadButton]) -> DomRoot<GamepadButtonList> {
-        reflect_dom_object(Box::new(GamepadButtonList::new_inherited(list)), global)
+        reflect_dom_object(
+            Box::new(GamepadButtonList::new_inherited(list)),
+            global,
+            CanGc::note(),
+        )
     }
 }
 
-impl GamepadButtonListMethods for GamepadButtonList {
+impl GamepadButtonListMethods<crate::DomTypeHolder> for GamepadButtonList {
     // https://w3c.github.io/gamepad/#dom-gamepad-buttons
     fn Length(&self) -> u32 {
         self.list.len() as u32
@@ -73,7 +78,7 @@ impl GamepadButtonList {
             GamepadButton::new(global, false, false), // Right button in left cluster
             GamepadButton::new(global, false, false), // Center button in center cluster
         ];
-        rooted_vec!(let buttons <- standard_buttons.iter().map(|button| DomRoot::from_ref(&**button)));
+        rooted_vec!(let buttons <- standard_buttons.iter().map(DomRoot::as_traced));
         Self::new(global, buttons.r())
     }
 }

@@ -21,10 +21,11 @@ use crate::dom::element::Element;
 use crate::dom::file::File;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormDatum, FormDatumValue, HTMLFormElement};
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
 use crate::dom::validation::{is_barred_by_datalist_ancestor, Validatable};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 enum SubmissionValue {
@@ -87,8 +88,12 @@ impl ElementInternals {
     }
 
     pub fn new(element: &HTMLElement) -> DomRoot<ElementInternals> {
-        let global = window_from_node(element);
-        reflect_dom_object(Box::new(ElementInternals::new_inherited(element)), &*global)
+        let global = element.owner_window();
+        reflect_dom_object(
+            Box::new(ElementInternals::new_inherited(element)),
+            &*global,
+            CanGc::note(),
+        )
     }
 
     fn is_target_form_associated(&self) -> bool {
@@ -182,7 +187,7 @@ impl ElementInternals {
     }
 }
 
-impl ElementInternalsMethods for ElementInternals {
+impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-setformvalue>
     fn SetFormValue(
         &self,
@@ -316,19 +321,19 @@ impl ElementInternalsMethods for ElementInternals {
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-checkvalidity>
-    fn CheckValidity(&self) -> Fallible<bool> {
+    fn CheckValidity(&self, can_gc: CanGc) -> Fallible<bool> {
         if !self.is_target_form_associated() {
             return Err(Error::NotSupported);
         }
-        Ok(self.check_validity())
+        Ok(self.check_validity(can_gc))
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-reportvalidity>
-    fn ReportValidity(&self) -> Fallible<bool> {
+    fn ReportValidity(&self, can_gc: CanGc) -> Fallible<bool> {
         if !self.is_target_form_associated() {
             return Err(Error::NotSupported);
         }
-        Ok(self.report_validity())
+        Ok(self.report_validity(can_gc))
     }
 }
 
@@ -343,7 +348,7 @@ impl Validatable for ElementInternals {
         debug_assert!(self.is_target_form_associated());
         self.validity_state.or_init(|| {
             ValidityState::new(
-                &window_from_node(self.target_element.upcast::<Node>()),
+                &self.target_element.owner_window(),
                 self.target_element.upcast(),
             )
         })

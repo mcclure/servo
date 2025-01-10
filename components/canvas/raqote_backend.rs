@@ -118,7 +118,7 @@ pub enum Pattern<'a> {
     Surface(SurfacePattern<'a>),
 }
 
-impl<'a> Pattern<'a> {
+impl Pattern<'_> {
     fn set_transform(&mut self, transform: Transform2D<f32>) {
         match self {
             Pattern::Surface(pattern) => pattern.set_transform(transform),
@@ -555,7 +555,8 @@ impl GenericDrawTarget for raqote::DrawTarget {
             SHARED_FONT_CACHE.with(|font_cache| {
                 let identifier = template.identifier();
                 if !font_cache.borrow().contains_key(&identifier) {
-                    let Ok(font) = Font::from_bytes(template.data(), identifier.index()) else {
+                    let data = std::sync::Arc::new(run.font.data().as_ref().to_vec());
+                    let Ok(font) = Font::from_bytes(data, identifier.index()) else {
                         return;
                     };
                     font_cache.borrow_mut().insert(identifier.clone(), font);

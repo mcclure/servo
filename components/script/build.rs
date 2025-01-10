@@ -16,11 +16,18 @@ fn main() {
     let start = Instant::now();
 
     let style_out_dir = PathBuf::from(env::var_os("DEP_SERVO_STYLE_CRATE_OUT_DIR").unwrap());
+    let css_properties_json = style_out_dir.join("css-properties.json");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+
+    println!("cargo::rerun-if-changed=dom/webidls");
+    println!("cargo::rerun-if-changed=dom/bindings/codegen");
+    println!("cargo::rerun-if-changed={}", css_properties_json.display());
+    println!("cargo::rerun-if-changed=../../third_party/WebIDL/WebIDL.py");
+    // NB: We aren't handling changes in `third_party/ply` here.
 
     let status = Command::new(find_python())
         .arg("dom/bindings/codegen/run.py")
-        .arg(style_out_dir.join("css-properties.json"))
+        .arg(&css_properties_json)
         .arg(&out_dir)
         .status()
         .unwrap();
@@ -49,7 +56,7 @@ fn main() {
 #[derive(Eq, Hash, PartialEq)]
 struct Bytes<'a>(&'a str);
 
-impl<'a> FmtConst for Bytes<'a> {
+impl FmtConst for Bytes<'_> {
     fn fmt_const(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         // https://github.com/rust-lang/rust/issues/55223
         // should technically be just `write!(formatter, "b\"{}\"", self.0)
@@ -58,7 +65,7 @@ impl<'a> FmtConst for Bytes<'a> {
     }
 }
 
-impl<'a> phf_shared::PhfHash for Bytes<'a> {
+impl phf_shared::PhfHash for Bytes<'_> {
     fn phf_hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
         self.0.as_bytes().phf_hash(hasher)
     }
@@ -98,7 +105,7 @@ fn find_python() -> PathBuf {
 
     for name in &candidates {
         // Command::new() allows us to omit the `.exe` suffix on windows
-        if Command::new(&name)
+        if Command::new(name)
             .arg("--version")
             .output()
             .is_ok_and(|out| out.status.success())

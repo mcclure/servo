@@ -13,6 +13,7 @@ use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
 use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct AudioDestinationNode {
@@ -44,11 +45,11 @@ impl AudioDestinationNode {
         options: &AudioNodeOptions,
     ) -> DomRoot<AudioDestinationNode> {
         let node = AudioDestinationNode::new_inherited(context, options);
-        reflect_dom_object(Box::new(node), global)
+        reflect_dom_object(Box::new(node), global, CanGc::note())
     }
 }
 
-impl AudioDestinationNodeMethods for AudioDestinationNode {
+impl AudioDestinationNodeMethods<crate::DomTypeHolder> for AudioDestinationNode {
     // https://webaudio.github.io/web-audio-api/#dom-audiodestinationnode-maxchannelcount
     fn MaxChannelCount(&self) -> u32 {
         MAX_CHANNEL_COUNT

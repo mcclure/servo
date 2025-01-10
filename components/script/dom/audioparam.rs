@@ -10,6 +10,7 @@ use servo_media::audio::graph::NodeId;
 use servo_media::audio::node::{AudioNodeMessage, AudioNodeType};
 use servo_media::audio::param::{ParamRate, ParamType, RampKind, UserAutomationEvent};
 
+use crate::conversions::Convert;
 use crate::dom::baseaudiocontext::BaseAudioContext;
 use crate::dom::bindings::codegen::Bindings::AudioParamBinding::{
     AudioParamMethods, AutomationRate,
@@ -19,6 +20,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct AudioParam {
@@ -86,7 +88,7 @@ impl AudioParam {
             min_value,
             max_value,
         );
-        reflect_dom_object(Box::new(audio_param), window)
+        reflect_dom_object(Box::new(audio_param), window, CanGc::note())
     }
 
     fn message_node(&self, message: AudioNodeMessage) {
@@ -110,7 +112,7 @@ impl AudioParam {
     }
 }
 
-impl AudioParamMethods for AudioParam {
+impl AudioParamMethods<crate::DomTypeHolder> for AudioParam {
     // https://webaudio.github.io/web-audio-api/#dom-audioparam-automationrate
     fn AutomationRate(&self) -> AutomationRate {
         self.automation_rate.get()
@@ -131,7 +133,7 @@ impl AudioParamMethods for AudioParam {
         self.automation_rate.set(automation_rate);
         self.message_node(AudioNodeMessage::SetParamRate(
             self.param,
-            automation_rate.into(),
+            automation_rate.convert(),
         ));
 
         Ok(())
@@ -322,9 +324,9 @@ impl AudioParamMethods for AudioParam {
 }
 
 // https://webaudio.github.io/web-audio-api/#enumdef-automationrate
-impl From<AutomationRate> for ParamRate {
-    fn from(rate: AutomationRate) -> Self {
-        match rate {
+impl Convert<ParamRate> for AutomationRate {
+    fn convert(self) -> ParamRate {
+        match self {
             AutomationRate::A_rate => ParamRate::ARate,
             AutomationRate::K_rate => ParamRate::KRate,
         }

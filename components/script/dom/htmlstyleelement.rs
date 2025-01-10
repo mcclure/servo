@@ -24,12 +24,10 @@ use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::document::Document;
 use crate::dom::element::{Element, ElementCreator};
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{
-    document_from_node, stylesheets_owner_from_node, window_from_node, BindContext,
-    ChildrenMutation, Node, UnbindContext,
-};
+use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
 use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 use crate::stylesheet_loader::{StylesheetLoader, StylesheetOwner};
 
 #[dom_struct]
@@ -73,6 +71,7 @@ impl HTMLStyleElement {
         document: &Document,
         proto: Option<HandleObject>,
         creator: ElementCreator,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLStyleElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLStyleElement::new_inherited(
@@ -80,6 +79,7 @@ impl HTMLStyleElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -88,8 +88,8 @@ impl HTMLStyleElement {
         let element = self.upcast::<Element>();
         assert!(node.is_connected());
 
-        let window = window_from_node(node);
-        let doc = document_from_node(self);
+        let window = node.owner_window();
+        let doc = self.owner_document();
 
         let mq_attribute = element.get_attribute(&ns!(), &local_name!("media"));
         let mq_str = match mq_attribute {
@@ -133,11 +133,10 @@ impl HTMLStyleElement {
 
         // No subresource loads were triggered, queue load event
         if self.pending_loads.get() == 0 {
-            let window = window_from_node(self);
-            window
+            self.owner_global()
                 .task_manager()
                 .dom_manipulation_task_source()
-                .queue_simple_event(self.upcast(), atom!("load"), &window);
+                .queue_simple_event(self.upcast(), atom!("load"));
         }
 
         self.set_stylesheet(sheet);
@@ -146,7 +145,7 @@ impl HTMLStyleElement {
     // FIXME(emilio): This is duplicated with HTMLLinkElement::set_stylesheet.
     #[allow(crown::unrooted_must_root)]
     pub fn set_stylesheet(&self, s: Arc<Stylesheet>) {
-        let stylesheets_owner = stylesheets_owner_from_node(self);
+        let stylesheets_owner = self.stylesheet_list_owner();
         if let Some(ref s) = *self.stylesheet.borrow() {
             stylesheets_owner.remove_stylesheet(self.upcast(), s)
         }
@@ -163,7 +162,7 @@ impl HTMLStyleElement {
         self.get_stylesheet().map(|sheet| {
             self.cssom_stylesheet.or_init(|| {
                 CSSStyleSheet::new(
-                    &window_from_node(self),
+                    &self.owner_window(),
                     self.upcast::<Element>(),
                     "text/css".into(),
                     None, // todo handle location
@@ -195,7 +194,7 @@ impl VirtualMethods for HTMLStyleElement {
         // "The element is not on the stack of open elements of an HTML parser or XML parser,
         // and one of its child nodes is modified by a script."
         // TODO: Handle Text child contents being mutated.
-        if self.upcast::<Node>().is_in_doc() && !self.in_stack_of_open_elements.get() {
+        if self.upcast::<Node>().is_in_a_document_tree() && !self.in_stack_of_open_elements.get() {
             self.parse_own_css();
         }
     }
@@ -219,7 +218,7 @@ impl VirtualMethods for HTMLStyleElement {
         // Handles the case when:
         // "The element is popped off the stack of open elements of an HTML parser or XML parser."
         self.in_stack_of_open_elements.set(false);
-        if self.upcast::<Node>().is_in_doc() {
+        if self.upcast::<Node>().is_in_a_document_tree() {
             self.parse_own_css();
         }
     }
@@ -232,7 +231,8 @@ impl VirtualMethods for HTMLStyleElement {
         if context.tree_connected {
             if let Some(s) = self.stylesheet.borrow_mut().take() {
                 self.clean_stylesheet_ownership();
-                stylesheets_owner_from_node(self).remove_stylesheet(self.upcast(), &s)
+                self.stylesheet_list_owner()
+                    .remove_stylesheet(self.upcast(), &s)
             }
         }
     }
@@ -263,8 +263,8 @@ impl StylesheetOwner for HTMLStyleElement {
         self.parser_inserted.get()
     }
 
-    fn referrer_policy(&self) -> Option<ReferrerPolicy> {
-        None
+    fn referrer_policy(&self) -> ReferrerPolicy {
+        ReferrerPolicy::EmptyString
     }
 
     fn set_origin_clean(&self, origin_clean: bool) {
@@ -274,7 +274,7 @@ impl StylesheetOwner for HTMLStyleElement {
     }
 }
 
-impl HTMLStyleElementMethods for HTMLStyleElement {
+impl HTMLStyleElementMethods<crate::DomTypeHolder> for HTMLStyleElement {
     /// <https://drafts.csswg.org/cssom/#dom-linkstyle-sheet>
     fn GetSheet(&self) -> Option<DomRoot<DOMStyleSheet>> {
         self.get_cssom_stylesheet().map(DomRoot::upcast)

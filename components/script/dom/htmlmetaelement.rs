@@ -10,7 +10,7 @@ use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use js::rust::HandleObject;
 use regex::bytes::Regex;
-use script_traits::HistoryEntryReplacement;
+use script_traits::NavigationHistoryBehavior;
 use servo_url::ServoUrl;
 use style::str::HTML_SPACE_CHARACTERS;
 
@@ -23,13 +23,13 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::{DeclarativeRefresh, Document};
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlheadelement::HTMLHeadElement;
 use crate::dom::location::NavigationType;
-use crate::dom::node::{document_from_node, window_from_node, BindContext, Node, UnbindContext};
+use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::timers::OneshotTimerCallback;
 
 #[dom_struct]
@@ -45,11 +45,12 @@ pub struct RefreshRedirectDue {
     pub window: DomRoot<Window>,
 }
 impl RefreshRedirectDue {
-    pub fn invoke(self) {
+    pub fn invoke(self, can_gc: CanGc) {
         self.window.Location().navigate(
             self.url.clone(),
-            HistoryEntryReplacement::Enabled,
+            NavigationHistoryBehavior::Replace,
             NavigationType::DeclarativeRefresh,
+            can_gc,
         );
     }
 }
@@ -71,11 +72,13 @@ impl HTMLMetaElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLMetaElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLMetaElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -142,7 +145,7 @@ impl HTMLMetaElement {
     /// <https://html.spec.whatwg.org/multipage/#shared-declarative-refresh-steps>
     fn shared_declarative_refresh_steps(&self, content: DOMString) {
         // 1
-        let document = document_from_node(self);
+        let document = self.owner_document();
         if document.will_declaratively_refresh() {
             return;
         }
@@ -202,8 +205,8 @@ impl HTMLMetaElement {
         // 12-13
         if document.completely_loaded() {
             // TODO: handle active sandboxing flag
-            let window = window_from_node(self);
-            window.upcast::<GlobalScope>().schedule_callback(
+            let window = self.owner_window();
+            window.as_global_scope().schedule_callback(
                 OneshotTimerCallback::RefreshRedirectDue(RefreshRedirectDue {
                     window: window.clone(),
                     url: url_record,
@@ -220,7 +223,7 @@ impl HTMLMetaElement {
     }
 }
 
-impl HTMLMetaElementMethods for HTMLMetaElement {
+impl HTMLMetaElementMethods<crate::DomTypeHolder> for HTMLMetaElement {
     // https://html.spec.whatwg.org/multipage/#dom-meta-name
     make_getter!(Name, "name");
 

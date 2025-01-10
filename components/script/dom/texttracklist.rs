@@ -17,7 +17,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::texttrack::TextTrack;
 use crate::dom::trackevent::TrackEvent;
 use crate::dom::window::Window;
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct TextTrackList {
@@ -34,7 +34,11 @@ impl TextTrackList {
     }
 
     pub fn new(window: &Window, tracks: &[&TextTrack]) -> DomRoot<TextTrackList> {
-        reflect_dom_object(Box::new(TextTrackList::new_inherited(tracks)), window)
+        reflect_dom_object(
+            Box::new(TextTrackList::new_inherited(tracks)),
+            window,
+            CanGc::note(),
+        )
     }
 
     pub fn item(&self, idx: usize) -> Option<DomRoot<TextTrack>> {
@@ -58,20 +62,15 @@ impl TextTrackList {
         if self.find(track).is_none() {
             self.dom_tracks.borrow_mut().push(Dom::from_ref(track));
 
-            let this = Trusted::new(self);
-            let (source, canceller) = &self
-                .global()
-                .as_window()
-                .task_manager()
-                .media_element_task_source_with_canceller();
-
-            let idx = match self.find(track) {
-                Some(t) => t,
-                None => return,
+            let Some(idx) = self.find(track) else {
+                return;
             };
 
-            let _ = source.queue_with_canceller(
-                task!(track_event_queue: move || {
+            let this = Trusted::new(self);
+            self.global()
+                .task_manager()
+                .media_element_task_source()
+                .queue(task!(track_event_queue: move || {
                     let this = this.root();
 
                     if let Some(track) = this.item(idx) {
@@ -83,13 +82,12 @@ impl TextTrackList {
                             &Some(VideoTrackOrAudioTrackOrTextTrack::TextTrack(
                                 DomRoot::from_ref(&track)
                             )),
+                            CanGc::note()
                         );
 
-                        event.upcast::<Event>().fire(this.upcast::<EventTarget>());
+                        event.upcast::<Event>().fire(this.upcast::<EventTarget>(), CanGc::note());
                     }
-                }),
-                canceller,
-            );
+                }));
             track.add_track_list(self);
         }
     }
@@ -97,17 +95,17 @@ impl TextTrackList {
     // FIXME(#22314, dlrobertson) allow TextTracks to be
     // removed from the TextTrackList.
     #[allow(dead_code)]
-    pub fn remove(&self, idx: usize) {
+    pub fn remove(&self, idx: usize, can_gc: CanGc) {
         if let Some(track) = self.dom_tracks.borrow().get(idx) {
             track.remove_track_list();
         }
         self.dom_tracks.borrow_mut().remove(idx);
         self.upcast::<EventTarget>()
-            .fire_event(atom!("removetrack"));
+            .fire_event(atom!("removetrack"), can_gc);
     }
 }
 
-impl TextTrackListMethods for TextTrackList {
+impl TextTrackListMethods<crate::DomTypeHolder> for TextTrackList {
     // https://html.spec.whatwg.org/multipage/#dom-texttracklist-length
     fn Length(&self) -> u32 {
         self.dom_tracks.borrow().len() as u32

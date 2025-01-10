@@ -6,8 +6,9 @@
 //! (<https://html.spec.whatwg.org/multipage/#serializable-objects>).
 
 use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::structuredclone::StructuredDataHolder;
+use crate::dom::bindings::structuredclone::{StructuredDataReader, StructuredDataWriter};
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 /// The key corresponding to the storage location
 /// of a serialized platform object stored in a StructuredDataHolder.
@@ -21,11 +22,12 @@ pub struct StorageKey {
 /// <https://html.spec.whatwg.org/multipage/#serializable>
 pub trait Serializable: DomObject {
     /// <https://html.spec.whatwg.org/multipage/#serialization-steps>
-    fn serialize(&self, sc_holder: &mut StructuredDataHolder) -> Result<StorageKey, ()>;
+    fn serialize(&self, sc_writer: &mut StructuredDataWriter) -> Result<StorageKey, ()>;
     /// <https://html.spec.whatwg.org/multipage/#deserialization-steps>
     fn deserialize(
         owner: &GlobalScope,
-        sc_holder: &mut StructuredDataHolder,
+        sc_reader: &mut StructuredDataReader,
         extra_data: StorageKey,
+        can_gc: CanGc,
     ) -> Result<(), ()>;
 }

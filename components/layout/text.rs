@@ -11,7 +11,7 @@ use std::sync::Arc;
 use app_units::Au;
 use base::text::is_bidi_control;
 use fonts::{
-    self, ByteIndex, FontIdentifier, FontMetrics, FontRef, RunMetrics, ShapingFlags,
+    self, ByteIndex, FontContext, FontIdentifier, FontMetrics, FontRef, RunMetrics, ShapingFlags,
     ShapingOptions, LAST_RESORT_GLYPH_ADVANCE,
 };
 use log::{debug, warn};
@@ -28,7 +28,6 @@ use unicode_bidi as bidi;
 use unicode_script::Script;
 use xi_unicode::LineBreakLeafIter;
 
-use crate::context::LayoutFontContext;
 use crate::fragment::{
     Fragment, ScannedTextFlags, ScannedTextFragmentInfo, SpecificFragmentInfo,
     UnscannedTextFragmentInfo,
@@ -71,7 +70,7 @@ impl TextRunScanner {
 
     pub fn scan_for_runs(
         &mut self,
-        font_context: &LayoutFontContext,
+        font_context: &FontContext,
         mut fragments: LinkedList<Fragment>,
     ) -> InlineFragments {
         debug!(
@@ -151,7 +150,7 @@ impl TextRunScanner {
     /// be adjusted.
     fn flush_clump_to_list(
         &mut self,
-        font_context: &LayoutFontContext,
+        font_context: &FontContext,
         out_fragments: &mut Vec<Fragment>,
         paragraph_bytes_processed: &mut usize,
         bidi_levels: Option<&[bidi::Level]>,
@@ -189,6 +188,7 @@ impl TextRunScanner {
             {
                 let in_fragment = self.clump.front().unwrap();
                 let font_style = in_fragment.style().clone_font();
+                let computed_font_size = font_style.font_size.computed_size();
                 let inherited_text_style = in_fragment.style().get_inherited_text();
                 font_group = font_context.font_group(font_style);
                 compression = match in_fragment.white_space_collapse() {
@@ -199,7 +199,10 @@ impl TextRunScanner {
                     WhiteSpaceCollapse::PreserveBreaks => CompressionMode::CompressWhitespace,
                 };
                 text_transform = inherited_text_style.text_transform;
-                letter_spacing = inherited_text_style.letter_spacing;
+                letter_spacing = inherited_text_style
+                    .letter_spacing
+                    .0
+                    .resolve(computed_font_size);
                 word_spacing = inherited_text_style
                     .word_spacing
                     .to_length()
@@ -338,7 +341,7 @@ impl TextRunScanner {
             // example, `finally` with a wide `letter-spacing` renders as `f i n a l l y` and not
             // `ﬁ n a l l y`.
             let mut flags = ShapingFlags::empty();
-            if letter_spacing.0.px() != 0. {
+            if letter_spacing.px() != 0. {
                 flags.insert(ShapingFlags::IGNORE_LIGATURES_SHAPING_FLAG);
             }
             if text_rendering == TextRendering::Optimizespeed {
@@ -349,10 +352,10 @@ impl TextRunScanner {
                 flags.insert(ShapingFlags::KEEP_ALL_FLAG);
             }
             let options = ShapingOptions {
-                letter_spacing: if letter_spacing.0.px() == 0. {
+                letter_spacing: if letter_spacing.px() == 0. {
                     None
                 } else {
-                    Some(Au::from(letter_spacing.0))
+                    Some(Au::from(letter_spacing))
                 },
                 word_spacing,
                 script: Script::Common,
@@ -379,8 +382,10 @@ impl TextRunScanner {
                     },
                 };
 
+                let font_instance_key = font.key(font_context);
                 let (run, break_at_zero) = TextRun::new(
                     font,
+                    font_instance_key,
                     run_info.text,
                     &options,
                     run_info.bidi_level,
@@ -538,7 +543,7 @@ fn bounding_box_for_run_metrics(
 /// Panics if no font can be found for the given font style.
 #[inline]
 pub fn font_metrics_for_style(
-    font_context: &LayoutFontContext,
+    font_context: &FontContext,
     style: crate::ServoArc<FontStyleStruct>,
 ) -> FontMetrics {
     let font_group = font_context.font_group(style);

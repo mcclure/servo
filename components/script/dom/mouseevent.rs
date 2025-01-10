@@ -75,8 +75,8 @@ impl MouseEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<MouseEvent> {
-        Self::new_uninitialized_with_proto(window, None, CanGc::note())
+    pub fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<MouseEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
@@ -107,6 +107,7 @@ impl MouseEvent {
         buttons: u16,
         related_target: Option<&EventTarget>,
         point_in_target: Option<Point2D<f32>>,
+        can_gc: CanGc,
     ) -> DomRoot<MouseEvent> {
         Self::new_with_proto(
             window,
@@ -128,7 +129,7 @@ impl MouseEvent {
             buttons,
             related_target,
             point_in_target,
-            CanGc::note(),
+            can_gc,
         )
     }
 
@@ -156,10 +157,10 @@ impl MouseEvent {
         can_gc: CanGc,
     ) -> DomRoot<MouseEvent> {
         let ev = MouseEvent::new_uninitialized_with_proto(window, proto, can_gc);
-        ev.InitMouseEvent(
+        ev.initialize_mouse_event(
             type_,
-            bool::from(can_bubble),
-            bool::from(cancelable),
+            can_bubble,
+            cancelable,
             view,
             detail,
             screen_x,
@@ -171,18 +172,76 @@ impl MouseEvent {
             shift_key,
             meta_key,
             button,
+            buttons,
             related_target,
+            point_in_target,
         );
-        ev.buttons.set(buttons);
-        ev.point_in_target.set(point_in_target);
-        // TODO: Set proper values in https://github.com/servo/servo/issues/24415
-        ev.page_x.set(client_x);
-        ev.page_y.set(client_y);
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    /// <https://w3c.github.io/uievents/#initialize-a-mouseevent>
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_mouse_event(
+        &self,
+        type_: DOMString,
+        can_bubble: EventBubbles,
+        cancelable: EventCancelable,
+        view: Option<&Window>,
+        detail: i32,
+        screen_x: i32,
+        screen_y: i32,
+        client_x: i32,
+        client_y: i32,
+        ctrl_key: bool,
+        alt_key: bool,
+        shift_key: bool,
+        meta_key: bool,
+        button: i16,
+        buttons: u16,
+        related_target: Option<&EventTarget>,
+        point_in_target: Option<Point2D<f32>>,
+    ) {
+        self.uievent.initialize_ui_event(
+            type_,
+            view.map(|window| window.upcast::<EventTarget>()),
+            can_bubble,
+            cancelable,
+        );
+
+        self.uievent.set_detail(detail);
+
+        self.screen_x.set(screen_x);
+        self.screen_y.set(screen_y);
+        self.client_x.set(client_x);
+        self.client_y.set(client_y);
+        self.page_x.set(self.PageX());
+        self.page_y.set(self.PageY());
+
+        // skip setting flags as they are absent
+        self.shift_key.set(shift_key);
+        self.ctrl_key.set(ctrl_key);
+        self.alt_key.set(alt_key);
+        self.meta_key.set(meta_key);
+
+        self.button.set(button);
+        self.buttons.set(buttons);
+        // skip step 3: Initialize PointerLock attributes for MouseEvent with event,
+        // as movementX, movementY is absent
+
+        self.related_target.set(related_target);
+
+        // below is not in the spec
+        self.point_in_target.set(point_in_target);
+    }
+
+    pub fn point_in_target(&self) -> Option<Point2D<f32>> {
+        self.point_in_target.get()
+    }
+}
+
+impl MouseEventMethods<crate::DomTypeHolder> for MouseEvent {
+    // https://w3c.github.io/uievents/#dom-mouseevent-mouseevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -216,12 +275,6 @@ impl MouseEvent {
         Ok(event)
     }
 
-    pub fn point_in_target(&self) -> Option<Point2D<f32>> {
-        self.point_in_target.get()
-    }
-}
-
-impl MouseEventMethods for MouseEvent {
     // https://w3c.github.io/uievents/#widl-MouseEvent-screenX
     fn ScreenX(&self) -> i32 {
         self.screen_x.get()
@@ -275,13 +328,13 @@ impl MouseEventMethods for MouseEvent {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
-    fn OffsetX(&self) -> i32 {
+    fn OffsetX(&self, can_gc: CanGc) -> i32 {
         let event = self.upcast::<Event>();
         if event.dispatching() {
             match event.GetTarget() {
                 Some(target) => {
                     if let Some(node) = target.downcast::<Node>() {
-                        let rect = node.client_rect();
+                        let rect = node.client_rect(can_gc);
                         self.client_x.get() - rect.origin.x
                     } else {
                         self.offset_x.get()
@@ -295,13 +348,13 @@ impl MouseEventMethods for MouseEvent {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsety
-    fn OffsetY(&self) -> i32 {
+    fn OffsetY(&self, can_gc: CanGc) -> i32 {
         let event = self.upcast::<Event>();
         if event.dispatching() {
             match event.GetTarget() {
                 Some(target) => {
                     if let Some(node) = target.downcast::<Node>() {
-                        let rect = node.client_rect();
+                        let rect = node.client_rect(can_gc);
                         self.client_y.get() - rect.origin.y
                     } else {
                         self.offset_y.get()

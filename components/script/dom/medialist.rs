@@ -18,6 +18,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct MediaList {
@@ -50,6 +51,7 @@ impl MediaList {
         reflect_dom_object(
             Box::new(MediaList::new_inherited(parent_stylesheet, media_queries)),
             window,
+            CanGc::note(),
         )
     }
 
@@ -58,7 +60,7 @@ impl MediaList {
     }
 }
 
-impl MediaListMethods for MediaList {
+impl MediaListMethods<crate::DomTypeHolder> for MediaList {
     /// <https://drafts.csswg.org/cssom/#dom-medialist-mediatext>
     fn MediaText(&self) -> DOMString {
         let guard = self.shared_lock().read();

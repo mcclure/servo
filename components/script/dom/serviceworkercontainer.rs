@@ -25,9 +25,8 @@ use crate::dom::promise::Promise;
 use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
 use crate::realms::{enter_realm, InRealm};
-use crate::task::TaskCanceller;
-use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
-use crate::task_source::{TaskSource, TaskSourceName};
+use crate::script_runtime::CanGc;
+use crate::task_source::SendableTaskSource;
 
 #[dom_struct]
 pub struct ServiceWorkerContainer {
@@ -49,11 +48,11 @@ impl ServiceWorkerContainer {
     pub fn new(global: &GlobalScope) -> DomRoot<ServiceWorkerContainer> {
         let client = Client::new(global.as_window());
         let container = ServiceWorkerContainer::new_inherited(&client);
-        reflect_dom_object(Box::new(container), global)
+        reflect_dom_object(Box::new(container), global, CanGc::note())
     }
 }
 
-impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
+impl ServiceWorkerContainerMethods<crate::DomTypeHolder> for ServiceWorkerContainer {
     // https://w3c.github.io/ServiceWorker/#service-worker-container-controller-attribute
     fn GetController(&self) -> Option<DomRoot<ServiceWorker>> {
         self.client.get_controller()
@@ -66,12 +65,13 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         script_url: USVString,
         options: &RegistrationOptions,
         comp: InRealm,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         // A: Step 2.
         let global = self.client.global();
 
         // A: Step 1
-        let promise = Promise::new_in_current_realm(comp);
+        let promise = Promise::new_in_current_realm(comp, can_gc);
         let USVString(ref script_url) = script_url;
 
         // A: Step 3
@@ -140,27 +140,18 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
 
         // Setup the callback for reject/resolve of the promise,
         // from steps running "in-parallel" from here in the serviceworker manager.
-        let (task_source, task_canceller) = (
-            global.dom_manipulation_task_source(),
-            global.task_canceller(TaskSourceName::DOMManipulation),
-        );
-
         let mut handler = RegisterJobResultHandler {
             trusted_promise: Some(TrustedPromise::new(promise.clone())),
-            task_source,
-            task_canceller,
+            task_source: global.task_manager().dom_manipulation_task_source().into(),
         };
 
         let (job_result_sender, job_result_receiver) = ipc::channel().expect("ipc channel failure");
 
-        ROUTER.add_route(
-            job_result_receiver.to_opaque(),
-            Box::new(move |message| {
-                let msg = message.to();
-                match msg {
-                    Ok(msg) => handler.handle(msg),
-                    Err(err) => warn!("Error receiving a JobResult: {:?}", err),
-                }
+        ROUTER.add_typed_route(
+            job_result_receiver,
+            Box::new(move |message| match message {
+                Ok(msg) => handler.handle(msg),
+                Err(err) => warn!("Error receiving a JobResult: {:?}", err),
             }),
         );
 
@@ -191,8 +182,7 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
 /// <https://w3c.github.io/ServiceWorker/#register>
 struct RegisterJobResultHandler {
     trusted_promise: Option<TrustedPromise>,
-    task_source: DOMManipulationTaskSource,
-    task_canceller: TaskCanceller,
+    task_source: SendableTaskSource,
 }
 
 impl RegisterJobResultHandler {
@@ -208,7 +198,7 @@ impl RegisterJobResultHandler {
                     .expect("No promise to resolve for SW Register job.");
 
                 // Step 1
-                let _ = self.task_source.queue_with_canceller(
+                self.task_source.queue(
                     task!(reject_promise_with_security_error: move || {
                         let promise = promise.root();
                         let _ac = enter_realm(&*promise.global());
@@ -221,8 +211,7 @@ impl RegisterJobResultHandler {
                             },
                         }
 
-                    }),
-                    &self.task_canceller,
+                    })
                 );
 
                 // TODO: step 2, handle equivalent jobs.
@@ -234,35 +223,32 @@ impl RegisterJobResultHandler {
                     .expect("No promise to resolve for SW Register job.");
 
                 // Step 1
-                let _ = self.task_source.queue_with_canceller(
-                    task!(resolve_promise: move || {
-                        let promise = promise.root();
-                        let global = promise.global();
-                        let _ac = enter_realm(&*global);
+                self.task_source.queue(task!(resolve_promise: move || {
+                    let promise = promise.root();
+                    let global = promise.global();
+                    let _ac = enter_realm(&*global);
 
-                        // Step 1.1
-                        let JobResultValue::Registration {
-                            id,
-                            installing_worker,
-                            waiting_worker,
-                            active_worker,
-                        } = value;
+                    // Step 1.1
+                    let JobResultValue::Registration {
+                        id,
+                        installing_worker,
+                        waiting_worker,
+                        active_worker,
+                    } = value;
 
-                        // Step 1.2 (Job type is "register").
-                        let registration = global.get_serviceworker_registration(
-                            &job.script_url,
-                            &job.scope_url,
-                            id,
-                            installing_worker,
-                            waiting_worker,
-                            active_worker,
-                        );
+                    // Step 1.2 (Job type is "register").
+                    let registration = global.get_serviceworker_registration(
+                        &job.script_url,
+                        &job.scope_url,
+                        id,
+                        installing_worker,
+                        waiting_worker,
+                        active_worker,
+                    );
 
-                        // Step 1.4
-                        promise.resolve_native(&*registration);
-                    }),
-                    &self.task_canceller,
-                );
+                    // Step 1.4
+                    promise.resolve_native(&*registration);
+                }));
 
                 // TODO: step 2, handle equivalent jobs.
             },

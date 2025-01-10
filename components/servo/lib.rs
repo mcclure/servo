@@ -22,21 +22,20 @@ use std::cmp::max;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::vec::Drain;
 
 pub use base::id::TopLevelBrowsingContextId;
 use base::id::{PipelineNamespace, PipelineNamespaceId};
 use bluetooth::BluetoothThreadFactory;
 use bluetooth_traits::BluetoothRequest;
-use canvas::canvas_paint_thread::{self, CanvasPaintThread};
+use canvas::canvas_paint_thread::CanvasPaintThread;
 use canvas::WebGLComm;
-use canvas_traits::webgl::WebGLThreads;
+use canvas_traits::webgl::{GlType, WebGLThreads};
 use compositing::webview::UnknownWebView;
 use compositing::windowing::{EmbedderEvent, EmbedderMethods, WindowMethods};
 use compositing::{CompositeTarget, IOCompositor, InitialCompositorState, ShutdownState};
-use compositing_traits::{
-    CompositorMsg, CompositorProxy, CompositorReceiver, ConstellationMsg, ForwardedToCompositorMsg,
-};
+use compositing_traits::{CompositorMsg, CompositorProxy, CompositorReceiver, ConstellationMsg};
 #[cfg(all(
     not(target_os = "windows"),
     not(target_os = "ios"),
@@ -54,7 +53,7 @@ use crossbeam_channel::{unbounded, Sender};
 use embedder_traits::{EmbedderMsg, EmbedderProxy, EmbedderReceiver, EventLoopWaker};
 use env_logger::Builder as EnvLoggerBuilder;
 use euclid::Scale;
-use fonts::FontCacheThread;
+use fonts::SystemFontService;
 #[cfg(all(
     not(target_os = "windows"),
     not(target_os = "ios"),
@@ -67,6 +66,7 @@ use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 pub use gleam::gl;
 use gleam::gl::RENDERER;
 use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::router::ROUTER;
 #[cfg(feature = "layout_2013")]
 pub use layout_thread_2013;
 use log::{error, trace, warn, Log, Metadata, Record};
@@ -89,23 +89,22 @@ use surfman::platform::generic::multi::context::NativeContext as LinuxNativeCont
 use surfman::{GLApi, GLVersion};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use surfman::{NativeConnection, NativeContext};
-use tracing::{span, Level};
+#[cfg(feature = "webgpu")]
+pub use webgpu;
+#[cfg(feature = "webgpu")]
 use webgpu::swapchain::WGPUImageMap;
 use webrender::{RenderApiSender, ShaderPrecacheFlags, UploadMethod, ONE_TIME_USAGE_HINT};
-use webrender_api::{
-    ColorF, DocumentId, FontInstanceFlags, FontInstanceKey, FontKey, FramePublishId, ImageKey,
-    NativeFontHandle,
-};
+use webrender_api::{ColorF, DocumentId, FramePublishId};
 use webrender_traits::{
-    CanvasToCompositorMsg, FontToCompositorMsg, ImageUpdate, RenderingContext, WebRenderFontApi,
-    WebrenderExternalImageHandlers, WebrenderExternalImageRegistry, WebrenderImageHandlerType,
+    CrossProcessCompositorApi, RenderingContext, WebrenderExternalImageHandlers,
+    WebrenderExternalImageRegistry, WebrenderImageHandlerType,
 };
 pub use {
     background_hang_monitor, base, bluetooth, bluetooth_traits, canvas, canvas_traits, compositing,
     constellation, devtools, devtools_traits, embedder_traits, euclid, fonts, ipc_channel,
     keyboard_types, layout_thread_2020, media, net, net_traits, profile, profile_traits, script,
     script_layout_interface, script_traits, servo_config as config, servo_config, servo_geometry,
-    servo_url as url, servo_url, style, style_traits, webgpu, webrender_api, webrender_traits,
+    servo_url as url, servo_url, style, style_traits, webrender_api, webrender_traits,
 };
 
 #[cfg(feature = "webdriver")]
@@ -207,32 +206,39 @@ impl webrender_api::RenderNotifier for RenderNotifier {
 
     fn new_frame_ready(
         &self,
-        _document_id: DocumentId,
+        document_id: DocumentId,
         _scrolled: bool,
         composite_needed: bool,
         _frame_publish_id: FramePublishId,
     ) {
         self.compositor_proxy
-            .send(CompositorMsg::NewWebRenderFrameReady(composite_needed));
+            .send(CompositorMsg::NewWebRenderFrameReady(
+                document_id,
+                composite_needed,
+            ));
     }
-}
-
-pub struct InitializedServo<Window: WindowMethods + 'static + ?Sized> {
-    pub servo: Servo<Window>,
-    pub browser_id: TopLevelBrowsingContextId,
 }
 
 impl<Window> Servo<Window>
 where
     Window: WindowMethods + 'static + ?Sized,
 {
-    #[tracing::instrument(skip(embedder, window), fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            skip(rendering_context, embedder, window),
+            fields(servo_profiling = true),
+            level = "trace",
+        )
+    )]
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
+        rendering_context: RenderingContext,
         mut embedder: Box<dyn EmbedderMethods>,
         window: Rc<Window>,
         user_agent: Option<String>,
         composite_target: CompositeTarget,
-    ) -> InitializedServo<Window> {
+    ) -> Servo<Window> {
         // Global configuration options, parsed from the command line.
         let opts = opts::get();
 
@@ -267,9 +273,6 @@ where
                 .unwrap_or(default_user_agent_string_for(DEFAULT_USER_AGENT).into()),
         };
 
-        // Initialize surfman
-        let rendering_context = window.rendering_context();
-
         // Get GL bindings
         let webrender_gl = match rendering_context.connection().gl_api() {
             GLApi::GL => unsafe { gl::GlFns::load_with(|s| rendering_context.get_proc_address(s)) },
@@ -292,7 +295,6 @@ where
 
         // Reserving a namespace to create TopLevelBrowsingContextId.
         PipelineNamespace::install(PipelineNamespaceId(0));
-        let top_level_browsing_context_id = TopLevelBrowsingContextId::new();
 
         // Get both endpoints of a special channel for communication between
         // the client window and the compositor. This channel is unique because
@@ -343,6 +345,17 @@ where
             } else {
                 UploadMethod::PixelBuffer(ONE_TIME_USAGE_HINT)
             };
+            let worker_threads = thread::available_parallelism()
+                .map(|i| i.get())
+                .unwrap_or(pref!(threadpools.fallback_worker_num) as usize)
+                .min(pref!(threadpools.webrender_workers.max).max(1) as usize);
+            let workers = Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(worker_threads)
+                    .thread_name(|idx| format!("WRWorker#{}", idx))
+                    .build()
+                    .unwrap(),
+            ));
             webrender::create_webrender_instance(
                 webrender_gl.clone(),
                 render_notifier,
@@ -365,6 +378,7 @@ where
                     allow_texture_swizzling: pref!(gfx.texture_swizzling.enabled),
                     clear_color,
                     upload_method,
+                    workers,
                     ..Default::default()
                 },
                 None,
@@ -385,8 +399,8 @@ where
 
         // Create the webgl thread
         let gl_type = match webrender_gl.get_type() {
-            gleam::gl::GlType::Gl => sparkle::gl::GlType::Gl,
-            gleam::gl::GlType::Gles => sparkle::gl::GlType::Gles,
+            gleam::gl::GlType::Gl => GlType::Gl,
+            gleam::gl::GlType::Gles => GlType::Gles,
         };
 
         let (external_image_handlers, external_images) = WebrenderExternalImageHandlers::new();
@@ -394,6 +408,7 @@ where
 
         let WebGLComm {
             webgl_threads,
+            #[cfg(feature = "webxr")]
             webxr_layer_grand_manager,
             image_handler,
         } = WebGLComm::new(
@@ -408,15 +423,20 @@ where
         external_image_handlers.set_handler(image_handler, WebrenderImageHandlerType::WebGL);
 
         // Create the WebXR main thread
+        #[cfg(feature = "webxr")]
         let mut webxr_main_thread =
             webxr::MainThreadRegistry::new(event_loop_waker, webxr_layer_grand_manager)
                 .expect("Failed to create WebXR device registry");
+        #[cfg(feature = "webxr")]
         if pref!(dom.webxr.enabled) {
             embedder.register_webxr(&mut webxr_main_thread, embedder_proxy.clone());
         }
 
+        #[cfg(feature = "webgpu")]
         let wgpu_image_handler = webgpu::WGPUExternalImages::default();
+        #[cfg(feature = "webgpu")]
         let wgpu_image_map = wgpu_image_handler.images.clone();
+        #[cfg(feature = "webgpu")]
         external_image_handlers.set_handler(
             Box::new(wgpu_image_handler),
             WebrenderImageHandlerType::WebGPU,
@@ -452,12 +472,14 @@ where
             devtools_sender,
             webrender_document,
             webrender_api_sender,
+            #[cfg(feature = "webxr")]
             webxr_main_thread.registry(),
             player_context,
             Some(webgl_threads),
             glplayer_threads,
             window_size,
             external_images,
+            #[cfg(feature = "webgpu")]
             wgpu_image_map,
             protocols,
         );
@@ -489,26 +511,22 @@ where
                 webrender_api,
                 rendering_context,
                 webrender_gl,
+                #[cfg(feature = "webxr")]
                 webxr_main_thread,
             },
             composite_target,
             opts.exit_after_load,
             opts.debug.convert_mouse_to_touch,
-            top_level_browsing_context_id,
             embedder.get_version_string().unwrap_or_default(),
         );
 
-        let servo = Servo {
+        Servo {
             compositor,
             constellation_chan,
             embedder_receiver,
             messages_for_embedder: Vec::new(),
             profiler_enabled: false,
             _js_engine_setup: js_engine_setup,
-        };
-        InitializedServo {
-            servo,
-            browser_id: top_level_browsing_context_id,
         }
     }
 
@@ -634,6 +652,15 @@ where
             EmbedderEvent::WindowResize => {
                 return self.compositor.on_resize_window_event();
             },
+            EmbedderEvent::ThemeChange(theme) => {
+                let msg = ConstellationMsg::ThemeChange(theme);
+                if let Err(e) = self.constellation_chan.send(msg) {
+                    warn!(
+                        "Sending platform theme change to constellation failed ({:?}).",
+                        e
+                    )
+                }
+            },
             EmbedderEvent::InvalidateNativeSurface => {
                 self.compositor.invalidate_native_surface();
             },
@@ -717,6 +744,16 @@ where
                 let msg = ConstellationMsg::Keyboard(key_event);
                 if let Err(e) = self.constellation_chan.send(msg) {
                     warn!("Sending keyboard event to constellation failed ({:?}).", e);
+                }
+            },
+
+            EmbedderEvent::IMEComposition(ime_event) => {
+                let msg = ConstellationMsg::IMECompositionEvent(ime_event);
+                if let Err(e) = self.constellation_chan.send(msg) {
+                    warn!(
+                        "Sending composition event to constellation failed ({:?}).",
+                        e
+                    );
                 }
             },
 
@@ -861,6 +898,9 @@ where
                     warn!("Sending Gamepad event to constellation failed ({:?}).", e);
                 }
             },
+            EmbedderEvent::Vsync => {
+                self.compositor.on_vsync();
+            },
         }
         false
     }
@@ -977,13 +1017,28 @@ fn create_compositor_channel(
     event_loop_waker: Box<dyn EventLoopWaker>,
 ) -> (CompositorProxy, CompositorReceiver) {
     let (sender, receiver) = unbounded();
-    (
-        CompositorProxy {
-            sender,
-            event_loop_waker,
-        },
-        CompositorReceiver { receiver },
-    )
+
+    let (compositor_ipc_sender, compositor_ipc_receiver) =
+        ipc::channel().expect("ipc channel failure");
+
+    let cross_process_compositor_api = CrossProcessCompositorApi(compositor_ipc_sender);
+    let compositor_proxy = CompositorProxy {
+        sender,
+        cross_process_compositor_api,
+        event_loop_waker,
+    };
+
+    let compositor_proxy_clone = compositor_proxy.clone();
+    ROUTER.add_typed_route(
+        compositor_ipc_receiver,
+        Box::new(move |message| {
+            compositor_proxy_clone.send(CompositorMsg::CrossProcess(
+                message.expect("Could not convert Compositor message"),
+            ));
+        }),
+    );
+
+    (compositor_proxy, CompositorReceiver { receiver })
 }
 
 fn get_layout_factory(legacy_layout: bool) -> Arc<dyn LayoutFactory> {
@@ -994,8 +1049,8 @@ fn get_layout_factory(legacy_layout: bool) -> Arc<dyn LayoutFactory> {
             }
         } else {
             if legacy_layout {
-                warn!("Runtime option `legacy_layout` was enabled, but the `layout_2013` \
-                feature was not enabled at compile time. Falling back to layout 2020! ");
+                panic!("Runtime option `legacy_layout` was enabled, but the `layout_2013` \
+                feature was not enabled at compile time! ");
            }
         }
     }
@@ -1013,13 +1068,13 @@ fn create_constellation(
     devtools_sender: Option<Sender<devtools_traits::DevtoolsControlMsg>>,
     webrender_document: DocumentId,
     webrender_api_sender: RenderApiSender,
-    webxr_registry: webxr_api::Registry,
+    #[cfg(feature = "webxr")] webxr_registry: webxr_api::Registry,
     player_context: WindowGLContext,
     webgl_threads: Option<WebGLThreads>,
     glplayer_threads: Option<GLPlayerThreads>,
     initial_window_size: WindowSizeData,
     external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-    wgpu_image_map: WGPUImageMap,
+    #[cfg(feature = "webgpu")] wgpu_image_map: WGPUImageMap,
     protocols: ProtocolRegistry,
 ) -> Sender<ConstellationMsg> {
     // Global configuration options, parsed from the command line.
@@ -1040,13 +1095,13 @@ fn create_constellation(
         Arc::new(protocols),
     );
 
-    let font_cache_thread = FontCacheThread::new(Box::new(WebRenderFontApiCompositorProxy(
-        compositor_proxy.clone(),
-    )));
+    let system_font_service = Arc::new(
+        SystemFontService::spawn(compositor_proxy.cross_process_compositor_api.clone()).to_proxy(),
+    );
 
     let (canvas_create_sender, canvas_ipc_sender) = CanvasPaintThread::start(
-        Box::new(CanvasWebrenderApi(compositor_proxy.clone())),
-        font_cache_thread.clone(),
+        compositor_proxy.cross_process_compositor_api.clone(),
+        system_font_service.clone(),
         public_resource_threads.clone(),
     );
 
@@ -1055,19 +1110,23 @@ fn create_constellation(
         embedder_proxy,
         devtools_sender,
         bluetooth_thread,
-        font_cache_thread,
+        system_font_service,
         public_resource_threads,
         private_resource_threads,
         time_profiler_chan,
         mem_profiler_chan,
         webrender_document,
         webrender_api_sender,
-        webxr_registry,
+        #[cfg(feature = "webxr")]
+        webxr_registry: Some(webxr_registry),
+        #[cfg(not(feature = "webxr"))]
+        webxr_registry: None,
         webgl_threads,
         glplayer_threads,
         player_context,
         user_agent,
         webrender_external_images: external_images,
+        #[cfg(feature = "webgpu")]
         wgpu_image_map,
     };
 
@@ -1087,102 +1146,6 @@ fn create_constellation(
         canvas_create_sender,
         canvas_ipc_sender,
     )
-}
-
-struct WebRenderFontApiCompositorProxy(CompositorProxy);
-
-impl WebRenderFontApi for WebRenderFontApiCompositorProxy {
-    fn add_font_instance(
-        &self,
-        font_key: FontKey,
-        size: f32,
-        flags: FontInstanceFlags,
-    ) -> FontInstanceKey {
-        let (sender, receiver) = unbounded();
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFontInstance(font_key, size, flags, sender),
-            )));
-        receiver.recv().unwrap()
-    }
-
-    #[tracing::instrument(skip(self), fields(servo_profiling = true))]
-    fn add_font(&self, data: Arc<Vec<u8>>, index: u32) -> FontKey {
-        let (sender, receiver) = unbounded();
-        let (bytes_sender, bytes_receiver) =
-            ipc::bytes_channel().expect("failed to create IPC channel");
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFont(sender, index, bytes_receiver),
-            )));
-        {
-            let span = span!(Level::TRACE, "add_font send", servo_profiling = true);
-            let _span = span.enter();
-            let _ = bytes_sender.send(&data);
-        }
-        receiver.recv().unwrap()
-    }
-
-    fn add_system_font(&self, handle: NativeFontHandle) -> FontKey {
-        let (sender, receiver) = unbounded();
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddSystemFont(sender, handle),
-            )));
-        receiver.recv().unwrap()
-    }
-
-    fn forward_add_font_message(
-        &self,
-        bytes_receiver: ipc::IpcBytesReceiver,
-        font_index: u32,
-        result_sender: IpcSender<FontKey>,
-    ) {
-        let (sender, receiver) = unbounded();
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFont(sender, font_index, bytes_receiver),
-            )));
-        let _ = result_sender.send(receiver.recv().unwrap());
-    }
-
-    fn forward_add_font_instance_message(
-        &self,
-        font_key: FontKey,
-        size: f32,
-        flags: FontInstanceFlags,
-        result_sender: IpcSender<FontInstanceKey>,
-    ) {
-        let (sender, receiver) = unbounded();
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Font(
-                FontToCompositorMsg::AddFontInstance(font_key, size, flags, sender),
-            )));
-        let _ = result_sender.send(receiver.recv().unwrap());
-    }
-}
-
-#[derive(Clone)]
-struct CanvasWebrenderApi(CompositorProxy);
-
-impl canvas_paint_thread::WebrenderApi for CanvasWebrenderApi {
-    fn generate_key(&self) -> Option<ImageKey> {
-        let (sender, receiver) = unbounded();
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Canvas(
-                CanvasToCompositorMsg::GenerateKey(sender),
-            )));
-        receiver.recv().ok()
-    }
-    fn update_images(&self, updates: Vec<ImageUpdate>) {
-        self.0
-            .send(CompositorMsg::Forwarded(ForwardedToCompositorMsg::Canvas(
-                CanvasToCompositorMsg::UpdateImages(updates),
-            )));
-    }
-    fn clone(&self) -> Box<dyn canvas_paint_thread::WebrenderApi> {
-        Box::new(<Self as Clone>::clone(self))
-    }
 }
 
 // A logger that logs to two downstream loggers.
@@ -1233,9 +1196,7 @@ pub fn run_content_process(token: String) {
 
     let unprivileged_content = unprivileged_content_receiver.recv().unwrap();
     opts::set_options(unprivileged_content.opts());
-    prefs::pref_map()
-        .set_all(unprivileged_content.prefs())
-        .expect("Failed to set preferences");
+    prefs::add_user_prefs(unprivileged_content.prefs());
 
     // Enter the sandbox if necessary.
     if opts::get().sandbox {
@@ -1309,26 +1270,26 @@ pub fn default_user_agent_string_for(agent: UserAgent) -> String {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64", not(target_env = "ohos")))]
     let desktop_ua_string =
-        format!("Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Servo/{servo_version} Firefox/111.0");
+        format!("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Servo/{servo_version} Firefox/128.0");
     #[cfg(all(
         target_os = "linux",
         not(target_arch = "x86_64"),
         not(target_env = "ohos")
     ))]
     let desktop_ua_string =
-        format!("Mozilla/5.0 (X11; Linux i686; rv:109.0) Servo/{servo_version} Firefox/111.0");
+        format!("Mozilla/5.0 (X11; Linux i686; rv:128.0) Servo/{servo_version} Firefox/128.0");
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     let desktop_ua_string = format!(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Servo/{servo_version} Firefox/111.0"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Servo/{servo_version} Firefox/128.0"
     );
     #[cfg(all(target_os = "windows", not(target_arch = "x86_64")))]
     let desktop_ua_string =
-        format!("Mozilla/5.0 (Windows NT 10.0; rv:109.0) Servo/{servo_version} Firefox/111.0");
+        format!("Mozilla/5.0 (Windows NT 10.0; rv:128.0) Servo/{servo_version} Firefox/128.0");
 
     #[cfg(target_os = "macos")]
     let desktop_ua_string = format!(
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Servo/{servo_version} Firefox/111.0"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Servo/{servo_version} Firefox/128.0"
     );
 
     #[cfg(any(target_os = "android", target_env = "ohos"))]
@@ -1337,13 +1298,13 @@ pub fn default_user_agent_string_for(agent: UserAgent) -> String {
     match agent {
         UserAgent::Desktop => desktop_ua_string,
         UserAgent::Android => format!(
-            "Mozilla/5.0 (Android; Mobile; rv:109.0) Servo/{servo_version} Firefox/111.0"
+            "Mozilla/5.0 (Android; Mobile; rv:128.0) Servo/{servo_version} Firefox/128.0"
         ),
         UserAgent::OpenHarmony => format!(
-            "Mozilla/5.0 (OpenHarmony; Mobile; rv:109.0) Servo/{servo_version} Firefox/111.0"
+            "Mozilla/5.0 (OpenHarmony; Mobile; rv:128.0) Servo/{servo_version} Firefox/128.0"
         ),
         UserAgent::iOS => format!(
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X; rv:109.0) Servo/{servo_version} Firefox/111.0"
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X; rv:128.0) Servo/{servo_version} Firefox/128.0"
         ),
     }
 }

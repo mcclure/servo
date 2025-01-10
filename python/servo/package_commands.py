@@ -56,6 +56,10 @@ PACKAGES = {
         r'production\msi\Servo.exe',
         r'production\msi\Servo.zip',
     ],
+    'ohos': [
+        ('openharmony/aarch64-unknown-linux-ohos/release/entry/build/'
+            'default/outputs/default/servoshell-default-signed.hap')
+    ],
 }
 
 
@@ -132,10 +136,7 @@ class PackageCommands(CommandBase):
     @CommandArgument('--target', '-t',
                      default=None,
                      help='Package for given target platform')
-    @CommandArgument('--flavor', '-f',
-                     default=None,
-                     help='Package using the given Gradle flavor')
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
     @CommandBase.allow_target_configuration
     def package(self, build_type: BuildType, flavor=None, with_asan=False):
         env = self.build_env()
@@ -194,12 +195,22 @@ class PackageCommands(CommandBase):
                 print("Cleaning up from previous packaging")
                 delete(ohos_target_dir)
             shutil.copytree(ohos_app_dir, ohos_target_dir)
+            resources_src_dir = path.join(self.get_top_dir(), "resources")
+            resources_app_dir = path.join(ohos_target_dir, "AppScope", "resources", "resfile", "servo")
+            os.makedirs(resources_app_dir, exist_ok=True)
+            shutil.copytree(resources_src_dir, resources_app_dir, dirs_exist_ok=True)
 
             # Map non-debug profiles to 'release' buildMode HAP.
             if build_type.is_custom():
                 build_mode = "release"
 
-            hvigor_command = ["--no-daemon", "assembleHap", "-p", "product=default", "-p", f"buildMode={build_mode}"]
+            flavor_name = "default"
+            if flavor is not None:
+                flavor_name = flavor
+
+            hvigor_command = ["--no-daemon", "assembleHap",
+                              "-p", f"product={flavor_name}",
+                              "-p", f"buildMode={build_mode}"]
             # Detect if PATH already has hvigor, or else fallback to npm installation
             # provided via HVIGOR_PATH
             if "HVIGOR_PATH" not in env:
@@ -213,6 +224,12 @@ class PackageCommands(CommandBase):
                           "path to hvigorw or set the HVIGOR_PATH environment variable to the npm"
                           "installation containing `node_modules` directory with hvigor modules.")
                     sys.exit(1)
+                except subprocess.CalledProcessError as e:
+                    print(f"hvigor exited with the following error: {e}")
+                    print(f"stdout: `{e.stdout}`")
+                    print(f"stderr: `{e.stderr}`")
+                    sys.exit(1)
+
             else:
                 env["NODE_PATH"] = env["HVIGOR_PATH"] + "/node_modules"
                 hvigor_script = f"{env['HVIGOR_PATH']}/node_modules/@ohos/hvigor/bin/hvigor.js"
@@ -413,16 +430,16 @@ class PackageCommands(CommandBase):
     @CommandArgument('--target', '-t',
                      default=None,
                      help='Install the given target platform')
-    @CommandBase.common_command_arguments(build_configuration=False, build_type=True)
+    @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
     @CommandBase.allow_target_configuration
-    def install(self, build_type: BuildType, emulator=False, usb=False, with_asan=False):
+    def install(self, build_type: BuildType, emulator=False, usb=False, with_asan=False, flavor=None):
         env = self.build_env()
         try:
             binary_path = self.get_binary_path(build_type, asan=with_asan)
         except BuildNotFound:
             print("Servo build not found. Building servo...")
             result = Registrar.dispatch(
-                "build", context=self.context, build_type=build_type
+                "build", context=self.context, build_type=build_type, flavor=flavor
             )
             if result:
                 return result
@@ -444,7 +461,7 @@ class PackageCommands(CommandBase):
                 exec_command += ["-d"]
             exec_command += ["install", "-r", pkg_path]
         elif self.is_openharmony():
-            pkg_path = self.target.get_package_path(build_type.directory_name())
+            pkg_path = self.target.get_package_path(build_type.directory_name(), flavor=flavor)
             hdc_path = path.join(env["OHOS_SDK_NATIVE"], "../", "toolchains", "hdc")
             exec_command = [hdc_path, "install", "-r", pkg_path]
         elif is_windows():
@@ -454,7 +471,7 @@ class PackageCommands(CommandBase):
         if not path.exists(pkg_path):
             print("Servo package not found. Packaging servo...")
             result = Registrar.dispatch(
-                "package", context=self.context, build_type=build_type
+                "package", context=self.context, build_type=build_type, flavor=flavor
             )
             if result != 0:
                 return result

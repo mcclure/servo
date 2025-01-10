@@ -11,6 +11,7 @@ use crate::dom::bindings::codegen::Bindings::WebGLShaderPrecisionFormatBinding::
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct WebGLShaderPrecisionFormat {
@@ -41,11 +42,12 @@ impl WebGLShaderPrecisionFormat {
                 range_min, range_max, precision,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
 
-impl WebGLShaderPrecisionFormatMethods for WebGLShaderPrecisionFormat {
+impl WebGLShaderPrecisionFormatMethods<crate::DomTypeHolder> for WebGLShaderPrecisionFormat {
     // https://www.khronos.org/registry/webgl/specs/1.0/#5.12.1
     fn RangeMin(&self) -> i32 {
         self.range_min

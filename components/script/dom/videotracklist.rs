@@ -15,7 +15,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::videotrack::VideoTrack;
 use crate::dom::window::Window;
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct VideoTrackList {
@@ -44,6 +44,7 @@ impl VideoTrackList {
         reflect_dom_object(
             Box::new(VideoTrackList::new_inherited(tracks, media_element)),
             window,
+            CanGc::note(),
         )
     }
 
@@ -80,13 +81,6 @@ impl VideoTrackList {
             return;
         }
 
-        let global = &self.global();
-        let this = Trusted::new(self);
-        let (source, canceller) = global
-            .as_window()
-            .task_manager()
-            .media_element_task_source_with_canceller();
-
         if let Some(current) = self.selected_index() {
             self.tracks.borrow()[current].set_selected(false);
         }
@@ -96,13 +90,14 @@ impl VideoTrackList {
             media_element.set_video_track(idx, value);
         }
 
-        let _ = source.queue_with_canceller(
-            task!(media_track_change: move || {
+        let this = Trusted::new(self);
+        self.global()
+            .task_manager()
+            .media_element_task_source()
+            .queue(task!(media_track_change: move || {
                 let this = this.root();
-                this.upcast::<EventTarget>().fire_event(atom!("change"));
-            }),
-            &canceller,
-        );
+                this.upcast::<EventTarget>().fire_event(atom!("change"), CanGc::note());
+            }));
     }
 
     pub fn add(&self, track: &VideoTrack) {
@@ -124,7 +119,7 @@ impl VideoTrackList {
     }
 }
 
-impl VideoTrackListMethods for VideoTrackList {
+impl VideoTrackListMethods<crate::DomTypeHolder> for VideoTrackList {
     // https://html.spec.whatwg.org/multipage/#dom-videotracklist-length
     fn Length(&self) -> u32 {
         self.len() as u32

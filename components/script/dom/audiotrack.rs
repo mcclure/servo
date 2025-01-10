@@ -13,6 +13,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct AudioTrack {
@@ -57,6 +58,7 @@ impl AudioTrack {
                 id, kind, label, language, track_list,
             )),
             window,
+            CanGc::note(),
         )
     }
 
@@ -85,7 +87,7 @@ impl AudioTrack {
     }
 }
 
-impl AudioTrackMethods for AudioTrack {
+impl AudioTrackMethods<crate::DomTypeHolder> for AudioTrack {
     // https://html.spec.whatwg.org/multipage/#dom-audiotrack-id
     fn Id(&self) -> DOMString {
         self.id()

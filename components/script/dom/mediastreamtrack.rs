@@ -12,6 +12,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct MediaStreamTrack {
@@ -38,7 +39,11 @@ impl MediaStreamTrack {
         id: MediaStreamId,
         ty: MediaStreamType,
     ) -> DomRoot<MediaStreamTrack> {
-        reflect_dom_object(Box::new(MediaStreamTrack::new_inherited(id, ty)), global)
+        reflect_dom_object(
+            Box::new(MediaStreamTrack::new_inherited(id, ty)),
+            global,
+            CanGc::note(),
+        )
     }
 
     pub fn id(&self) -> MediaStreamId {
@@ -50,7 +55,7 @@ impl MediaStreamTrack {
     }
 }
 
-impl MediaStreamTrackMethods for MediaStreamTrack {
+impl MediaStreamTrackMethods<crate::DomTypeHolder> for MediaStreamTrack {
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastreamtrack-kind>
     fn Kind(&self) -> DOMString {
         match self.ty {

@@ -38,6 +38,7 @@ use egui_glow::ShaderVersion;
 pub use egui_winit;
 use egui_winit::winit;
 pub use egui_winit::EventResponse;
+use winit::event_loop::ActiveEventLoop;
 
 /// Use [`egui`] from a [`glow`] app based on [`winit`].
 pub struct EguiGlow {
@@ -51,12 +52,12 @@ pub struct EguiGlow {
 
 impl EguiGlow {
     /// For automatic shader version detection set `shader_version` to `None`.
-    pub fn new<E>(
-        event_loop: &winit::event_loop::EventLoopWindowTarget<E>,
+    pub fn new(
+        event_loop: &ActiveEventLoop,
         gl: std::sync::Arc<glow::Context>,
         shader_version: Option<ShaderVersion>,
     ) -> Self {
-        let painter = egui_glow::Painter::new(gl, "", shader_version)
+        let painter = egui_glow::Painter::new(gl, "", shader_version, false)
             .map_err(|err| {
                 log::error!("error occurred in initializing painter:\n{err}");
             })
@@ -68,6 +69,7 @@ impl EguiGlow {
                 egui_ctx.clone(),
                 ViewportId::ROOT,
                 event_loop,
+                None,
                 None,
                 None,
             ),

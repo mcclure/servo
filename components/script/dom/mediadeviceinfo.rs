@@ -5,6 +5,7 @@
 use dom_struct::dom_struct;
 use servo_media::streams::device_monitor::MediaDeviceKind as ServoMediaDeviceKind;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::MediaDeviceInfoBinding::{
     MediaDeviceInfoMethods, MediaDeviceKind,
 };
@@ -12,6 +13,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct MediaDeviceInfo {
@@ -50,11 +52,12 @@ impl MediaDeviceInfo {
                 device_id, kind, label, group_id,
             )),
             global,
+            CanGc::note(),
         )
     }
 }
 
-impl MediaDeviceInfoMethods for MediaDeviceInfo {
+impl MediaDeviceInfoMethods<crate::DomTypeHolder> for MediaDeviceInfo {
     /// <https://w3c.github.io/mediacapture-main/#dom-mediadeviceinfo-deviceid>
     fn DeviceId(&self) -> DOMString {
         self.device_id.clone()
@@ -76,9 +79,9 @@ impl MediaDeviceInfoMethods for MediaDeviceInfo {
     }
 }
 
-impl From<ServoMediaDeviceKind> for MediaDeviceKind {
-    fn from(kind: ServoMediaDeviceKind) -> MediaDeviceKind {
-        match kind {
+impl Convert<MediaDeviceKind> for ServoMediaDeviceKind {
+    fn convert(self) -> MediaDeviceKind {
+        match self {
             ServoMediaDeviceKind::AudioInput => MediaDeviceKind::Audioinput,
             ServoMediaDeviceKind::AudioOutput => MediaDeviceKind::Audiooutput,
             ServoMediaDeviceKind::VideoInput => MediaDeviceKind::Videoinput,

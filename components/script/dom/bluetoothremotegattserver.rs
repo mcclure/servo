@@ -20,6 +20,7 @@ use crate::dom::bluetoothuuid::{BluetoothServiceUUID, BluetoothUUID};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::realms::InRealm;
+use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/#bluetoothremotegattserver
 #[dom_struct]
@@ -45,6 +46,7 @@ impl BluetoothRemoteGATTServer {
         reflect_dom_object(
             Box::new(BluetoothRemoteGATTServer::new_inherited(device)),
             global,
+            CanGc::note(),
         )
     }
 
@@ -57,7 +59,7 @@ impl BluetoothRemoteGATTServer {
     }
 }
 
-impl BluetoothRemoteGATTServerMethods for BluetoothRemoteGATTServer {
+impl BluetoothRemoteGATTServerMethods<crate::DomTypeHolder> for BluetoothRemoteGATTServer {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-device
     fn Device(&self) -> DomRoot<BluetoothDevice> {
         DomRoot::from_ref(&self.device)
@@ -70,9 +72,9 @@ impl BluetoothRemoteGATTServerMethods for BluetoothRemoteGATTServer {
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-connect
     #[allow(unsafe_code)]
-    fn Connect(&self, comp: InRealm) -> Rc<Promise> {
+    fn Connect(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         // Step 1.
-        let p = Promise::new_in_current_realm(comp);
+        let p = Promise::new_in_current_realm(comp, can_gc);
         let sender = response_async(&p, self);
 
         // TODO: Step 3: Check if the UA is currently using the Bluetooth system.
@@ -94,7 +96,7 @@ impl BluetoothRemoteGATTServerMethods for BluetoothRemoteGATTServer {
     }
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-disconnect
-    fn Disconnect(&self) -> ErrorResult {
+    fn Disconnect(&self, can_gc: CanGc) -> ErrorResult {
         // TODO: Step 1: Implement activeAlgorithms internal slot for BluetoothRemoteGATTServer.
 
         // Step 2.
@@ -103,14 +105,14 @@ impl BluetoothRemoteGATTServerMethods for BluetoothRemoteGATTServer {
         }
 
         // Step 3.
-        self.Device().clean_up_disconnected_device();
+        self.Device().clean_up_disconnected_device(can_gc);
 
         // Step 4 - 5:
         self.Device().garbage_collect_the_connection()
     }
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-getprimaryservice
-    fn GetPrimaryService(&self, service: BluetoothServiceUUID) -> Rc<Promise> {
+    fn GetPrimaryService(&self, service: BluetoothServiceUUID, can_gc: CanGc) -> Rc<Promise> {
         // Step 1 - 2.
         get_gatt_children(
             self,
@@ -120,11 +122,16 @@ impl BluetoothRemoteGATTServerMethods for BluetoothRemoteGATTServer {
             String::from(self.Device().Id()),
             self.Device().get_gatt().Connected(),
             GATTType::PrimaryService,
+            can_gc,
         )
     }
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-getprimaryservices
-    fn GetPrimaryServices(&self, service: Option<BluetoothServiceUUID>) -> Rc<Promise> {
+    fn GetPrimaryServices(
+        &self,
+        service: Option<BluetoothServiceUUID>,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
         // Step 1 - 2.
         get_gatt_children(
             self,
@@ -134,12 +141,13 @@ impl BluetoothRemoteGATTServerMethods for BluetoothRemoteGATTServer {
             String::from(self.Device().Id()),
             self.Connected(),
             GATTType::PrimaryService,
+            can_gc,
         )
     }
 }
 
 impl AsyncBluetoothListener for BluetoothRemoteGATTServer {
-    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>) {
+    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>, _can_gc: CanGc) {
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-connect
             BluetoothResponse::GATTServerConnect(connected) => {

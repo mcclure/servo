@@ -3,10 +3,9 @@ resolver = "2"
 members = [
     "ports/servoshell",
     "tests/unit/*",
-    "support/crown",
 ]
 default-members = ["ports/servoshell"]
-exclude = [".cargo"]
+exclude = [".cargo", "support/crown"]
 
 [workspace.package]
 version = "0.0.1"
@@ -14,30 +13,36 @@ authors = ["The Servo Project Developers"]
 license = "MPL-2.0"
 edition = "2021"
 publish = false
-rust-version = "1.80.1"
+rust-version = "1.83.0"
 
 [workspace.dependencies]
 accountable-refcell = "0.2.0"
+aes = "0.8.4"
+aes-kw = { version = "0.2.1", features = ["alloc"] }
+aes-gcm = "0.10.3"
 app_units = "0.7"
 arrayvec = "0.7"
-async-tungstenite = { version = "0.23", features = ["tokio-rustls-webpki-roots"] }
+async-tungstenite = { version = "0.28", features = ["tokio-rustls-webpki-roots"] }
 atomic_refcell = "0.1.13"
 background_hang_monitor_api = { path = "components/shared/background_hang_monitor" }
 backtrace = "0.3"
 base = { path = "components/shared/base" }
-base64 = "0.21.7"
+base64 = "0.22.1"
 bincode = "1"
 bitflags = "2.6"
 bluetooth_traits = { path = "components/shared/bluetooth" }
 byteorder = "1.5"
 canvas_traits = { path = "components/shared/canvas" }
+cbc = "0.1.2"
 cfg-if = "1.0.0"
 chrono = { version = "0.4", features = ["serde"] }
+cipher = { version = "0.4.4", features = ["alloc"] }
 compositing_traits = { path = "components/shared/compositing" }
 content-security-policy = { version = "0.5", features = ["serde"] }
 cookie = { package = "cookie", version = "0.18" }
 crossbeam-channel = "0.5"
 cssparser = { version = "0.34", features = ["serde"] }
+ctr = "0.9.2"
 darling = { version = "0.20", default-features = false }
 data-url = "0.3"
 devtools_traits = { path = "components/shared/devtools" }
@@ -46,42 +51,45 @@ encoding_rs = "0.8"
 env_logger = "0.10"
 euclid = "0.22"
 fnv = "1.0"
+fonts_traits = { path = "components/shared/fonts" }
 freetype-sys = "0.20"
 fxhash = "0.2"
 getopts = "0.2.11"
-fonts_traits = { path = "components/shared/fonts" }
 gleam = "0.15"
 glib = "0.19"
-gstreamer = { version = "0.22", features = ["v1_18"] }
-gstreamer-base = "0.22"
-gstreamer-gl = "0.22"
-gstreamer-gl-sys = "0.22"
-gstreamer-sys = "0.22"
-gstreamer-video = "0.22"
-headers = "0.3"
+glow = "0.16"
+gstreamer = { version = "0.23", features = ["v1_18"] }
+gstreamer-base = "0.23"
+gstreamer-gl = "0.23"
+gstreamer-gl-sys = "0.23"
+gstreamer-sys = "0.23"
+gstreamer-video = "0.23"
+headers = "0.4"
 hitrace = "0.1.4"
 html5ever = "0.29"
-http = "0.2"
-hyper = "0.14"
-hyper-rustls = { version = "0.24", default-features = false, features = ["acceptor", "http1", "http2", "logging", "tls12", "webpki-tokio"] }
+http = "1.0"
+http-body-util = "0.1"
+hyper = "1.0"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "tls12", "webpki-tokio"] }
 hyper_serde = { path = "components/hyper_serde" }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
 icu_segmenter = "1.5.0"
 image = "0.24"
 imsz = "0.2"
 indexmap = { version = "2.5.0", features = ["std"] }
-ipc-channel = "0.18"
+ipc-channel = "0.19"
 itertools = "0.13"
-tikv-jemalloc-sys = "0.6.0"
-tikv-jemallocator = "0.6.0"
 keyboard-types = "0.7"
 libc = "0.2"
 log = "0.4"
 mach2 = "0.4"
-malloc_size_of = { git = "https://github.com/servo/stylo", branch = "2024-09-02", features = ["servo"] }
+malloc_size_of = { package = "servo_malloc_size_of", path = "components/malloc_size_of" }
 malloc_size_of_derive = "0.1"
+markup5ever = "0.14"
+memmap2 = "0.9.5"
 mime = "0.3.13"
 mime_guess = "2.0.5"
-mozangle = "0.5.1"
+mozangle = "0.5.3"
 net_traits = { path = "components/shared/net" }
 nix = "0.29"
 num-traits = "0.2"
@@ -95,57 +103,66 @@ rand = "0.8"
 rand_core = "0.6"
 rand_isaac = "0.3"
 rayon = "1"
-regex = "1.10"
-rustls = { version = "0.21.12", features = ["dangerous_configuration"] }
-rustls-pemfile = "1.0.4"
+regex = "1.11"
+ring = "0.17.8"
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
+rustls-pemfile = "2.0"
+rustls-pki-types = "1.10"
 script_layout_interface = { path = "components/shared/script_layout" }
 script_traits = { path = "components/shared/script" }
-selectors = { git = "https://github.com/servo/stylo", branch = "2024-09-02" }
-serde = "1.0.210"
+selectors = { git = "https://github.com/servo/stylo", branch = "2025-01-02" }
+serde = "1.0.217"
 serde_bytes = "0.11"
 serde_json = "1.0"
 servo-media = { git = "https://github.com/servo/media" }
 servo-media-dummy = { git = "https://github.com/servo/media" }
 servo-media-gstreamer = { git = "https://github.com/servo/media" }
-servo_arc = { git = "https://github.com/servo/stylo", branch = "2024-09-02", features = ["servo"] }
-servo_atoms = { git = "https://github.com/servo/stylo", branch = "2024-09-02" }
-size_of_test = { git = "https://github.com/servo/stylo", branch = "2024-09-02" }
+servo_arc = { git = "https://github.com/servo/stylo", branch = "2025-01-02", features = ["servo"] }
+servo_atoms = { git = "https://github.com/servo/stylo", branch = "2025-01-02" }
 smallbitvec = "2.5.3"
 smallvec = "1.13"
-sparkle = "0.1.26"
+static_assertions = "1.1"
 string_cache = "0.8"
 string_cache_codegen = "0.5"
-style = { git = "https://github.com/servo/stylo", branch = "2024-09-02", features = ["servo"] }
-style_config = { git = "https://github.com/servo/stylo", branch = "2024-09-02" }
-style_dom = { git = "https://github.com/servo/stylo", package = "dom", branch = "2024-09-02" }
-style_traits = { git = "https://github.com/servo/stylo", branch = "2024-09-02", features = ["servo"] }
-surfman = { version = "0.9.8", features = ["chains"] }
+style = { git = "https://github.com/servo/stylo", branch = "2025-01-02", features = ["servo"] }
+style_config = { git = "https://github.com/servo/stylo", branch = "2025-01-02" }
+style_dom = { git = "https://github.com/servo/stylo", package = "dom", branch = "2025-01-02" }
+style_traits = { git = "https://github.com/servo/stylo", branch = "2025-01-02", features = ["servo"] }
+style_malloc_size_of = { package = "malloc_size_of", git = "https://github.com/servo/stylo", branch = "2025-01-02", features = ["servo"] }
+surfman = { git = "https://github.com/servo/surfman", rev = "300789ddbda45c89e9165c31118bf1c4c07f89f6", features = ["chains"] }
 syn = { version = "2", default-features = false, features = ["clone-impls", "derive", "parsing"] }
 synstructure = "0.13"
+taffy = { version = "0.7.2", default-features = false, features = ["std", "serde", "grid", "detailed_layout_info"] }
 thin-vec = "0.2.13"
+tikv-jemalloc-sys = "0.6.0"
+tikv-jemallocator = "0.6.0"
 time_03 = { package = "time", version = "0.3", features = ["large-dates", "local-offset", "serde"] }
-to_shmem = { git = "https://github.com/servo/stylo", branch = "2024-09-02" }
+to_shmem = { git = "https://github.com/servo/stylo", branch = "2025-01-02" }
 tokio = "1"
-tokio-rustls = "0.24"
-tungstenite = "0.20"
-tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
-tracing-perfetto = "0.1.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
+tower-service = "0.3"
+tracing = "0.1.41"
+tracing-perfetto = "0.1.5"
+tracing-subscriber = "0.3.19"
+tungstenite = "0.24"
 uluru = "3.0"
-unicode-bidi = "0.3.15"
-unicode-properties = { version = "0.1.2", features = ["emoji"] }
+unicode-bidi = "0.3.18"
+unicode-properties = { version = "0.1.3", features = ["emoji"] }
 unicode-script = "0.5"
 unicode-segmentation = "1.12.0"
 url = "2.5"
-uuid = { version = "1.10.0", features = ["v4"] }
-webdriver = "0.49.0"
-webpki-roots = "0.25"
+uuid = { version = "1.11.0", features = ["v4"] }
+webdriver = "0.51.0"
+webpki-roots = "0.26"
 webrender = { git = "https://github.com/servo/webrender", branch = "0.65", features = ["capture"] }
 webrender_api = { git = "https://github.com/servo/webrender", branch = "0.65" }
 webrender_traits = { path = "components/shared/webrender" }
-wgpu-core = { git = "https://github.com/gfx-rs/wgpu", rev = "0e352f5b3448236b6cbebcd146d0606b00cb3806" }
-wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "0e352f5b3448236b6cbebcd146d0606b00cb3806" }
+webxr = { git = "https://github.com/servo/webxr" }
+webxr-api = { git = "https://github.com/servo/webxr" }
+wgpu-core = { git = "https://github.com/gfx-rs/wgpu", rev = "0f5f0580e4cb2fd2feac0e8ed7e8d3050e4d9c93" }
+wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "0f5f0580e4cb2fd2feac0e8ed7e8d3050e4d9c93" }
 windows-sys = "0.59"
+wr_malloc_size_of = { git = "https://github.com/servo/webrender", branch = "0.65" }
 xi-unicode = "0.3.0"
 xml5ever = "0.20"
 
@@ -153,11 +170,20 @@ xml5ever = "0.20"
 opt-level = 3
 debug-assertions = true
 
+# A profile between `dev` and `release` which aims to offer a compromise between
+# fast incremental rebuilds and runtime speed.
+[profile.medium]
+inherits = "release"
+opt-level = 2
+incremental = true
+debug = "line-tables-only"
+
 [profile.production]
 inherits = "release"
 debug-assertions = false
-lto = "thin"
+lto = true
 codegen-units = 1
+opt-level = "s"
 
 [profile.production-stripped]
 inherits = "production"
@@ -179,17 +205,15 @@ codegen-units = 1
 # Or for Stylo:
 #
 # [patch."https://github.com/servo/stylo"]
-# derive_common = { path = "../stylo/derive_common" }
-# dom = { path = "../stylo/dom" }
-# malloc_size_of = { path = "../stylo/malloc_size_of" }
 # selectors = { path = "../stylo/selectors" }
 # servo_arc = { path = "../stylo/servo_arc" }
 # servo_atoms = { path = "../stylo/atoms" }
-# size_of_test = { path = "../stylo/size_of_test" }
 # static_prefs = { path = "../stylo/style_static_prefs" }
 # style = { path = "../stylo/style" }
 # style_config = { path = "../stylo/style_config" }
 # style_derive = { path = "../stylo/style_derive" }
+# style_dom = { path = "../stylo/dom", package = "dom" }
+# style_malloc_size_of = { path = "../stylo/malloc_size_of", package = "malloc_size_of" }
 # style_traits = { path = "../stylo/style_traits" }
 # to_shmem = { path = "../stylo/to_shmem" }
 #
@@ -198,6 +222,7 @@ codegen-units = 1
 # [patch."https://github.com/servo/webrender"]
 # webrender = { path = "../webrender/webrender" }
 # webrender_api = { path = "../webrender/webrender_api" }
+# wr_malloc_size_of = { path = "../webrender/wr_malloc_size_of" }
 #
 # Or for another Git dependency:
 #

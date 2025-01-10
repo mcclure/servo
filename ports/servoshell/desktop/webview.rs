@@ -21,8 +21,8 @@ use servo::base::id::TopLevelBrowsingContextId as WebViewId;
 use servo::compositing::windowing::{EmbedderEvent, WebRenderDebugOption};
 use servo::embedder_traits::{
     CompositorEventVariant, ContextMenuResult, DualRumbleEffectParams, EmbedderMsg, FilterPattern,
-    GamepadHapticEffectType, PermissionPrompt, PermissionRequest, PromptDefinition, PromptOrigin,
-    PromptResult,
+    GamepadHapticEffectType, PermissionPrompt, PermissionRequest, PromptCredentialsInput,
+    PromptDefinition, PromptOrigin, PromptResult,
 };
 use servo::ipc_channel::ipc::IpcSender;
 use servo::script_traits::{
@@ -38,7 +38,6 @@ use tinyfiledialogs::{self, MessageBoxIcon, OkCancel, YesNo};
 use super::keyutils::{CMD_OR_ALT, CMD_OR_CONTROL};
 use super::window_trait::{WindowPortsMethods, LINE_HEIGHT};
 use crate::desktop::tracing::{trace_embedder_event, trace_embedder_msg};
-use crate::parser::location_bar_input_to_url;
 
 pub struct WebViewManager<Window: WindowPortsMethods + ?Sized> {
     status_text: Option<String>,
@@ -431,29 +430,6 @@ where
             .shortcut(CMD_OR_CONTROL, 'R', || {
                 self.focused_webview_id.map(EmbedderEvent::Reload)
             })
-            .shortcut(CMD_OR_CONTROL, 'L', || {
-                if !opts::get().minibrowser {
-                    let url = match self.focused_webview() {
-                        Some(webview) => webview
-                            .url
-                            .as_ref()
-                            .map(|url| url.to_string())
-                            .unwrap_or_else(String::default),
-                        None => String::default(),
-                    };
-
-                    let title = "URL or search query";
-                    let input = tinyfiledialogs::input_box(title, title, &tiny_dialog_escape(&url));
-                    input.and_then(|input| {
-                        location_bar_input_to_url(&input).and_then(|url| {
-                            self.focused_webview_id
-                                .map(|id| EmbedderEvent::LoadUrl(id, url))
-                        })
-                    })
-                } else {
-                    None
-                }
-            })
             // Select the first 8 tabs via shortcuts
             .shortcut(CMD_OR_CONTROL, '1', || self.focus_webview_by_index(0))
             .shortcut(CMD_OR_CONTROL, '2', || self.focus_webview_by_index(1))
@@ -721,6 +697,12 @@ where
                             PromptDefinition::Input(_message, default, sender) => {
                                 sender.send(Some(default.to_owned()))
                             },
+                            PromptDefinition::Credentials(sender) => {
+                                sender.send(PromptCredentialsInput {
+                                    username: None,
+                                    password: None,
+                                })
+                            },
                         }
                     } else {
                         thread::Builder::new()
@@ -774,6 +756,12 @@ where
                                     }
                                     let result = tinyfiledialogs::input_box("", &message, &default);
                                     sender.send(result)
+                                },
+                                PromptDefinition::Credentials(sender) => {
+                                    // TODO: figure out how to make the message a localized string
+                                    let username = tinyfiledialogs::input_box("", "username", "");
+                                    let password = tinyfiledialogs::input_box("", "password", "");
+                                    sender.send(PromptCredentialsInput { username, password })
                                 },
                             })
                             .unwrap()

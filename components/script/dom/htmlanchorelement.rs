@@ -2,48 +2,47 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
 use std::default::Default;
 
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::rust::HandleObject;
-use net_traits::request::Referrer;
 use num_traits::ToPrimitive;
-use script_traits::{HistoryEntryReplacement, LoadData, LoadOrigin};
 use servo_atoms::Atom;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
 
 use crate::dom::activation::Activatable;
+use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLAnchorElementBinding::HTMLAnchorElementMethods;
 use crate::dom::bindings::codegen::Bindings::MouseEventBinding::MouseEventMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
-use crate::dom::element::{referrer_policy_for_element, Element};
+use crate::dom::element::{reflect_referrer_policy_attribute, AttributeMutation, Element};
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlareaelement::HTMLAreaElement;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlformelement::HTMLFormElement;
 use crate::dom::htmlimageelement::HTMLImageElement;
 use crate::dom::mouseevent::MouseEvent;
-use crate::dom::node::{document_from_node, Node};
+use crate::dom::node::{BindContext, Node, NodeTraits};
 use crate::dom::urlhelper::UrlHelper;
 use crate::dom::virtualmethods::VirtualMethods;
-use crate::task_source::TaskSource;
+use crate::links::{follow_hyperlink, LinkRelations};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLAnchorElement {
     htmlelement: HTMLElement,
     rel_list: MutNullableDom<DOMTokenList>,
+
+    #[no_trace]
+    relations: Cell<LinkRelations>,
     #[no_trace]
     url: DomRefCell<Option<ServoUrl>>,
 }
@@ -57,6 +56,7 @@ impl HTMLAnchorElement {
         HTMLAnchorElement {
             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             rel_list: Default::default(),
+            relations: Cell::new(LinkRelations::empty()),
             url: DomRefCell::new(None),
         }
     }
@@ -67,6 +67,7 @@ impl HTMLAnchorElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLAnchorElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLAnchorElement::new_inherited(
@@ -74,18 +75,33 @@ impl HTMLAnchorElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-hyperlink-url-set
+    /// <https://html.spec.whatwg.org/multipage/#concept-hyperlink-url-set>
     fn set_url(&self) {
+        // Step 1. Set this element's url to null.
+        *self.url.borrow_mut() = None;
+
+        // Step 2. If this element's href content attribute is absent, then return.
         let attribute = self
             .upcast::<Element>()
             .get_attribute(&ns!(), &local_name!("href"));
-        *self.url.borrow_mut() = attribute.and_then(|attribute| {
-            let document = document_from_node(self);
-            document.base_url().join(&attribute.value()).ok()
-        });
+
+        let Some(attribute) = attribute else {
+            return;
+        };
+
+        // Step 3. Let url be the result of encoding-parsing a URL given this element's
+        // href content attribute's value, relative to this element's node document.
+        let document = self.owner_document();
+        let url = document.encoding_parse_a_url(&attribute.value());
+
+        // Step 4. If url is not failure, then set this element's url to url.
+        if let Ok(url) = url {
+            *self.url.borrow_mut() = Some(url);
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/#reinitialise-url
@@ -101,9 +117,9 @@ impl HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#update-href
-    fn update_href(&self, url: DOMString) {
+    fn update_href(&self, url: DOMString, can_gc: CanGc) {
         self.upcast::<Element>()
-            .set_string_attribute(&local_name!("href"), url);
+            .set_string_attribute(&local_name!("href"), url, can_gc);
     }
 }
 
@@ -121,26 +137,47 @@ impl VirtualMethods for HTMLAnchorElement {
                 .parse_plain_attribute(name, value),
         }
     }
+
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
+        self.super_type().unwrap().attribute_mutated(attr, mutation);
+
+        match *attr.local_name() {
+            local_name!("rel") | local_name!("rev") => {
+                self.relations
+                    .set(LinkRelations::for_element(self.upcast()));
+            },
+            _ => {},
+        }
+    }
+
+    fn bind_to_tree(&self, context: &BindContext) {
+        if let Some(s) = self.super_type() {
+            s.bind_to_tree(context);
+        }
+
+        self.relations
+            .set(LinkRelations::for_element(self.upcast()));
+    }
 }
 
-impl HTMLAnchorElementMethods for HTMLAnchorElement {
+impl HTMLAnchorElementMethods<crate::DomTypeHolder> for HTMLAnchorElement {
     // https://html.spec.whatwg.org/multipage/#dom-a-text
     fn Text(&self) -> DOMString {
         self.upcast::<Node>().GetTextContent().unwrap()
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-a-text
-    fn SetText(&self, value: DOMString) {
-        self.upcast::<Node>().SetTextContent(Some(value))
+    fn SetText(&self, value: DOMString, can_gc: CanGc) {
+        self.upcast::<Node>().SetTextContent(Some(value), can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-a-rel
     make_getter!(Rel, "rel");
 
     // https://html.spec.whatwg.org/multipage/#dom-a-rel
-    fn SetRel(&self, rel: DOMString) {
+    fn SetRel(&self, rel: DOMString, can_gc: CanGc) {
         self.upcast::<Element>()
-            .set_tokenlist_attribute(&local_name!("rel"), rel);
+            .set_tokenlist_attribute(&local_name!("rel"), rel, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-a-rellist
@@ -204,7 +241,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-hash
-    fn SetHash(&self, value: USVString) {
+    fn SetHash(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -220,7 +257,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 6.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-host
@@ -243,7 +280,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-host
-    fn SetHost(&self, value: USVString) {
+    fn SetHost(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -259,7 +296,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 5.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-hostname
@@ -278,7 +315,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-hostname
-    fn SetHostname(&self, value: USVString) {
+    fn SetHostname(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -294,7 +331,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 5.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-href
@@ -320,9 +357,12 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-href
-    fn SetHref(&self, value: USVString) {
-        self.upcast::<Element>()
-            .set_string_attribute(&local_name!("href"), DOMString::from_string(value.0));
+    fn SetHref(&self, value: USVString, can_gc: CanGc) {
+        self.upcast::<Element>().set_string_attribute(
+            &local_name!("href"),
+            DOMString::from_string(value.0),
+            can_gc,
+        );
         self.set_url();
     }
 
@@ -357,7 +397,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-password
-    fn SetPassword(&self, value: USVString) {
+    fn SetPassword(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -373,7 +413,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 5.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-pathname
@@ -390,7 +430,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-pathname
-    fn SetPathname(&self, value: USVString) {
+    fn SetPathname(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -406,7 +446,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 6.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-port
@@ -423,7 +463,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-port
-    fn SetPort(&self, value: USVString) {
+    fn SetPort(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -442,7 +482,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 5.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-protocol
@@ -459,7 +499,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-protocol
-    fn SetProtocol(&self, value: USVString) {
+    fn SetProtocol(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -473,7 +513,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 4.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-search
@@ -490,7 +530,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-search
-    fn SetSearch(&self, value: USVString) {
+    fn SetSearch(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -507,7 +547,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 6.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-username
@@ -524,7 +564,7 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-hyperlink-username
-    fn SetUsername(&self, value: USVString) {
+    fn SetUsername(&self, value: USVString, can_gc: CanGc) {
         // Step 1.
         self.reinitialize_url();
 
@@ -540,8 +580,16 @@ impl HTMLAnchorElementMethods for HTMLAnchorElement {
             },
         };
         // Step 5.
-        self.update_href(url);
+        self.update_href(url, can_gc);
     }
+
+    // https://html.spec.whatwg.org/multipage/#dom-a-referrerpolicy
+    fn ReferrerPolicy(&self) -> DOMString {
+        reflect_referrer_policy_attribute(self.upcast::<Element>())
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-script-referrerpolicy
+    make_setter!(SetReferrerPolicy, "referrerpolicy");
 }
 
 impl Activatable for HTMLAnchorElement {
@@ -559,7 +607,7 @@ impl Activatable for HTMLAnchorElement {
     }
 
     //https://html.spec.whatwg.org/multipage/#the-a-element:activation-behaviour
-    fn activation_behavior(&self, event: &Event, target: &EventTarget) {
+    fn activation_behavior(&self, event: &Event, target: &EventTarget, _can_gc: CanGc) {
         let element = self.as_element();
         let mouse_event = event.downcast::<MouseEvent>().unwrap();
         let mut ismap_suffix = None;
@@ -569,7 +617,7 @@ impl Activatable for HTMLAnchorElement {
         if let Some(element) = target.downcast::<Element>() {
             if target.is::<HTMLImageElement>() && element.has_attribute(&local_name!("ismap")) {
                 let target_node = element.upcast::<Node>();
-                let rect = target_node.bounding_content_box_or_zero();
+                let rect = target_node.bounding_content_box_or_zero(CanGc::note());
                 ismap_suffix = Some(format!(
                     "?{},{}",
                     mouse_event.ClientX().to_f32().unwrap() - rect.origin.x.to_f32_px(),
@@ -580,153 +628,6 @@ impl Activatable for HTMLAnchorElement {
 
         // Step 2.
         //TODO: Download the link is `download` attribute is set.
-        follow_hyperlink(element, ismap_suffix);
+        follow_hyperlink(element, self.relations.get(), ismap_suffix);
     }
-}
-
-/// <https://html.spec.whatwg.org/multipage/#get-an-element's-target>
-pub fn get_element_target(subject: &Element) -> Option<DOMString> {
-    if !(subject.is::<HTMLAreaElement>() ||
-        subject.is::<HTMLAnchorElement>() ||
-        subject.is::<HTMLFormElement>())
-    {
-        return None;
-    }
-    if subject.has_attribute(&local_name!("target")) {
-        return Some(subject.get_string_attribute(&local_name!("target")));
-    }
-
-    let doc = document_from_node(subject).base_element();
-    match doc {
-        Some(doc) => {
-            let element = doc.upcast::<Element>();
-            if element.has_attribute(&local_name!("target")) {
-                Some(element.get_string_attribute(&local_name!("target")))
-            } else {
-                None
-            }
-        },
-        None => None,
-    }
-}
-
-/// <https://html.spec.whatwg.org/multipage/#get-an-element's-noopener>
-pub fn get_element_noopener(subject: &Element, target_attribute_value: Option<DOMString>) -> bool {
-    if !(subject.is::<HTMLAreaElement>() ||
-        subject.is::<HTMLAnchorElement>() ||
-        subject.is::<HTMLFormElement>())
-    {
-        return false;
-    }
-    let target_is_blank = target_attribute_value
-        .as_ref()
-        .is_some_and(|target| target.to_lowercase() == "_blank");
-    let link_types = match subject.get_attribute(&ns!(), &local_name!("rel")) {
-        Some(rel) => rel.Value(),
-        None => return target_is_blank,
-    };
-    link_types.contains("noreferrer") ||
-        link_types.contains("noopener") ||
-        (!link_types.contains("opener") && target_is_blank)
-}
-
-/// <https://html.spec.whatwg.org/multipage/#following-hyperlinks-2>
-pub fn follow_hyperlink(subject: &Element, hyperlink_suffix: Option<String>) {
-    // Step 1.
-    if subject.cannot_navigate() {
-        return;
-    }
-    // Step 2, done in Step 7.
-
-    let document = document_from_node(subject);
-    let window = document.window();
-
-    // Step 3: source browsing context.
-    let source = document.browsing_context().unwrap();
-
-    // Step 4-5: target attribute.
-    let target_attribute_value =
-        if subject.is::<HTMLAreaElement>() || subject.is::<HTMLAnchorElement>() {
-            get_element_target(subject)
-        } else {
-            None
-        };
-    // Step 6.
-    let noopener = get_element_noopener(subject, target_attribute_value.clone());
-
-    // Step 7.
-    let (maybe_chosen, replace) = match target_attribute_value {
-        Some(name) => {
-            let (maybe_chosen, new) = source.choose_browsing_context(name, noopener);
-            let replace = if new {
-                HistoryEntryReplacement::Enabled
-            } else {
-                HistoryEntryReplacement::Disabled
-            };
-            (maybe_chosen, replace)
-        },
-        None => (
-            Some(window.window_proxy()),
-            HistoryEntryReplacement::Disabled,
-        ),
-    };
-
-    // Step 8.
-    let chosen = match maybe_chosen {
-        Some(proxy) => proxy,
-        None => return,
-    };
-
-    if let Some(target_document) = chosen.document() {
-        let target_window = target_document.window();
-        // Step 9, dis-owning target's opener, if necessary
-        // will have been done as part of Step 7 above
-        // in choose_browsing_context/create_auxiliary_browsing_context.
-
-        // Step 10, 11. TODO: if parsing the URL failed, navigate to error page.
-        let attribute = subject.get_attribute(&ns!(), &local_name!("href")).unwrap();
-        let mut href = attribute.Value();
-        // Step 11: append a hyperlink suffix.
-        // https://www.w3.org/Bugs/Public/show_bug.cgi?id=28925
-        if let Some(suffix) = hyperlink_suffix {
-            href.push_str(&suffix);
-        }
-        let url = match document.base_url().join(&href) {
-            Ok(url) => url,
-            Err(_) => return,
-        };
-
-        // Step 12.
-        let referrer_policy = referrer_policy_for_element(subject);
-
-        // Step 13
-        let referrer = match subject.get_attribute(&ns!(), &local_name!("rel")) {
-            Some(ref link_types) if link_types.Value().contains("noreferrer") => {
-                Referrer::NoReferrer
-            },
-            _ => target_window.upcast::<GlobalScope>().get_referrer(),
-        };
-
-        // Step 14
-        let pipeline_id = target_window.upcast::<GlobalScope>().pipeline_id();
-        let secure = target_window.upcast::<GlobalScope>().is_secure_context();
-        let load_data = LoadData::new(
-            LoadOrigin::Script(document.origin().immutable().clone()),
-            url,
-            Some(pipeline_id),
-            referrer,
-            referrer_policy,
-            Some(secure),
-        );
-        let target = Trusted::new(target_window);
-        let task = task!(navigate_follow_hyperlink: move || {
-            debug!("following hyperlink to {}", load_data.url);
-            target.root().load_url(replace, false, load_data);
-        });
-        target_window
-            .task_manager()
-            .dom_manipulation_task_source()
-            .queue(task, target_window.upcast())
-            .unwrap();
-    };
 }

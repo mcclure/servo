@@ -13,8 +13,9 @@ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::document::Document;
 use crate::dom::element::Element;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct SVGElement {
@@ -48,11 +49,13 @@ impl SVGElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<SVGElement> {
         Node::reflect_node_with_proto(
             Box::new(SVGElement::new_inherited(tag_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 }
@@ -63,11 +66,11 @@ impl VirtualMethods for SVGElement {
     }
 }
 
-impl SVGElementMethods for SVGElement {
+impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
     // https://html.spec.whatwg.org/multipage/#the-style-attribute
     fn Style(&self) -> DomRoot<CSSStyleDeclaration> {
         self.style_decl.or_init(|| {
-            let global = window_from_node(self);
+            let global = self.owner_window();
             CSSStyleDeclaration::new(
                 &global,
                 CSSStyleOwner::Element(Dom::from_ref(self.upcast())),
@@ -83,8 +86,8 @@ impl SVGElementMethods for SVGElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-fe-autofocus
-    fn SetAutofocus(&self, autofocus: bool) {
+    fn SetAutofocus(&self, autofocus: bool, can_gc: CanGc) {
         self.element
-            .set_bool_attribute(&local_name!("autofocus"), autofocus);
+            .set_bool_attribute(&local_name!("autofocus"), autofocus, can_gc);
     }
 }

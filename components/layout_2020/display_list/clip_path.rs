@@ -65,6 +65,15 @@ pub(super) fn build_clip_path_clip_chain_if_necessary(
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        name = "display_list::build_simple_shape",
+        skip_all,
+        fields(servo_profiling = true),
+        level = "trace",
+    )
+)]
 fn build_simple_shape(
     shape: BasicShape,
     layout_box: LayoutRect,

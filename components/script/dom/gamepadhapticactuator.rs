@@ -9,7 +9,7 @@ use dom_struct::dom_struct;
 use embedder_traits::{DualRumbleEffectParams, EmbedderMsg};
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
-use js::jsval::JSVal;
+use js::rust::MutableHandleValue;
 use script_traits::GamepadSupportedHapticEffects;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -27,37 +27,30 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::realms::InRealm;
 use crate::script_runtime::{CanGc, JSContext};
-use crate::task::TaskCanceller;
-use crate::task_source::gamepad::GamepadTaskSource;
-use crate::task_source::{TaskSource, TaskSourceName};
+use crate::task_source::SendableTaskSource;
 
 struct HapticEffectListener {
-    canceller: TaskCanceller,
-    task_source: GamepadTaskSource,
+    task_source: SendableTaskSource,
     context: Trusted<GamepadHapticActuator>,
 }
 
 impl HapticEffectListener {
     fn handle_stopped(&self, stopped_successfully: bool) {
         let context = self.context.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(handle_haptic_effect_stopped: move || {
+        self.task_source
+            .queue(task!(handle_haptic_effect_stopped: move || {
                 let actuator = context.root();
                 actuator.handle_haptic_effect_stopped(stopped_successfully);
-            }),
-            &self.canceller,
-        );
+            }));
     }
 
     fn handle_completed(&self, completed_successfully: bool) {
         let context = self.context.clone();
-        let _ = self.task_source.queue_with_canceller(
-            task!(handle_haptic_effect_completed: move || {
+        self.task_source
+            .queue(task!(handle_haptic_effect_completed: move || {
                 let actuator = context.root();
                 actuator.handle_haptic_effect_completed(completed_successfully);
-            }),
-            &self.canceller,
-        );
+            }));
     }
 }
 
@@ -96,7 +89,7 @@ impl GamepadHapticActuator {
         }
         Self {
             reflector_: Reflector::new(),
-            gamepad_index: gamepad_index,
+            gamepad_index,
             effects,
             playing_effect_promise: DomRefCell::new(None),
             sequence_id: Cell::new(0),
@@ -109,14 +102,16 @@ impl GamepadHapticActuator {
         global: &GlobalScope,
         gamepad_index: u32,
         supported_haptic_effects: GamepadSupportedHapticEffects,
+        can_gc: CanGc,
     ) -> DomRoot<GamepadHapticActuator> {
-        Self::new_with_proto(global, gamepad_index, supported_haptic_effects)
+        Self::new_with_proto(global, gamepad_index, supported_haptic_effects, can_gc)
     }
 
     fn new_with_proto(
         global: &GlobalScope,
         gamepad_index: u32,
         supported_haptic_effects: GamepadSupportedHapticEffects,
+        can_gc: CanGc,
     ) -> DomRoot<GamepadHapticActuator> {
         reflect_dom_object_with_proto(
             Box::new(GamepadHapticActuator::new_inherited(
@@ -125,15 +120,15 @@ impl GamepadHapticActuator {
             )),
             global,
             None,
-            CanGc::note(),
+            can_gc,
         )
     }
 }
 
-impl GamepadHapticActuatorMethods for GamepadHapticActuator {
+impl GamepadHapticActuatorMethods<crate::DomTypeHolder> for GamepadHapticActuator {
     /// <https://www.w3.org/TR/gamepad/#dom-gamepadhapticactuator-effects>
-    fn Effects(&self, cx: JSContext) -> JSVal {
-        to_frozen_array(self.effects.as_slice(), cx)
+    fn Effects(&self, cx: JSContext, retval: MutableHandleValue) {
+        to_frozen_array(self.effects.as_slice(), cx, retval)
     }
 
     /// <https://www.w3.org/TR/gamepad/#dom-gamepadhapticactuator-playeffect>
@@ -142,8 +137,9 @@ impl GamepadHapticActuatorMethods for GamepadHapticActuator {
         type_: GamepadHapticEffectType,
         params: &GamepadEffectParameters,
         comp: InRealm,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
-        let playing_effect_promise = Promise::new_in_current_realm(comp);
+        let playing_effect_promise = Promise::new_in_current_realm(comp, can_gc);
 
         // <https://www.w3.org/TR/gamepad/#dfn-valid-effect>
         match type_ {
@@ -196,13 +192,12 @@ impl GamepadHapticActuatorMethods for GamepadHapticActuator {
 
         if let Some(promise) = self.playing_effect_promise.borrow_mut().take() {
             let trusted_promise = TrustedPromise::new(promise);
-            let _ = self.global().gamepad_task_source().queue(
+            self.global().task_manager().gamepad_task_source().queue(
                 task!(preempt_promise: move || {
                     let promise = trusted_promise.root();
                     let message = DOMString::from("preempted");
                     promise.resolve_native(&message);
                 }),
-                &self.global(),
             );
         }
 
@@ -217,24 +212,16 @@ impl GamepadHapticActuatorMethods for GamepadHapticActuator {
         let context = Trusted::new(self);
         let (effect_complete_sender, effect_complete_receiver) =
             ipc::channel().expect("ipc channel failure");
-        let (task_source, canceller) = (
-            self.global().gamepad_task_source(),
-            self.global().task_canceller(TaskSourceName::Gamepad),
-        );
         let listener = HapticEffectListener {
-            canceller,
-            task_source,
+            task_source: self.global().task_manager().gamepad_task_source().into(),
             context,
         };
 
-        ROUTER.add_route(
-            effect_complete_receiver.to_opaque(),
-            Box::new(move |message| {
-                let msg = message.to::<bool>();
-                match msg {
-                    Ok(msg) => listener.handle_completed(msg),
-                    Err(err) => warn!("Error receiving a GamepadMsg: {:?}", err),
-                }
+        ROUTER.add_typed_route(
+            effect_complete_receiver,
+            Box::new(move |message| match message {
+                Ok(msg) => listener.handle_completed(msg),
+                Err(err) => warn!("Error receiving a GamepadMsg: {:?}", err),
             }),
         );
 
@@ -259,8 +246,8 @@ impl GamepadHapticActuatorMethods for GamepadHapticActuator {
     }
 
     /// <https://www.w3.org/TR/gamepad/#dom-gamepadhapticactuator-reset>
-    fn Reset(&self, comp: InRealm) -> Rc<Promise> {
-        let promise = Promise::new_in_current_realm(comp);
+    fn Reset(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
+        let promise = Promise::new_in_current_realm(comp, can_gc);
 
         let document = self.global().as_window().Document();
         if !document.is_fully_active() {
@@ -272,13 +259,12 @@ impl GamepadHapticActuatorMethods for GamepadHapticActuator {
 
         if let Some(promise) = self.playing_effect_promise.borrow_mut().take() {
             let trusted_promise = TrustedPromise::new(promise);
-            let _ = self.global().gamepad_task_source().queue(
+            self.global().task_manager().gamepad_task_source().queue(
                 task!(preempt_promise: move || {
                     let promise = trusted_promise.root();
                     let message = DOMString::from("preempted");
                     promise.resolve_native(&message);
                 }),
-                &self.global(),
             );
         }
 
@@ -289,24 +275,16 @@ impl GamepadHapticActuatorMethods for GamepadHapticActuator {
         let context = Trusted::new(self);
         let (effect_stop_sender, effect_stop_receiver) =
             ipc::channel().expect("ipc channel failure");
-        let (task_source, canceller) = (
-            self.global().gamepad_task_source(),
-            self.global().task_canceller(TaskSourceName::Gamepad),
-        );
         let listener = HapticEffectListener {
-            canceller,
-            task_source,
+            task_source: self.global().task_manager().gamepad_task_source().into(),
             context,
         };
 
-        ROUTER.add_route(
-            effect_stop_receiver.to_opaque(),
-            Box::new(move |message| {
-                let msg = message.to::<bool>();
-                match msg {
-                    Ok(msg) => listener.handle_stopped(msg),
-                    Err(err) => warn!("Error receiving a GamepadMsg: {:?}", err),
-                }
+        ROUTER.add_typed_route(
+            effect_stop_receiver,
+            Box::new(move |message| match message {
+                Ok(msg) => listener.handle_stopped(msg),
+                Err(err) => warn!("Error receiving a GamepadMsg: {:?}", err),
             }),
         );
 
@@ -345,7 +323,7 @@ impl GamepadHapticActuator {
             let trusted_promise = TrustedPromise::new(promise);
             let sequence_id = self.sequence_id.get();
             let reset_sequence_id = self.reset_sequence_id.get();
-            let _ = self.global().gamepad_task_source().queue(
+            self.global().task_manager().gamepad_task_source().queue(
                 task!(complete_promise: move || {
                     if sequence_id != reset_sequence_id {
                         warn!("Mismatched sequence/reset sequence ids: {} != {}", sequence_id, reset_sequence_id);
@@ -354,8 +332,7 @@ impl GamepadHapticActuator {
                     let promise = trusted_promise.root();
                     let message = DOMString::from("complete");
                     promise.resolve_native(&message);
-                }),
-                &self.global(),
+                })
             );
         }
     }
@@ -367,7 +344,7 @@ impl GamepadHapticActuator {
         }
 
         let this = Trusted::new(self);
-        let _ = self.global().gamepad_task_source().queue(
+        self.global().task_manager().gamepad_task_source().queue(
             task!(stop_playing_effect: move || {
                 let actuator = this.root();
                 let Some(promise) = actuator.playing_effect_promise.borrow_mut().take() else {
@@ -376,7 +353,6 @@ impl GamepadHapticActuator {
                 let message = DOMString::from("preempted");
                 promise.resolve_native(&message);
             }),
-            &self.global(),
         );
 
         let (send, _rcv) = ipc::channel().expect("ipc channel failure");

@@ -5,19 +5,19 @@
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use servo_atoms::Atom;
 
-use crate::dom::bindings::cell::DomRefCell;
+use crate::dom::bindings::codegen::Bindings::ExtendableEventBinding::ExtendableEvent_Binding::ExtendableEventMethods;
 use crate::dom::bindings::codegen::Bindings::ExtendableMessageEventBinding;
 use crate::dom::bindings::codegen::Bindings::ExtendableMessageEventBinding::ExtendableMessageEventMethods;
 use crate::dom::bindings::error::Fallible;
+use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::RootedTraceableBox;
-use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::extendableevent::ExtendableEvent;
@@ -41,7 +41,7 @@ pub struct ExtendableMessageEvent {
     /// <https://w3c.github.io/ServiceWorker/#dom-extendablemessageevent-ports>
     ports: Vec<Dom<MessagePort>>,
     #[ignore_malloc_size_of = "mozjs"]
-    frozen_ports: DomRefCell<Option<Heap<JSVal>>>,
+    frozen_ports: CachedFrozenArray,
 }
 
 #[allow(non_snake_case)]
@@ -60,7 +60,7 @@ impl ExtendableMessageEvent {
                 .into_iter()
                 .map(|port| Dom::from_ref(&*port))
                 .collect(),
-            frozen_ports: DomRefCell::new(None),
+            frozen_ports: CachedFrozenArray::new(),
         }
     }
 
@@ -74,6 +74,7 @@ impl ExtendableMessageEvent {
         origin: DOMString,
         lastEventId: DOMString,
         ports: Vec<DomRoot<MessagePort>>,
+        can_gc: CanGc,
     ) -> DomRoot<ExtendableMessageEvent> {
         Self::new_with_proto(
             global,
@@ -85,7 +86,7 @@ impl ExtendableMessageEvent {
             origin,
             lastEventId,
             ports,
-            CanGc::note(),
+            can_gc,
         )
     }
 
@@ -116,8 +117,53 @@ impl ExtendableMessageEvent {
 
         ev
     }
+}
 
-    pub fn Constructor(
+#[allow(non_snake_case)]
+impl ExtendableMessageEvent {
+    pub fn dispatch_jsval(
+        target: &EventTarget,
+        scope: &GlobalScope,
+        message: HandleValue,
+        ports: Vec<DomRoot<MessagePort>>,
+        can_gc: CanGc,
+    ) {
+        let Extendablemessageevent = ExtendableMessageEvent::new(
+            scope,
+            atom!("message"),
+            false,
+            false,
+            message,
+            DOMString::new(),
+            DOMString::new(),
+            ports,
+            can_gc,
+        );
+        Extendablemessageevent
+            .upcast::<Event>()
+            .fire(target, can_gc);
+    }
+
+    pub fn dispatch_error(target: &EventTarget, scope: &GlobalScope, can_gc: CanGc) {
+        let init = ExtendableMessageEventBinding::ExtendableMessageEventInit::empty();
+        let ExtendableMsgEvent = ExtendableMessageEvent::new(
+            scope,
+            atom!("messageerror"),
+            init.parent.parent.bubbles,
+            init.parent.parent.cancelable,
+            init.data.handle(),
+            init.origin.clone(),
+            init.lastEventId.clone(),
+            init.ports.clone(),
+            can_gc,
+        );
+        ExtendableMsgEvent.upcast::<Event>().fire(target, can_gc);
+    }
+}
+
+impl ExtendableMessageEventMethods<crate::DomTypeHolder> for ExtendableMessageEvent {
+    /// <https://w3c.github.io/ServiceWorker/#dom-extendablemessageevent-extendablemessageevent>
+    fn Constructor(
         worker: &ServiceWorkerGlobalScope,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -139,87 +185,38 @@ impl ExtendableMessageEvent {
         );
         Ok(ev)
     }
-}
 
-#[allow(non_snake_case)]
-impl ExtendableMessageEvent {
-    pub fn dispatch_jsval(
-        target: &EventTarget,
-        scope: &GlobalScope,
-        message: HandleValue,
-        ports: Vec<DomRoot<MessagePort>>,
-    ) {
-        let Extendablemessageevent = ExtendableMessageEvent::new(
-            scope,
-            atom!("message"),
-            false,
-            false,
-            message,
-            DOMString::new(),
-            DOMString::new(),
-            ports,
-        );
-        Extendablemessageevent.upcast::<Event>().fire(target);
+    /// <https://w3c.github.io/ServiceWorker/#dom-extendablemessageevent-data>
+    fn Data(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.data.get())
     }
 
-    pub fn dispatch_error(target: &EventTarget, scope: &GlobalScope) {
-        let init = ExtendableMessageEventBinding::ExtendableMessageEventInit::empty();
-        let ExtendableMsgEvent = ExtendableMessageEvent::new(
-            scope,
-            atom!("messageerror"),
-            init.parent.parent.bubbles,
-            init.parent.parent.cancelable,
-            init.data.handle(),
-            init.origin.clone(),
-            init.lastEventId.clone(),
-            init.ports.clone(),
-        );
-        ExtendableMsgEvent.upcast::<Event>().fire(target);
-    }
-}
-
-impl ExtendableMessageEventMethods for ExtendableMessageEvent {
-    // https://w3c.github.io/ServiceWorker/#extendablemessage-event-data-attribute
-    fn Data(&self, _cx: JSContext) -> JSVal {
-        self.data.get()
-    }
-
-    // https://w3c.github.io/ServiceWorker/#extendablemessage-event-origin-attribute
+    /// <https://w3c.github.io/ServiceWorker/#dom-extendablemessageevent-origin>
     fn Origin(&self) -> DOMString {
         self.origin.clone()
     }
 
-    // https://w3c.github.io/ServiceWorker/#extendablemessage-event-lasteventid-attribute
+    /// <https://w3c.github.io/ServiceWorker/#dom-extendablemessageevent-lasteventid>
     fn LastEventId(&self) -> DOMString {
         self.lastEventId.clone()
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }
 
     /// <https://w3c.github.io/ServiceWorker/#extendablemessage-event-ports>
-    fn Ports(&self, cx: JSContext) -> JSVal {
-        if let Some(ports) = &*self.frozen_ports.borrow() {
-            return ports.get();
-        }
-
-        let ports: Vec<DomRoot<MessagePort>> = self
-            .ports
-            .iter()
-            .map(|port| DomRoot::from_ref(&**port))
-            .collect();
-        let frozen_ports = to_frozen_array(ports.as_slice(), cx);
-
-        // Safety: need to create the Heap value in its final memory location before setting it.
-        *self.frozen_ports.borrow_mut() = Some(Heap::default());
-        self.frozen_ports
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .set(frozen_ports);
-
-        frozen_ports
+    fn Ports(&self, cx: JSContext, retval: MutableHandleValue) {
+        self.frozen_ports.get_or_init(
+            || {
+                self.ports
+                    .iter()
+                    .map(|port| DomRoot::from_ref(&**port))
+                    .collect()
+            },
+            cx,
+            retval,
+        );
     }
 }

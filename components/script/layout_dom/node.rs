@@ -59,7 +59,7 @@ pub struct ServoLayoutNode<'dom> {
 unsafe impl Send for ServoLayoutNode<'_> {}
 unsafe impl Sync for ServoLayoutNode<'_> {}
 
-impl<'dom> fmt::Debug for ServoLayoutNode<'dom> {
+impl fmt::Debug for ServoLayoutNode<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(el) = self.as_element() {
             el.fmt(f)
@@ -76,6 +76,11 @@ impl<'dom> ServoLayoutNode<'dom> {
         ServoLayoutNode { node: n }
     }
 
+    /// Create a new [`ServoLayoutNode`] for this given [`TrustedNodeAddress`].
+    ///
+    /// # Safety
+    ///
+    /// The address pointed to by `address` should point to a valid node in memory.
     pub unsafe fn new(address: &TrustedNodeAddress) -> Self {
         ServoLayoutNode::from_layout_js(LayoutDom::from_trusted_node_address(*address))
     }
@@ -90,7 +95,7 @@ impl<'dom> ServoLayoutNode<'dom> {
     }
 }
 
-impl<'dom> style::dom::NodeInfo for ServoLayoutNode<'dom> {
+impl style::dom::NodeInfo for ServoLayoutNode<'_> {
     fn is_element(&self) -> bool {
         self.node.is_element_for_layout()
     }
@@ -163,7 +168,7 @@ impl<'dom> style::dom::TNode for ServoLayoutNode<'dom> {
     }
 
     fn is_in_document(&self) -> bool {
-        unsafe { self.node.get_flag(NodeFlags::IS_IN_DOC) }
+        unsafe { self.node.get_flag(NodeFlags::IS_IN_A_DOCUMENT_TREE) }
     }
 }
 
@@ -257,7 +262,7 @@ impl<'dom> ServoThreadSafeLayoutNode<'dom> {
     }
 }
 
-impl<'dom> style::dom::NodeInfo for ServoThreadSafeLayoutNode<'dom> {
+impl style::dom::NodeInfo for ServoThreadSafeLayoutNode<'_> {
     fn is_element(&self) -> bool {
         self.node.is_element()
     }

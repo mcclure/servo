@@ -19,21 +19,13 @@ use crate::script_runtime::{CanGc, JSContext};
 
 /// Create the reflector for a new DOM object and yield ownership to the
 /// reflector.
-pub fn reflect_dom_object<T, U>(obj: Box<T>, global: &U) -> DomRoot<T>
+pub fn reflect_dom_object<T, U>(obj: Box<T>, global: &U, can_gc: CanGc) -> DomRoot<T>
 where
     T: DomObject + DomObjectWrap,
     U: DerivedFrom<GlobalScope>,
 {
     let global_scope = global.upcast();
-    unsafe {
-        T::WRAP(
-            GlobalScope::get_cx(),
-            global_scope,
-            None,
-            obj,
-            CanGc::note(),
-        )
-    }
+    unsafe { T::WRAP(GlobalScope::get_cx(), global_scope, None, obj, can_gc) }
 }
 
 pub fn reflect_dom_object_with_proto<T, U>(
@@ -76,6 +68,10 @@ impl Reflector {
     }
 
     /// Initialize the reflector. (May be called only once.)
+    ///
+    /// # Safety
+    ///
+    /// The provided [`JSObject`] pointer must point to a valid [`JSObject`].
     pub unsafe fn set_jsobject(&self, object: *mut JSObject) {
         assert!(self.object.get().is_null());
         assert!(!object.is_null());
@@ -104,7 +100,9 @@ pub trait DomObject: JSTraceable + 'static {
     /// Returns the receiver's reflector.
     fn reflector(&self) -> &Reflector;
 
-    /// Returns the global scope of the realm that the DomObject was created in.
+    /// Returns the [`GlobalScope`] of the realm that the [`DomObject`] was created in.  If this
+    /// object is a `Node`, this will be different from it's owning `Document` if adopted by. For
+    /// `Node`s it's almost always better to use `NodeTraits::owning_global`.
     fn global(&self) -> DomRoot<GlobalScope>
     where
         Self: Sized,
@@ -123,6 +121,10 @@ impl DomObject for Reflector {
 /// A trait to initialize the `Reflector` for a DOM object.
 pub trait MutDomObject: DomObject {
     /// Initializes the Reflector
+    ///
+    /// # Safety
+    ///
+    /// The provided [`JSObject`] pointer must point to a valid [`JSObject`].
     unsafe fn init_reflector(&self, obj: *mut JSObject);
 }
 
@@ -135,6 +137,7 @@ impl MutDomObject for Reflector {
 /// A trait to provide a function pointer to wrap function for DOM objects.
 pub trait DomObjectWrap: Sized + DomObject {
     /// Function pointer to the general wrap function type
+    #[allow(clippy::type_complexity)]
     const WRAP: unsafe fn(
         JSContext,
         &GlobalScope,
@@ -148,6 +151,7 @@ pub trait DomObjectWrap: Sized + DomObject {
 /// DOM iterator interfaces.
 pub trait DomObjectIteratorWrap: DomObjectWrap + JSTraceable + Iterable {
     /// Function pointer to the wrap function for `IterableIterator<T>`
+    #[allow(clippy::type_complexity)]
     const ITER_WRAP: unsafe fn(
         JSContext,
         &GlobalScope,

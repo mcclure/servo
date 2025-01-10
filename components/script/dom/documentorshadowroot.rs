@@ -25,6 +25,7 @@ use crate::dom::element::Element;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::{self, Node, VecPreOrderInsertionHelper};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 use crate::stylesheet_set::StylesheetSetRef;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -34,6 +35,14 @@ pub struct StyleSheetInDocument {
     #[no_trace]
     pub sheet: Arc<Stylesheet>,
     pub owner: Dom<Element>,
+}
+
+// This is necessary because this type is contained within a Stylo type which needs
+// Stylo's version of MallocSizeOf.
+impl style_malloc_size_of::MallocSizeOf for StyleSheetInDocument {
+    fn size_of(&self, ops: &mut style_malloc_size_of::MallocSizeOfOps) -> usize {
+        <StyleSheetInDocument as malloc_size_of::MallocSizeOf>::size_of(self, ops)
+    }
 }
 
 impl fmt::Debug for StyleSheetInDocument {
@@ -90,8 +99,12 @@ impl DocumentOrShadowRoot {
         &self,
         client_point: &Point2D<f32>,
         query_type: NodesFromPointQueryType,
+        can_gc: CanGc,
     ) -> Vec<UntrustedNodeAddress> {
-        if !self.window.layout_reflow(QueryMsg::NodesFromPointQuery) {
+        if !self
+            .window
+            .layout_reflow(QueryMsg::NodesFromPointQuery, can_gc)
+        {
             return vec![];
         };
 
@@ -108,6 +121,7 @@ impl DocumentOrShadowRoot {
         y: Finite<f64>,
         document_element: Option<DomRoot<Element>>,
         has_browsing_context: bool,
+        can_gc: CanGc,
     ) -> Option<DomRoot<Element>> {
         let x = *x as f32;
         let y = *y as f32;
@@ -123,7 +137,7 @@ impl DocumentOrShadowRoot {
         }
 
         match self
-            .nodes_from_point(point, NodesFromPointQueryType::Topmost)
+            .nodes_from_point(point, NodesFromPointQueryType::Topmost, can_gc)
             .first()
         {
             Some(address) => {
@@ -147,6 +161,7 @@ impl DocumentOrShadowRoot {
         y: Finite<f64>,
         document_element: Option<DomRoot<Element>>,
         has_browsing_context: bool,
+        can_gc: CanGc,
     ) -> Vec<DomRoot<Element>> {
         let x = *x as f32;
         let y = *y as f32;
@@ -163,7 +178,7 @@ impl DocumentOrShadowRoot {
         }
 
         // Step 1 and Step 3
-        let nodes = self.nodes_from_point(point, NodesFromPointQueryType::All);
+        let nodes = self.nodes_from_point(point, NodesFromPointQueryType::All, can_gc);
         let mut elements: Vec<DomRoot<Element>> = nodes
             .iter()
             .flat_map(|&untrusted_node_address| {
@@ -288,7 +303,10 @@ impl DocumentOrShadowRoot {
         root: DomRoot<Node>,
     ) {
         debug!("Adding named element {:p}: {:p} id={}", self, element, id);
-        assert!(element.upcast::<Node>().is_connected());
+        assert!(
+            element.upcast::<Node>().is_in_a_document_tree() ||
+                element.upcast::<Node>().is_in_a_shadow_tree()
+        );
         assert!(!id.is_empty());
         let mut id_map = id_map.borrow_mut();
         let elements = id_map.entry(id.clone()).or_default();

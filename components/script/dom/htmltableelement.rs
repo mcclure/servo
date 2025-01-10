@@ -26,8 +26,9 @@ use crate::dom::htmltablecaptionelement::HTMLTableCaptionElement;
 use crate::dom::htmltablecolelement::HTMLTableColElement;
 use crate::dom::htmltablerowelement::HTMLTableRowElement;
 use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
-use crate::dom::node::{document_from_node, window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLTableElement {
@@ -75,6 +76,7 @@ impl HTMLTableElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableElement::new_inherited(
@@ -82,6 +84,7 @@ impl HTMLTableElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -137,13 +140,17 @@ impl HTMLTableElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createthead
     // https://html.spec.whatwg.org/multipage/#dom-table-createtfoot
-    fn create_section_of_type(&self, atom: &LocalName) -> DomRoot<HTMLTableSectionElement> {
+    fn create_section_of_type(
+        &self,
+        atom: &LocalName,
+        can_gc: CanGc,
+    ) -> DomRoot<HTMLTableSectionElement> {
         if let Some(section) = self.get_first_section_of_type(atom) {
             return section;
         }
 
         let section =
-            HTMLTableSectionElement::new(atom.clone(), None, &document_from_node(self), None);
+            HTMLTableSectionElement::new(atom.clone(), None, &self.owner_document(), None, can_gc);
         match *atom {
             local_name!("thead") => self.SetTHead(Some(&section)),
             local_name!("tfoot") => self.SetTFoot(Some(&section)),
@@ -176,11 +183,11 @@ impl HTMLTableElement {
     }
 }
 
-impl HTMLTableElementMethods for HTMLTableElement {
+impl HTMLTableElementMethods<crate::DomTypeHolder> for HTMLTableElement {
     // https://html.spec.whatwg.org/multipage/#dom-table-rows
     fn Rows(&self) -> DomRoot<HTMLCollection> {
         let filter = self.get_rows();
-        HTMLCollection::new(&window_from_node(self), self.upcast(), Box::new(filter))
+        HTMLCollection::new(&self.owner_window(), self.upcast(), Box::new(filter))
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-caption
@@ -206,15 +213,16 @@ impl HTMLTableElementMethods for HTMLTableElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createcaption
-    fn CreateCaption(&self) -> DomRoot<HTMLTableCaptionElement> {
+    fn CreateCaption(&self, can_gc: CanGc) -> DomRoot<HTMLTableCaptionElement> {
         match self.GetCaption() {
             Some(caption) => caption,
             None => {
                 let caption = HTMLTableCaptionElement::new(
                     local_name!("caption"),
                     None,
-                    &document_from_node(self),
+                    &self.owner_document(),
                     None,
+                    can_gc,
                 );
                 self.SetCaption(Some(&caption))
                     .expect("Generated caption is invalid");
@@ -243,8 +251,8 @@ impl HTMLTableElementMethods for HTMLTableElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createthead
-    fn CreateTHead(&self) -> DomRoot<HTMLTableSectionElement> {
-        self.create_section_of_type(&local_name!("thead"))
+    fn CreateTHead(&self, can_gc: CanGc) -> DomRoot<HTMLTableSectionElement> {
+        self.create_section_of_type(&local_name!("thead"), can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-deletethead
@@ -276,8 +284,8 @@ impl HTMLTableElementMethods for HTMLTableElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createtfoot
-    fn CreateTFoot(&self) -> DomRoot<HTMLTableSectionElement> {
-        self.create_section_of_type(&local_name!("tfoot"))
+    fn CreateTFoot(&self, can_gc: CanGc) -> DomRoot<HTMLTableSectionElement> {
+        self.create_section_of_type(&local_name!("tfoot"), can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-deletetfoot
@@ -287,30 +295,27 @@ impl HTMLTableElementMethods for HTMLTableElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-table-tbodies
     fn TBodies(&self) -> DomRoot<HTMLCollection> {
-        #[derive(JSTraceable)]
-        struct TBodiesFilter;
-        impl CollectionFilter for TBodiesFilter {
-            fn filter(&self, elem: &Element, root: &Node) -> bool {
-                elem.is::<HTMLTableSectionElement>() &&
-                    elem.local_name() == &local_name!("tbody") &&
-                    elem.upcast::<Node>().GetParentNode().as_deref() == Some(root)
-            }
-        }
-
         self.tbodies.or_init(|| {
-            let window = window_from_node(self);
-            let filter = Box::new(TBodiesFilter);
-            HTMLCollection::create(&window, self.upcast(), filter)
+            HTMLCollection::new_with_filter_fn(
+                &self.owner_window(),
+                self.upcast(),
+                |element, root| {
+                    element.is::<HTMLTableSectionElement>() &&
+                        element.local_name() == &local_name!("tbody") &&
+                        element.upcast::<Node>().GetParentNode().as_deref() == Some(root)
+                },
+            )
         })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createtbody
-    fn CreateTBody(&self) -> DomRoot<HTMLTableSectionElement> {
+    fn CreateTBody(&self, can_gc: CanGc) -> DomRoot<HTMLTableSectionElement> {
         let tbody = HTMLTableSectionElement::new(
             local_name!("tbody"),
             None,
-            &document_from_node(self),
+            &self.owner_document(),
             None,
+            can_gc,
         );
         let node = self.upcast::<Node>();
         let last_tbody = node
@@ -325,7 +330,7 @@ impl HTMLTableElementMethods for HTMLTableElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-insertrow
-    fn InsertRow(&self, index: i32) -> Fallible<DomRoot<HTMLTableRowElement>> {
+    fn InsertRow(&self, index: i32, can_gc: CanGc) -> Fallible<DomRoot<HTMLTableRowElement>> {
         let rows = self.Rows();
         let number_of_row_elements = rows.Length();
 
@@ -333,8 +338,13 @@ impl HTMLTableElementMethods for HTMLTableElement {
             return Err(Error::IndexSize);
         }
 
-        let new_row =
-            HTMLTableRowElement::new(local_name!("tr"), None, &document_from_node(self), None);
+        let new_row = HTMLTableRowElement::new(
+            local_name!("tr"),
+            None,
+            &self.owner_document(),
+            None,
+            can_gc,
+        );
         let node = self.upcast::<Node>();
 
         if number_of_row_elements == 0 {
@@ -351,7 +361,7 @@ impl HTMLTableElementMethods for HTMLTableElement {
                     .AppendChild(new_row.upcast::<Node>())
                     .expect("InsertRow failed to append first row.");
             } else {
-                let tbody = self.CreateTBody();
+                let tbody = self.CreateTBody(can_gc);
                 node.AppendChild(tbody.upcast())
                     .expect("InsertRow failed to append new tbody.");
 

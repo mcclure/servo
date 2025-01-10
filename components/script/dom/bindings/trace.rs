@@ -37,9 +37,11 @@ use std::hash::{BuildHasher, Hash};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
+use crossbeam_channel::Sender;
 use indexmap::IndexMap;
 /// A trait to allow tracing (only) DOM objects.
 pub use js::gc::Traceable as JSTraceable;
+pub use js::gc::{RootableVec, RootedVec};
 use js::glue::{CallObjectTracer, CallScriptTracer, CallStringTracer, CallValueTracer};
 use js::jsapi::{GCTraceKindToAscii, Heap, JSObject, JSScript, JSString, JSTracer, TraceKind};
 use js::jsval::JSVal;
@@ -53,24 +55,35 @@ use style::stylesheet_set::{AuthorStylesheetSet, DocumentStylesheetSet};
 use tendril::fmt::UTF8;
 use tendril::stream::LossyDecoder;
 use tendril::TendrilSink;
+#[cfg(feature = "webxr")]
 use webxr_api::{Finger, Hand};
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::{DomObject, Reflector};
-use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::htmlimageelement::SourceSet;
 use crate::dom::htmlmediaelement::HTMLMediaElementFetchContext;
 use crate::dom::windowproxy::WindowProxyHandler;
-use crate::script_runtime::{ContextForRequestInterrupt, StreamConsumer};
+use crate::script_runtime::StreamConsumer;
 use crate::script_thread::IncompleteParserContexts;
 use crate::task::TaskBox;
 
 /// A trait to allow tracing only DOM sub-objects.
+///
+/// # Safety
+///
+/// This trait is unsafe; if it is implemented incorrectly, the GC may end up collecting objects
+/// that are still reachable.
 pub unsafe trait CustomTraceable {
     /// Trace `self`.
+    ///
+    /// # Safety
+    ///
+    /// The `JSTracer` argument must point to a valid `JSTracer` in memory. In addition,
+    /// implementors of this method must ensure that all active objects are properly traced
+    /// or else the garbage collector may end up collecting objects that are still reachable.
     unsafe fn trace(&self, trc: *mut JSTracer);
 }
 
@@ -93,6 +106,10 @@ unsafe impl<T: JSTraceable> CustomTraceable for OnceCell<T> {
             value.trace(tracer)
         }
     }
+}
+
+unsafe impl<T> CustomTraceable for Sender<T> {
+    unsafe fn trace(&self, _: *mut JSTracer) {}
 }
 
 /// Wrapper type for nop traceble
@@ -359,7 +376,6 @@ where
 unsafe_no_jsmanaged_fields!(Error);
 unsafe_no_jsmanaged_fields!(TrustedPromise);
 
-unsafe_no_jsmanaged_fields!(ContextForRequestInterrupt);
 unsafe_no_jsmanaged_fields!(WindowProxyHandler);
 unsafe_no_jsmanaged_fields!(DOMString);
 unsafe_no_jsmanaged_fields!(USVString);
@@ -414,6 +430,7 @@ where
     }
 }
 
+#[cfg(feature = "webxr")]
 unsafe impl<J> CustomTraceable for Hand<J>
 where
     J: JSTraceable,
@@ -444,6 +461,7 @@ where
     }
 }
 
+#[cfg(feature = "webxr")]
 unsafe impl<J> CustomTraceable for Finger<J>
 where
     J: JSTraceable,
@@ -465,9 +483,6 @@ where
         phalanx_tip.trace(trc);
     }
 }
-
-/// Holds a set of JSTraceables that need to be rooted
-pub use js::gc::RootedTraceableSet;
 
 /// Roots any JSTraceable thing
 ///
@@ -533,77 +548,5 @@ impl<T: JSTraceable> Deref for RootedTraceableBox<T> {
 impl<T: JSTraceable> DerefMut for RootedTraceableBox<T> {
     fn deref_mut(&mut self) -> &mut T {
         self.0.deref_mut()
-    }
-}
-
-/// A vector of items to be rooted with `RootedVec`.
-/// Guaranteed to be empty when not rooted.
-/// Usage: `rooted_vec!(let mut v);` or if you have an
-/// iterator of `DomRoot`s, `rooted_vec!(let v <- iterator);`.
-#[allow(crown::unrooted_must_root)]
-#[derive(JSTraceable)]
-#[crown::unrooted_must_root_lint::allow_unrooted_interior]
-pub struct RootableVec<T: JSTraceable> {
-    v: Vec<T>,
-}
-
-impl<T: JSTraceable> RootableVec<T> {
-    /// Create a vector of items of type T that can be rooted later.
-    pub fn new_unrooted() -> RootableVec<T> {
-        RootableVec { v: vec![] }
-    }
-}
-
-/// A vector of items that are rooted for the lifetime 'a.
-#[crown::unrooted_must_root_lint::allow_unrooted_interior]
-pub struct RootedVec<'a, T: 'static + JSTraceable> {
-    root: &'a mut RootableVec<T>,
-}
-
-impl<'a, T: 'static + JSTraceable> RootedVec<'a, T> {
-    /// Create a vector of items of type T that is rooted for
-    /// the lifetime of this struct
-    pub fn new(root: &'a mut RootableVec<T>) -> Self {
-        unsafe {
-            RootedTraceableSet::add(root);
-        }
-        RootedVec { root }
-    }
-}
-
-impl<'a, T: 'static + JSTraceable + DomObject> RootedVec<'a, Dom<T>> {
-    /// Create a vector of items of type `Dom<T>` that is rooted for
-    /// the lifetime of this struct
-    pub fn from_iter<I>(root: &'a mut RootableVec<Dom<T>>, iter: I) -> Self
-    where
-        I: Iterator<Item = DomRoot<T>>,
-    {
-        unsafe {
-            RootedTraceableSet::add(root);
-        }
-        root.v.extend(iter.map(|item| Dom::from_ref(&*item)));
-        RootedVec { root }
-    }
-}
-
-impl<'a, T: JSTraceable + 'static> Drop for RootedVec<'a, T> {
-    fn drop(&mut self) {
-        self.clear();
-        unsafe {
-            RootedTraceableSet::remove(self.root);
-        }
-    }
-}
-
-impl<'a, T: JSTraceable> Deref for RootedVec<'a, T> {
-    type Target = Vec<T>;
-    fn deref(&self) -> &Vec<T> {
-        &self.root.v
-    }
-}
-
-impl<'a, T: JSTraceable> DerefMut for RootedVec<'a, T> {
-    fn deref_mut(&mut self) -> &mut Vec<T> {
-        &mut self.root.v
     }
 }

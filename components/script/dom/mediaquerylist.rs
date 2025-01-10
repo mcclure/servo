@@ -20,6 +20,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::eventtarget::EventTarget;
+use crate::script_runtime::CanGc;
 
 pub enum MediaQueryListMatchState {
     Same,
@@ -49,6 +50,7 @@ impl MediaQueryList {
         reflect_dom_object(
             Box::new(MediaQueryList::new_inherited(document, media_query_list)),
             document.window(),
+            CanGc::note(),
         )
     }
 }
@@ -78,7 +80,7 @@ impl MediaQueryList {
     }
 }
 
-impl MediaQueryListMethods for MediaQueryList {
+impl MediaQueryListMethods<crate::DomTypeHolder> for MediaQueryList {
     // https://drafts.csswg.org/cssom-view/#dom-mediaquerylist-media
     fn Media(&self) -> DOMString {
         self.media_query_list.to_css_string().into()

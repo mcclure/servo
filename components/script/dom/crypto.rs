@@ -12,19 +12,20 @@ use uuid::Uuid;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CryptoBinding::CryptoMethods;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
-use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::USVString;
+use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::dom::subtlecrypto::SubtleCrypto;
+use crate::script_runtime::{CanGc, JSContext};
 
 // https://developer.mozilla.org/en-US/docs/Web/API/Crypto
 #[dom_struct]
 pub struct Crypto {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "Defined in rand"]
     #[no_trace]
     rng: DomRefCell<ServoRng>,
+    subtle: MutNullableDom<SubtleCrypto>,
 }
 
 impl Crypto {
@@ -32,15 +33,21 @@ impl Crypto {
         Crypto {
             reflector_: Reflector::new(),
             rng: DomRefCell::new(ServoRng::default()),
+            subtle: MutNullableDom::default(),
         }
     }
 
     pub fn new(global: &GlobalScope) -> DomRoot<Crypto> {
-        reflect_dom_object(Box::new(Crypto::new_inherited()), global)
+        reflect_dom_object(Box::new(Crypto::new_inherited()), global, CanGc::note())
     }
 }
 
-impl CryptoMethods for Crypto {
+impl CryptoMethods<crate::DomTypeHolder> for Crypto {
+    /// <https://w3c.github.io/webcrypto/#dfn-Crypto-attribute-subtle>
+    fn Subtle(&self) -> DomRoot<SubtleCrypto> {
+        self.subtle.or_init(|| SubtleCrypto::new(&self.global()))
+    }
+
     #[allow(unsafe_code)]
     // https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues
     fn GetRandomValues(
@@ -65,7 +72,7 @@ impl CryptoMethods for Crypto {
     }
 
     // https://w3c.github.io/webcrypto/#Crypto-method-randomUUID
-    fn RandomUUID(&self) -> USVString {
+    fn RandomUUID(&self) -> DOMString {
         let uuid = Uuid::new_v4();
         uuid.hyphenated()
             .encode_lower(&mut Uuid::encode_buffer())

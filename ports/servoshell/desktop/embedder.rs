@@ -42,6 +42,7 @@ impl EmbedderMethods for EmbedderCallbacks {
         self.event_loop_waker.clone()
     }
 
+    #[cfg(feature = "webxr")]
     fn register_webxr(
         &mut self,
         xr: &mut webxr::MainThreadRegistry,
@@ -61,8 +62,8 @@ impl EmbedderMethods for EmbedderCallbacks {
     fn get_protocol_handlers(&self) -> ProtocolRegistry {
         let mut registry = ProtocolRegistry::default();
         registry.register("urlinfo", urlinfo::UrlInfoProtocolHander::default());
-        registry.register("servo", servo_handler::ServoProtocolHander::default());
-        registry.register("resource", resource::ResourceProtocolHander::default());
+        registry.register("servo", servo_handler::ServoProtocolHandler::default());
+        registry.register("resource", resource::ResourceProtocolHandler::default());
         registry
     }
 

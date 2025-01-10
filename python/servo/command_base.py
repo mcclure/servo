@@ -515,7 +515,11 @@ class CommandBase(object):
         return env
 
     @staticmethod
-    def common_command_arguments(build_configuration=False, build_type=False, binary_selection=False):
+    def common_command_arguments(build_configuration=False,
+                                 build_type=False,
+                                 binary_selection=False,
+                                 package_configuration=False
+                                 ):
         decorators = []
         if build_type or binary_selection:
             decorators += [
@@ -531,7 +535,7 @@ class CommandBase(object):
                                 help='Build in release mode without debug assertions'),
                 CommandArgument('--profile', group="Build Type",
                                 help='Build with custom Cargo profile'),
-                CommandArgument('--with-asan', action='store_true', help="Build with AddressSanitizer")
+                CommandArgument('--with-asan', action='store_true', help="Build with AddressSanitizer"),
             ]
 
         if build_configuration:
@@ -589,6 +593,14 @@ class CommandBase(object):
                     action='store_true',
                     help="Enable Servo's `crown` linter tool"
                 )
+            ]
+        if package_configuration:
+            decorators += [
+                CommandArgumentGroup('Packaging options'),
+                CommandArgument(
+                    '--flavor', default=None, group="Packaging options",
+                    help='Product flavor to be used when packaging with Gradle/Hvigor (android/ohos).'
+                ),
             ]
 
         if binary_selection:
@@ -666,6 +678,10 @@ class CommandBase(object):
             elif self.config["build"]["mode"] == "release":
                 print("No build type specified, but .servobuild specified `--release`.")
                 return BuildType.release()
+            elif self.config["build"]["mode"] != "":
+                profile = self.config["build"]["mode"]
+                print(f"No build type specified, but .servobuild specified custom profile `{profile}`.")
+                return BuildType.custom(profile)
             else:
                 print("No build type specified so assuming `--dev`.")
                 return BuildType.dev()
@@ -815,6 +831,10 @@ class CommandBase(object):
 
         if with_debug_assertions or self.config["build"]["debug-assertions"]:
             env['RUSTFLAGS'] = env.get('RUSTFLAGS', "") + " -C debug_assertions"
+
+        # mozjs gets its Python from `env['PYTHON3']`, which defaults to `python3`,
+        # but uv venv on Windows only provides a `python`, not `python3`.
+        env['PYTHON3'] = "python"
 
         return call(["cargo", command] + args + cargo_args, env=env, verbose=verbose)
 

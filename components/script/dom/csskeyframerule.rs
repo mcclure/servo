@@ -17,6 +17,7 @@ use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct CSSKeyframeRule {
@@ -51,11 +52,12 @@ impl CSSKeyframeRule {
                 keyframerule,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
 
-impl CSSKeyframeRuleMethods for CSSKeyframeRule {
+impl CSSKeyframeRuleMethods<crate::DomTypeHolder> for CSSKeyframeRule {
     // https://drafts.csswg.org/css-animations/#dom-csskeyframerule-style
     fn Style(&self) -> DomRoot<CSSStyleDeclaration> {
         self.style_decl.or_init(|| {

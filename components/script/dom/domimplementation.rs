@@ -47,18 +47,23 @@ impl DOMImplementation {
 
     pub fn new(document: &Document) -> DomRoot<DOMImplementation> {
         let window = document.window();
-        reflect_dom_object(Box::new(DOMImplementation::new_inherited(document)), window)
+        reflect_dom_object(
+            Box::new(DOMImplementation::new_inherited(document)),
+            window,
+            CanGc::note(),
+        )
     }
 }
 
 // https://dom.spec.whatwg.org/#domimplementation
-impl DOMImplementationMethods for DOMImplementation {
+impl DOMImplementationMethods<crate::DomTypeHolder> for DOMImplementation {
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
     fn CreateDocumentType(
         &self,
         qualified_name: DOMString,
         pubid: DOMString,
         sysid: DOMString,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<DocumentType>> {
         validate_qualified_name(&qualified_name)?;
         Ok(DocumentType::new(
@@ -66,6 +71,7 @@ impl DOMImplementationMethods for DOMImplementation {
             Some(pubid),
             Some(sysid),
             &self.document,
+            can_gc,
         ))
     }
 
@@ -157,15 +163,15 @@ impl DOMImplementationMethods for DOMImplementation {
             loader,
             None,
             None,
-            None,
             Default::default(),
+            false,
             can_gc,
         );
 
         {
             // Step 3.
             let doc_node = doc.upcast::<Node>();
-            let doc_type = DocumentType::new(DOMString::from("html"), None, None, &doc);
+            let doc_type = DocumentType::new(DOMString::from("html"), None, None, &doc, can_gc);
             doc_node.AppendChild(doc_type.upcast()).unwrap();
         }
 
@@ -177,6 +183,7 @@ impl DOMImplementationMethods for DOMImplementation {
                 None,
                 &doc,
                 None,
+                can_gc,
             ));
             doc_node.AppendChild(&doc_html).expect("Appending failed");
 
@@ -187,6 +194,7 @@ impl DOMImplementationMethods for DOMImplementation {
                     None,
                     &doc,
                     None,
+                    can_gc,
                 ));
                 doc_html.AppendChild(&doc_head).unwrap();
 
@@ -198,17 +206,18 @@ impl DOMImplementationMethods for DOMImplementation {
                         None,
                         &doc,
                         None,
+                        can_gc,
                     ));
                     doc_head.AppendChild(&doc_title).unwrap();
 
                     // Step 6.2.
-                    let title_text = Text::new(title_str, &doc);
+                    let title_text = Text::new(title_str, &doc, can_gc);
                     doc_title.AppendChild(title_text.upcast()).unwrap();
                 }
             }
 
             // Step 7.
-            let doc_body = HTMLBodyElement::new(local_name!("body"), None, &doc, None);
+            let doc_body = HTMLBodyElement::new(local_name!("body"), None, &doc, None, can_gc);
             doc_html.AppendChild(doc_body.upcast()).unwrap();
         }
 

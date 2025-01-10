@@ -6,8 +6,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
-use js::jsval::JSVal;
-use js::rust::HandleObject;
+use js::rust::{HandleObject, MutableHandleValue};
 
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
@@ -70,8 +69,9 @@ impl PerformanceObserver {
         global: &GlobalScope,
         callback: Rc<PerformanceObserverCallback>,
         entries: DOMPerformanceEntryList,
+        can_gc: CanGc,
     ) -> DomRoot<PerformanceObserver> {
-        Self::new_with_proto(global, None, callback, entries, CanGc::note())
+        Self::new_with_proto(global, None, callback, entries, can_gc)
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -84,22 +84,6 @@ impl PerformanceObserver {
     ) -> DomRoot<PerformanceObserver> {
         let observer = PerformanceObserver::new_inherited(callback, DomRefCell::new(entries));
         reflect_dom_object_with_proto(Box::new(observer), global, proto, can_gc)
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        can_gc: CanGc,
-        callback: Rc<PerformanceObserverCallback>,
-    ) -> Fallible<DomRoot<PerformanceObserver>> {
-        Ok(PerformanceObserver::new_with_proto(
-            global,
-            proto,
-            callback,
-            Vec::new(),
-            can_gc,
-        ))
     }
 
     /// Buffer a new performance entry.
@@ -132,17 +116,32 @@ impl PerformanceObserver {
     pub fn set_entries(&self, entries: DOMPerformanceEntryList) {
         *self.entries.borrow_mut() = entries;
     }
-
-    // https://w3c.github.io/performance-timeline/#supportedentrytypes-attribute
-    #[allow(non_snake_case)]
-    pub fn SupportedEntryTypes(cx: JSContext, global: &GlobalScope) -> JSVal {
-        // While this is exposed through a method of PerformanceObserver,
-        // it is specified as associated with the global scope.
-        global.supported_performance_entry_types(cx)
-    }
 }
 
-impl PerformanceObserverMethods for PerformanceObserver {
+impl PerformanceObserverMethods<crate::DomTypeHolder> for PerformanceObserver {
+    // https://w3c.github.io/performance-timeline/#dom-performanceobserver-constructor
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        callback: Rc<PerformanceObserverCallback>,
+    ) -> Fallible<DomRoot<PerformanceObserver>> {
+        Ok(PerformanceObserver::new_with_proto(
+            global,
+            proto,
+            callback,
+            Vec::new(),
+            can_gc,
+        ))
+    }
+
+    // https://w3c.github.io/performance-timeline/#supportedentrytypes-attribute
+    fn SupportedEntryTypes(cx: JSContext, global: &GlobalScope, retval: MutableHandleValue) {
+        // While this is exposed through a method of PerformanceObserver,
+        // it is specified as associated with the global scope.
+        global.supported_performance_entry_types(cx, retval)
+    }
+
     // https://w3c.github.io/performance-timeline/#dom-performanceobserver-observe()
     fn Observe(&self, options: &PerformanceObserverInit) -> Fallible<()> {
         // Step 1 is self

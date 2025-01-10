@@ -19,6 +19,7 @@ use crate::dom::bluetoothuuid::{BluetoothCharacteristicUUID, BluetoothServiceUUI
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/#bluetoothremotegattservice
 #[dom_struct]
@@ -59,6 +60,7 @@ impl BluetoothRemoteGATTService {
                 device, uuid, isPrimary, instanceID,
             )),
             global,
+            CanGc::note(),
         )
     }
 
@@ -67,7 +69,7 @@ impl BluetoothRemoteGATTService {
     }
 }
 
-impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
+impl BluetoothRemoteGATTServiceMethods<crate::DomTypeHolder> for BluetoothRemoteGATTService {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattservice-device
     fn Device(&self) -> DomRoot<BluetoothDevice> {
         DomRoot::from_ref(&self.device)
@@ -84,7 +86,11 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
     }
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattservice-getcharacteristic
-    fn GetCharacteristic(&self, characteristic: BluetoothCharacteristicUUID) -> Rc<Promise> {
+    fn GetCharacteristic(
+        &self,
+        characteristic: BluetoothCharacteristicUUID,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
         get_gatt_children(
             self,
             true,
@@ -93,6 +99,7 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
             self.get_instance_id(),
             self.Device().get_gatt().Connected(),
             GATTType::Characteristic,
+            can_gc,
         )
     }
 
@@ -100,6 +107,7 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
     fn GetCharacteristics(
         &self,
         characteristic: Option<BluetoothCharacteristicUUID>,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         get_gatt_children(
             self,
@@ -109,11 +117,12 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
             self.get_instance_id(),
             self.Device().get_gatt().Connected(),
             GATTType::Characteristic,
+            can_gc,
         )
     }
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattservice-getincludedservice
-    fn GetIncludedService(&self, service: BluetoothServiceUUID) -> Rc<Promise> {
+    fn GetIncludedService(&self, service: BluetoothServiceUUID, can_gc: CanGc) -> Rc<Promise> {
         get_gatt_children(
             self,
             false,
@@ -122,11 +131,16 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
             self.get_instance_id(),
             self.Device().get_gatt().Connected(),
             GATTType::IncludedService,
+            can_gc,
         )
     }
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattservice-getincludedservices
-    fn GetIncludedServices(&self, service: Option<BluetoothServiceUUID>) -> Rc<Promise> {
+    fn GetIncludedServices(
+        &self,
+        service: Option<BluetoothServiceUUID>,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
         get_gatt_children(
             self,
             false,
@@ -135,6 +149,7 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
             self.get_instance_id(),
             self.Device().get_gatt().Connected(),
             GATTType::IncludedService,
+            can_gc,
         )
     }
 
@@ -149,7 +164,7 @@ impl BluetoothRemoteGATTServiceMethods for BluetoothRemoteGATTService {
 }
 
 impl AsyncBluetoothListener for BluetoothRemoteGATTService {
-    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>) {
+    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>, _can_gc: CanGc) {
         let device = self.Device();
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#getgattchildren

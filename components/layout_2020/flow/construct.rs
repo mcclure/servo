@@ -26,6 +26,7 @@ use crate::dom_traversal::{
 use crate::flow::float::FloatBox;
 use crate::flow::{BlockContainer, BlockFormattingContext, BlockLevelBox};
 use crate::formatting_contexts::IndependentFormattingContext;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
 use crate::style_ext::{ComputedValuesExt, DisplayGeneratingBox, DisplayInside, DisplayOutside};
 use crate::table::{AnonymousTableContent, Table};
@@ -447,7 +448,8 @@ where
 
         // Otherwise, this is just a normal inline box. Whatever happened before, all we need to do
         // before recurring is to remember this ongoing inline level box.
-        self.inline_formatting_context_builder
+        let inline_item = self
+            .inline_formatting_context_builder
             .start_inline_box(InlineBox::new(info));
 
         if is_list_item {
@@ -466,9 +468,8 @@ where
 
         self.finish_anonymous_table_if_needed();
 
-        box_slot.set(LayoutBox::InlineBox(
-            self.inline_formatting_context_builder.end_inline_box(),
-        ));
+        self.inline_formatting_context_builder.end_inline_box();
+        box_slot.set(LayoutBox::InlineLevel(inline_item));
     }
 
     fn handle_block_level_element(
@@ -654,9 +655,8 @@ where
                 let contents = intermediate_block_container.finish(context, info);
                 let contains_floats = contents.contains_floats();
                 ArcRefCell::new(BlockLevelBox::SameFormattingContextBlock {
-                    base_fragment_info: info.into(),
+                    base: LayoutBoxBase::new(info.into(), info.style.clone()),
                     contents,
-                    style: Arc::clone(&info.style),
                     contains_floats,
                 })
             },
@@ -713,7 +713,7 @@ where
                 );
                 ArcRefCell::new(BlockLevelBox::OutsideMarker(OutsideMarker {
                     marker_style,
-                    list_item_style: info.style.clone(),
+                    base: LayoutBoxBase::new(info.into(), info.style.clone()),
                     block_container,
                 }))
             },

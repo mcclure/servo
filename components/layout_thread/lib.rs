@@ -10,21 +10,19 @@
 
 use std::borrow::ToOwned;
 use std::cell::{Cell, RefCell};
-use std::ops::{Deref, DerefMut};
 use std::process;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use app_units::Au;
 use base::cross_process_instant::CrossProcessInstant;
-use base::id::{BrowsingContextId, PipelineId};
+use base::id::PipelineId;
 use base::Epoch;
 use embedder_traits::resources::{self, Resource};
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
 use euclid::{Point2D, Rect, Scale, Size2D};
 use fnv::FnvHashMap;
 use fonts::{
-    get_and_reset_text_shaping_performance_counter, FontCacheThread, FontContext,
-    FontContextWebFontMethods,
+    get_and_reset_text_shaping_performance_counter, FontContext, FontContextWebFontMethods,
 };
 use fonts_traits::WebFontLoadFinishedCallback;
 use fxhash::{FxHashMap, FxHashSet};
@@ -37,8 +35,8 @@ use layout::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils, MutableOwne
 use layout::flow_ref::FlowRef;
 use layout::incremental::{RelayoutMode, SpecialRestyleDamage};
 use layout::query::{
-    process_client_rect_query, process_content_box_request, process_content_boxes_request,
-    process_element_inner_text_query, process_offset_parent_query,
+    get_the_text_steps, process_client_rect_query, process_content_box_request,
+    process_content_boxes_request, process_offset_parent_query,
     process_resolved_font_style_request, process_resolved_style_request,
     process_scrolling_area_request,
 };
@@ -48,32 +46,31 @@ use layout::traversal::{
 };
 use layout::wrapper::ThreadSafeLayoutNodeHelpers;
 use layout::{layout_debug, layout_debug_scope, parallel, sequential};
-use log::{debug, error, trace, warn};
+use log::{debug, error, trace};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use metrics::{PaintTimeMetrics, ProfilerMetadataFactory};
 use net_traits::image_cache::{ImageCache, UsePlaceholder};
-use net_traits::ResourceThreads;
 use parking_lot::RwLock;
 use profile_traits::mem::{Report, ReportKind};
-use profile_traits::path;
 use profile_traits::time::{
-    self as profile_time, profile, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+    self as profile_time, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
 };
-use script::layout_dom::{ServoLayoutDocument, ServoLayoutElement, ServoLayoutNode};
+use profile_traits::{path, time_profile};
+use script::layout_dom::{ServoLayoutElement, ServoLayoutNode};
 use script_layout_interface::wrapper_traits::LayoutNode;
 use script_layout_interface::{
-    Layout, LayoutConfig, LayoutFactory, NodesFromPointQueryType, OffsetParentResponse, Reflow,
-    ReflowComplete, ReflowGoal, ScriptReflow, TrustedNodeAddress,
+    IFrameSizes, Layout, LayoutConfig, LayoutFactory, NodesFromPointQueryType,
+    OffsetParentResponse, Reflow, ReflowGoal, ReflowRequest, ReflowResult, TrustedNodeAddress,
 };
 use script_traits::{
-    ConstellationControlMsg, DrawAPaintImageResult, IFrameSizeMsg, LayoutMsg as ConstellationMsg,
-    PaintWorkletError, Painter, ScrollState, UntrustedNodeAddress, WindowSizeData, WindowSizeType,
+    ConstellationControlMsg, DrawAPaintImageResult, PaintWorkletError, Painter, ScrollState,
+    UntrustedNodeAddress, WindowSizeData,
 };
 use servo_arc::Arc as ServoArc;
 use servo_atoms::Atom;
 use servo_config::opts::{self, DebugOptions};
 use servo_config::pref;
-use servo_url::{ImmutableOrigin, ServoUrl};
+use servo_url::ServoUrl;
 use style::animation::{AnimationSetKey, DocumentAnimationSet, ElementAnimationSet};
 use style::context::{
     QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters, SharedStyleContext,
@@ -81,12 +78,13 @@ use style::context::{
 use style::dom::{OpaqueNode, ShowSubtree, ShowSubtreeDataAndPrimaryValues, TElement, TNode};
 use style::driver;
 use style::error_reporting::RustLogReporter;
-use style::global_style_data::{GLOBAL_STYLE_DATA, STYLE_THREAD_POOL};
+use style::global_style_data::GLOBAL_STYLE_DATA;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::logical_geometry::LogicalPoint;
 use style::media_queries::{Device, MediaList, MediaType};
 use style::properties::style_structs::Font;
 use style::properties::{ComputedValues, PropertyId};
+use style::queries::values::PrefersColorScheme;
 use style::selector_parser::{PseudoElement, SnapshotMap};
 use style::servo::media_queries::FontMetricsProvider;
 use style::servo::restyle_damage::ServoRestyleDamage;
@@ -101,11 +99,20 @@ use style::traversal_flags::TraversalFlags;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{FontSize, Length, NonNegativeLength};
 use style::values::specified::font::KeywordInfo;
-use style_traits::{CSSPixel, DevicePixel, SpeculativePainter};
+use style_traits::{CSSPixel, SpeculativePainter};
 use time_03::Duration;
 use url::Url;
+use webrender_api::units::DevicePixel;
 use webrender_api::{units, ColorF, HitTestFlags};
-use webrender_traits::WebRenderScriptApi;
+use webrender_traits::CrossProcessCompositorApi;
+
+// This mutex is necessary due to syncronisation issues between two different types of thread-local storage
+// which manifest themselves when the layout thread tries to layout iframes in parallel with the main page
+//
+// See: https://github.com/servo/servo/pull/29792
+// And: https://gist.github.com/mukilan/ed57eb61b83237a05fbf6360ec5e33b0
+static STYLE_THREAD_POOL: Mutex<&style::global_style_data::STYLE_THREAD_POOL> =
+    Mutex::new(&style::global_style_data::STYLE_THREAD_POOL);
 
 /// Information needed by layout.
 pub struct LayoutThread {
@@ -121,9 +128,6 @@ pub struct LayoutThread {
     /// Is the current reflow of an iframe, as opposed to a root window?
     is_iframe: bool,
 
-    /// The channel on which messages can be sent to the constellation.
-    constellation_chan: IpcSender<ConstellationMsg>,
-
     /// The channel on which messages can be sent to the script thread.
     script_chan: IpcSender<ConstellationControlMsg>,
 
@@ -133,10 +137,10 @@ pub struct LayoutThread {
     /// Reference to the script thread image cache.
     image_cache: Arc<dyn ImageCache>,
 
-    /// A FontContext tFontCacheThreadImplg layout.
-    font_context: Arc<FontContext<FontCacheThread>>,
+    /// A per-layout FontContext managing font access.
+    font_context: Arc<FontContext>,
 
-    /// Is this the first reflow iFontCacheThreadImplread?
+    /// Is this the first reflow in this layout?
     first_reflow: Cell<bool>,
 
     /// Flag to indicate whether to use parallel operations
@@ -170,14 +174,14 @@ pub struct LayoutThread {
     /// The executors for paint worklets.
     registered_painters: RegisteredPaintersImpl,
 
-    /// Webrender interface.
-    webrender_api: WebRenderScriptApi,
+    /// Cross-process access to the compositor API.
+    compositor_api: CrossProcessCompositorApi,
 
     /// Paint time metrics.
     paint_time_metrics: PaintTimeMetrics,
 
     /// The sizes of all iframes encountered during the last layout operation.
-    last_iframe_sizes: RefCell<FnvHashMap<BrowsingContextId, Size2D<f32, CSSPixel>>>,
+    last_iframe_sizes: RefCell<IFrameSizes>,
 
     /// Debug options, copied from configuration to this `LayoutThread` in order
     /// to avoid having to constantly access the thread-safe global options.
@@ -195,52 +199,14 @@ impl LayoutFactory for LayoutFactoryImpl {
             config.id,
             config.url,
             config.is_iframe,
-            config.constellation_chan,
             config.script_chan,
             config.image_cache,
-            config.resource_threads,
-            config.font_cache_thread,
+            config.font_context,
             config.time_profiler_chan,
-            config.webrender_api_sender,
+            config.compositor_api,
             config.paint_time_metrics,
             config.window_size,
         ))
-    }
-}
-
-struct ScriptReflowResult {
-    script_reflow: ScriptReflow,
-    result: RefCell<Option<ReflowComplete>>,
-}
-
-impl Deref for ScriptReflowResult {
-    type Target = ScriptReflow;
-    fn deref(&self) -> &ScriptReflow {
-        &self.script_reflow
-    }
-}
-
-impl DerefMut for ScriptReflowResult {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.script_reflow
-    }
-}
-
-impl ScriptReflowResult {
-    fn new(script_reflow: ScriptReflow) -> ScriptReflowResult {
-        ScriptReflowResult {
-            script_reflow,
-            result: RefCell::new(Some(Default::default())),
-        }
-    }
-}
-
-impl Drop for ScriptReflowResult {
-    fn drop(&mut self) {
-        self.script_reflow
-            .script_join_chan
-            .send(self.result.borrow_mut().take().unwrap())
-            .unwrap();
     }
 }
 
@@ -249,7 +215,7 @@ impl Drop for LayoutThread {
         let (keys, instance_keys) = self
             .font_context
             .collect_unused_webrender_resources(true /* all */);
-        self.webrender_api
+        self.compositor_api
             .remove_unused_font_resources(keys, instance_keys)
     }
 }
@@ -257,10 +223,6 @@ impl Drop for LayoutThread {
 impl Layout for LayoutThread {
     fn device(&self) -> &Device {
         self.stylist.device()
-    }
-
-    fn waiting_for_web_fonts_to_load(&self) -> bool {
-        self.font_context.web_fonts_still_loading() != 0
     }
 
     fn current_epoch(&self) -> Epoch {
@@ -325,22 +287,12 @@ impl Layout for LayoutThread {
         process_client_rect_query(node, root_flow_ref)
     }
 
-    fn query_element_inner_text(
+    fn query_element_inner_outer_text(
         &self,
         node: script_layout_interface::TrustedNodeAddress,
     ) -> String {
         let node = unsafe { ServoLayoutNode::new(&node) };
-        process_element_inner_text_query(node, &self.indexable_text.borrow())
-    }
-
-    fn query_inner_window_dimension(
-        &self,
-        browsing_context_id: BrowsingContextId,
-    ) -> Option<Size2D<f32, CSSPixel>> {
-        self.last_iframe_sizes
-            .borrow()
-            .get(&browsing_context_id)
-            .cloned()
+        get_the_text_steps(node, &self.indexable_text.borrow())
     }
 
     fn query_nodes_from_point(
@@ -359,7 +311,7 @@ impl Layout for LayoutThread {
 
         let client_point = units::DevicePoint::from_untyped(point);
         let results = self
-            .webrender_api
+            .compositor_api
             .hit_test(Some(self.id.into()), client_point, flags);
 
         results.iter().map(|result| result.node.into()).collect()
@@ -526,14 +478,13 @@ impl Layout for LayoutThread {
         });
     }
 
-    fn reflow(&mut self, script_reflow: script_layout_interface::ScriptReflow) {
-        let mut result = ScriptReflowResult::new(script_reflow);
-        profile(
+    fn reflow(&mut self, reflow_request: ReflowRequest) -> Option<ReflowResult> {
+        time_profile!(
             profile_time::ProfilerCategory::LayoutPerform,
             self.profiler_metadata(),
             self.time_profiler_chan.clone(),
-            || self.handle_reflow(&mut result),
-        );
+            || self.handle_reflow(reflow_request),
+        )
     }
 
     fn set_scroll_states(&mut self, scroll_states: &[ScrollState]) {
@@ -552,22 +503,21 @@ impl LayoutThread {
         self.root_flow.borrow().clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         id: PipelineId,
         url: ServoUrl,
         is_iframe: bool,
-        constellation_chan: IpcSender<ConstellationMsg>,
         script_chan: IpcSender<ConstellationControlMsg>,
         image_cache: Arc<dyn ImageCache>,
-        resource_threads: ResourceThreads,
-        font_cache_thread: FontCacheThread,
+        font_context: Arc<FontContext>,
         time_profiler_chan: profile_time::ProfilerChan,
-        webrender_api: WebRenderScriptApi,
+        compositor_api: CrossProcessCompositorApi,
         paint_time_metrics: PaintTimeMetrics,
         window_size: WindowSizeData,
     ) -> LayoutThread {
         // Let webrender know about this pipeline by sending an empty display list.
-        webrender_api.send_initial_transaction(id.into());
+        compositor_api.send_initial_transaction(id.into());
 
         let mut font = Font::initial_values();
         let default_font_size = pref!(fonts.default_size);
@@ -577,14 +527,15 @@ impl LayoutThread {
             keyword_info: KeywordInfo::medium(),
         };
 
-        let font_context = Arc::new(FontContext::new(font_cache_thread, resource_threads));
         let device = Device::new(
             MediaType::screen(),
             QuirksMode::NoQuirks,
             window_size.initial_viewport,
-            window_size.device_pixel_ratio,
+            Scale::new(window_size.device_pixel_ratio.get()),
             Box::new(LayoutFontMetricsProvider),
             ComputedValues::initial_values_with_font_override(font),
+            // TODO: obtain preferred color scheme from embedder
+            PrefersColorScheme::Light,
         );
 
         LayoutThread {
@@ -592,7 +543,6 @@ impl LayoutThread {
             url,
             is_iframe,
             script_chan,
-            constellation_chan,
             time_profiler_chan,
             registered_painters: RegisteredPaintersImpl(Default::default()),
             image_cache,
@@ -607,7 +557,7 @@ impl LayoutThread {
                 Au::from_f32_px(window_size.initial_viewport.width),
                 Au::from_f32_px(window_size.initial_viewport.height),
             ),
-            webrender_api,
+            compositor_api,
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             display_list: Default::default(),
             indexable_text: Default::default(),
@@ -646,24 +596,21 @@ impl LayoutThread {
         &'a self,
         guards: StylesheetGuards<'a>,
         snapshot_map: &'a SnapshotMap,
-        origin: ImmutableOrigin,
-        animation_timeline_value: f64,
-        animations: &DocumentAnimationSet,
-        stylesheets_changed: bool,
+        reflow_request: &ReflowRequest,
     ) -> LayoutContext<'a> {
-        let traversal_flags = match stylesheets_changed {
+        let traversal_flags = match reflow_request.stylesheets_changed {
             true => TraversalFlags::ForCSSRuleChanges,
             false => TraversalFlags::empty(),
         };
 
         LayoutContext {
             id: self.id,
-            origin,
+            origin: reflow_request.origin.clone(),
             style_context: self.build_shared_style_context(
                 guards,
                 snapshot_map,
-                animation_timeline_value,
-                animations,
+                reflow_request.animation_timeline_value,
+                &reflow_request.animations,
                 traversal_flags,
             ),
             image_cache: self.image_cache.clone(),
@@ -779,61 +726,18 @@ impl LayoutThread {
         );
     }
 
-    /// Update the recorded iframe sizes of the contents of layout and when these sizes changes,
-    /// send a message to the constellation informing it of the new sizes.
-    fn update_iframe_sizes(
-        &self,
-        new_iframe_sizes: FnvHashMap<BrowsingContextId, Size2D<f32, CSSPixel>>,
-    ) {
-        let old_iframe_sizes =
-            std::mem::replace(&mut *self.last_iframe_sizes.borrow_mut(), new_iframe_sizes);
-
-        if self.last_iframe_sizes.borrow().is_empty() {
-            return;
-        }
-
-        let size_messages: Vec<_> = self
-            .last_iframe_sizes
-            .borrow()
-            .iter()
-            .filter_map(|(browsing_context_id, size)| {
-                match old_iframe_sizes.get(browsing_context_id) {
-                    Some(old_size) if old_size != size => Some(IFrameSizeMsg {
-                        browsing_context_id: *browsing_context_id,
-                        size: *size,
-                        type_: WindowSizeType::Resize,
-                    }),
-                    None => Some(IFrameSizeMsg {
-                        browsing_context_id: *browsing_context_id,
-                        size: *size,
-                        type_: WindowSizeType::Initial,
-                    }),
-                    _ => None,
-                }
-            })
-            .collect();
-
-        if !size_messages.is_empty() {
-            let msg = ConstellationMsg::IFrameSizes(size_messages);
-            if let Err(e) = self.constellation_chan.send(msg) {
-                warn!("Layout resize to constellation failed ({}).", e);
-            }
-        }
-    }
-
     /// Computes the stacking-relative positions of all flows and, if the painting is dirty and the
     /// reflow type need it, builds the display list.
     fn compute_abs_pos_and_build_display_list(
         &self,
         data: &Reflow,
         reflow_goal: &ReflowGoal,
-        document: Option<&ServoLayoutDocument>,
         layout_root: &mut dyn Flow,
         layout_context: &mut LayoutContext,
     ) {
         let writing_mode = layout_root.base().writing_mode;
         let (metadata, sender) = (self.profiler_metadata(), self.time_profiler_chan.clone());
-        profile(
+        time_profile!(
             profile_time::ProfilerCategory::LayoutDispListBuild,
             metadata.clone(),
             sender.clone(),
@@ -870,13 +774,13 @@ impl LayoutThread {
                         root_flow.overflow.scroll.size
                     };
 
-                    let origin = Rect::new(Point2D::new(Au(0), Au(0)), root_size).to_layout();
+                    let origin = Rect::new(Point2D::zero(), root_size).to_layout();
                     build_state.root_stacking_context.bounds = origin;
                     build_state.root_stacking_context.overflow = origin;
 
                     // We will not use build_state.iframe_sizes again, so it's safe to move it.
-                    let iframe_sizes = std::mem::take(&mut build_state.iframe_sizes);
-                    self.update_iframe_sizes(iframe_sizes);
+                    *self.last_iframe_sizes.borrow_mut() =
+                        std::mem::take(&mut build_state.iframe_sizes);
 
                     *self.indexable_text.borrow_mut() =
                         std::mem::take(&mut build_state.indexable_text);
@@ -884,17 +788,7 @@ impl LayoutThread {
                 }
 
                 if !reflow_goal.needs_display() {
-                    // Defer the paint step until the next ForDisplay.
-                    //
-                    // We need to tell the document about this so it doesn't
-                    // incorrectly suppress reflows. See #13131.
-                    document
-                        .expect("No document in a non-display reflow?")
-                        .needs_paint_from_layout();
                     return;
-                }
-                if let Some(document) = document {
-                    document.will_paint();
                 }
 
                 let mut display_list = self.display_list.borrow_mut();
@@ -932,38 +826,38 @@ impl LayoutThread {
                 self.paint_time_metrics
                     .maybe_observe_paint_time(self, epoch, is_contentful.0);
 
-                self.webrender_api
+                self.compositor_api
                     .send_display_list(compositor_info, builder.end().1);
 
                 let (keys, instance_keys) = self
                     .font_context
                     .collect_unused_webrender_resources(false /* all */);
-                self.webrender_api
+                self.compositor_api
                     .remove_unused_font_resources(keys, instance_keys)
             },
         );
     }
 
     /// The high-level routine that performs layout.
-    fn handle_reflow(&mut self, data: &mut ScriptReflowResult) {
-        let document = unsafe { ServoLayoutNode::new(&data.document) };
+    fn handle_reflow(&mut self, mut reflow_request: ReflowRequest) -> Option<ReflowResult> {
+        let document = unsafe { ServoLayoutNode::new(&reflow_request.document) };
         let document = document.as_document().unwrap();
 
         // Parallelize if there's more than 750 objects based on rzambre's suggestion
         // https://github.com/servo/servo/issues/10110
-        self.parallel_flag = data.dom_count > 750;
+        self.parallel_flag = reflow_request.dom_count > 750;
         debug!("layout: received layout request for: {}", self.url);
-        debug!("Number of objects in DOM: {}", data.dom_count);
+        debug!("Number of objects in DOM: {}", reflow_request.dom_count);
         debug!("layout: parallel? {}", self.parallel_flag);
 
         let Some(root_element) = document.root_element() else {
             debug!("layout: No root node: bailing");
-            return;
+            return None;
         };
 
         debug!(
             "layout: processing reflow request for: {:?} ({}) (query={:?})",
-            root_element, self.url, data.reflow_goal
+            root_element, self.url, reflow_request.reflow_goal
         );
         trace!("{:?}", ShowSubtree(root_element.as_node()));
 
@@ -980,7 +874,8 @@ impl LayoutThread {
         };
 
         let had_used_viewport_units = self.stylist.device().used_viewport_units();
-        let viewport_size_changed = self.handle_viewport_change(data.window_size, &guards);
+        let viewport_size_changed =
+            self.handle_viewport_change(reflow_request.window_size, &guards);
         if viewport_size_changed && had_used_viewport_units {
             if let Some(mut data) = root_element.mutate_data() {
                 data.hint.insert(RestyleHint::recascade_subtree());
@@ -1007,7 +902,7 @@ impl LayoutThread {
             }
         }
 
-        if data.stylesheets_changed {
+        if reflow_request.stylesheets_changed {
             debug!("Doc sheets changed, flushing author sheets too");
             self.stylist
                 .force_stylesheet_origins_dirty(Origin::Author.into());
@@ -1027,7 +922,7 @@ impl LayoutThread {
         // Flush shadow roots stylesheets if dirty.
         document.flush_shadow_roots_stylesheets(&mut self.stylist, guards.author);
 
-        let restyles = std::mem::take(&mut data.pending_restyles);
+        let restyles = std::mem::take(&mut reflow_request.pending_restyles);
         debug!("Draining restyles: {}", restyles.len());
 
         let mut map = SnapshotMap::new();
@@ -1064,14 +959,7 @@ impl LayoutThread {
         self.stylist.flush(&guards, Some(root_element), Some(&map));
 
         // Create a layout context for use throughout the following passes.
-        let mut layout_context = self.build_layout_context(
-            guards.clone(),
-            &map,
-            data.origin.clone(),
-            data.animation_timeline_value,
-            &data.animations,
-            data.stylesheets_changed,
-        );
+        let mut layout_context = self.build_layout_context(guards.clone(), &map, &reflow_request);
 
         let pool = STYLE_THREAD_POOL.lock().unwrap();
         let thread_pool = pool.pool();
@@ -1082,7 +970,7 @@ impl LayoutThread {
         };
 
         let dirty_root = unsafe {
-            ServoLayoutNode::new(&data.dirty_root.unwrap())
+            ServoLayoutNode::new(&reflow_request.dirty_root.unwrap())
                 .as_element()
                 .unwrap()
         };
@@ -1098,7 +986,7 @@ impl LayoutThread {
 
         if token.should_traverse() {
             // Recalculate CSS styles and rebuild flows and fragments.
-            profile(
+            time_profile!(
                 profile_time::ProfilerCategory::LayoutStyleRecalc,
                 self.profiler_metadata(),
                 self.time_profiler_chan.clone(),
@@ -1157,9 +1045,8 @@ impl LayoutThread {
         if let Some(mut root_flow) = self.root_flow.borrow().clone() {
             self.perform_post_style_recalc_layout_passes(
                 &mut root_flow,
-                &data.reflow_info,
-                &data.reflow_goal,
-                Some(&document),
+                &reflow_request.reflow_info,
+                &reflow_request.reflow_goal,
                 &mut layout_context,
                 thread_pool,
             );
@@ -1167,12 +1054,15 @@ impl LayoutThread {
 
         self.first_reflow.set(false);
 
-        data.result.borrow_mut().as_mut().unwrap().pending_images =
-            std::mem::take(&mut *layout_context.pending_images.lock().unwrap());
-
-        if let ReflowGoal::UpdateScrollNode(scroll_state) = data.reflow_goal {
+        if let ReflowGoal::UpdateScrollNode(scroll_state) = reflow_request.reflow_goal {
             self.update_scroll_node_state(&scroll_state);
         }
+
+        let pending_images = std::mem::take(&mut *layout_context.pending_images.lock().unwrap());
+        Some(ReflowResult {
+            pending_images,
+            iframe_sizes: self.last_iframe_sizes.borrow().clone(),
+        })
     }
 
     fn update_scroll_node_state(&self, state: &ScrollState) {
@@ -1181,7 +1071,7 @@ impl LayoutThread {
             .insert(state.scroll_id, state.scroll_offset);
 
         let point = Point2D::new(-state.scroll_offset.x, -state.scroll_offset.y);
-        self.webrender_api.send_scroll_node(
+        self.compositor_api.send_scroll_node(
             self.id.into(),
             units::LayoutPoint::from_untyped(point),
             state.scroll_id,
@@ -1234,7 +1124,6 @@ impl LayoutThread {
         root_flow: &mut FlowRef,
         data: &Reflow,
         reflow_goal: &ReflowGoal,
-        document: Option<&ServoLayoutDocument>,
         context: &mut LayoutContext,
         thread_pool: Option<&rayon::ThreadPool>,
     ) {
@@ -1243,7 +1132,7 @@ impl LayoutThread {
             FlowRef::deref_mut(root_flow),
         );
 
-        profile(
+        time_profile!(
             profile_time::ProfilerCategory::LayoutRestyleDamagePropagation,
             self.profiler_metadata(),
             self.time_profiler_chan.clone(),
@@ -1265,7 +1154,7 @@ impl LayoutThread {
         }
 
         // Resolve generated content.
-        profile(
+        time_profile!(
             profile_time::ProfilerCategory::LayoutGeneratedContent,
             self.profiler_metadata(),
             self.time_profiler_chan.clone(),
@@ -1273,7 +1162,7 @@ impl LayoutThread {
         );
 
         // Guess float placement.
-        profile(
+        time_profile!(
             profile_time::ProfilerCategory::LayoutFloatPlacementSpeculation,
             self.profiler_metadata(),
             self.time_profiler_chan.clone(),
@@ -1287,7 +1176,7 @@ impl LayoutThread {
             .restyle_damage
             .intersects(ServoRestyleDamage::REFLOW | ServoRestyleDamage::REFLOW_OUT_OF_FLOW)
         {
-            profile(
+            time_profile!(
                 profile_time::ProfilerCategory::LayoutMain,
                 self.profiler_metadata(),
                 self.time_profiler_chan.clone(),
@@ -1311,7 +1200,7 @@ impl LayoutThread {
             );
         }
 
-        profile(
+        time_profile!(
             profile_time::ProfilerCategory::LayoutStoreOverflow,
             self.profiler_metadata(),
             self.time_profiler_chan.clone(),
@@ -1320,7 +1209,7 @@ impl LayoutThread {
             },
         );
 
-        self.perform_post_main_layout_passes(data, root_flow, reflow_goal, document, context);
+        self.perform_post_main_layout_passes(data, root_flow, reflow_goal, context);
     }
 
     fn perform_post_main_layout_passes(
@@ -1328,14 +1217,12 @@ impl LayoutThread {
         data: &Reflow,
         root_flow: &mut FlowRef,
         reflow_goal: &ReflowGoal,
-        document: Option<&ServoLayoutDocument>,
         layout_context: &mut LayoutContext,
     ) {
         // Build the display list if necessary, and send it to the painter.
         self.compute_abs_pos_and_build_display_list(
             data,
             reflow_goal,
-            document,
             FlowRef::deref_mut(root_flow),
             &mut *layout_context,
         );
@@ -1395,7 +1282,8 @@ impl LayoutThread {
         );
 
         if self.stylist.device().au_viewport_size() == au_viewport_size &&
-            self.stylist.device().device_pixel_ratio() == window_size_data.device_pixel_ratio
+            self.stylist.device().device_pixel_ratio().get() ==
+                window_size_data.device_pixel_ratio.get()
         {
             return false;
         }
@@ -1404,9 +1292,11 @@ impl LayoutThread {
             MediaType::screen(),
             self.stylist.quirks_mode(),
             window_size_data.initial_viewport,
-            window_size_data.device_pixel_ratio,
+            Scale::new(window_size_data.device_pixel_ratio.get()),
             Box::new(LayoutFontMetricsProvider),
             self.stylist.device().default_computed_values().to_arc(),
+            // TODO: obtain preferred color scheme from embedder
+            PrefersColorScheme::Light,
         );
 
         // Preserve any previously computed root font size.

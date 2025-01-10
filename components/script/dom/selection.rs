@@ -17,10 +17,9 @@ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::range::Range;
 use crate::script_runtime::CanGc;
-use crate::task_source::TaskSource;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
 enum Direction {
@@ -53,6 +52,7 @@ impl Selection {
         reflect_dom_object(
             Box::new(Selection::new_inherited(document)),
             &*document.global(),
+            CanGc::note(),
         )
     }
 
@@ -88,19 +88,17 @@ impl Selection {
             return;
         }
         let this = Trusted::new(self);
-        let window = window_from_node(&*self.document);
-        window
+        self.document
+            .owner_global()
             .task_manager()
             .user_interaction_task_source() // w3c/selection-api#117
             .queue(
                 task!(selectionchange_task_steps: move || {
                     let this = this.root();
                     this.task_queued.set(false);
-                    this.document.upcast::<EventTarget>().fire_event(atom!("selectionchange"));
-                }),
-                window.upcast(),
-            )
-            .expect("Couldn't queue selectionchange task!");
+                    this.document.upcast::<EventTarget>().fire_event(atom!("selectionchange"), CanGc::note());
+                })
+            );
         self.task_queued.set(true);
     }
 
@@ -109,7 +107,7 @@ impl Selection {
     }
 }
 
-impl SelectionMethods for Selection {
+impl SelectionMethods<crate::DomTypeHolder> for Selection {
     // https://w3c.github.io/selection-api/#dom-selection-anchornode
     fn GetAnchorNode(&self) -> Option<DomRoot<Node>> {
         if let Some(range) = self.range.get() {

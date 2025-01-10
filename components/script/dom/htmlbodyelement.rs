@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::time::Duration;
-
 use dom_struct::dom_struct;
 use embedder_traits::EmbedderMsg;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
@@ -22,11 +20,9 @@ use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{document_from_node, window_from_node, BindContext, Node};
+use crate::dom::node::{BindContext, Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
-
-/// How long we should wait before performing the initial reflow after `<body>` is parsed.
-const INITIAL_REFLOW_DELAY: Duration = Duration::from_millis(200);
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLBodyElement {
@@ -50,11 +46,13 @@ impl HTMLBodyElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLBodyElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLBodyElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -70,7 +68,7 @@ impl HTMLBodyElement {
     }
 }
 
-impl HTMLBodyElementMethods for HTMLBodyElement {
+impl HTMLBodyElementMethods<crate::DomTypeHolder> for HTMLBodyElement {
     // https://html.spec.whatwg.org/multipage/#dom-body-bgcolor
     make_getter!(BgColor, "bgcolor");
 
@@ -87,13 +85,11 @@ impl HTMLBodyElementMethods for HTMLBodyElement {
     make_getter!(Background, "background");
 
     // https://html.spec.whatwg.org/multipage/#dom-body-background
-    fn SetBackground(&self, input: DOMString) {
-        let value = AttrValue::from_resolved_url(
-            &document_from_node(self).base_url().get_arc(),
-            input.into(),
-        );
+    fn SetBackground(&self, input: DOMString, can_gc: CanGc) {
+        let value =
+            AttrValue::from_resolved_url(&self.owner_document().base_url().get_arc(), input.into());
         self.upcast::<Element>()
-            .set_attribute(&local_name!("background"), value);
+            .set_attribute(&local_name!("background"), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#windoweventhandlers
@@ -150,16 +146,14 @@ impl VirtualMethods for HTMLBodyElement {
             s.bind_to_tree(context);
         }
 
-        if !context.tree_in_doc {
+        if !context.tree_is_in_a_document_tree {
             return;
         }
 
-        let window = window_from_node(self);
-        let document = window.Document();
-        document.set_reflow_timeout(INITIAL_REFLOW_DELAY);
+        let window = self.owner_window();
+        window.prevent_layout_until_load_event();
         if window.is_top_level() {
-            let msg = EmbedderMsg::HeadParsed;
-            window.send_to_embedder(msg);
+            window.send_to_embedder(EmbedderMsg::HeadParsed);
         }
     }
 
@@ -169,7 +163,7 @@ impl VirtualMethods for HTMLBodyElement {
                 AttrValue::from_legacy_color(value.into())
             },
             local_name!("background") => AttrValue::from_resolved_url(
-                &document_from_node(self).base_url().get_arc(),
+                &self.owner_document().base_url().get_arc(),
                 value.into(),
             ),
             _ => self
@@ -182,7 +176,7 @@ impl VirtualMethods for HTMLBodyElement {
     fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
         let do_super_mutate = match (attr.local_name(), mutation) {
             (name, AttributeMutation::Set(_)) if name.starts_with("on") => {
-                let window = window_from_node(self);
+                let window = self.owner_window();
                 // https://html.spec.whatwg.org/multipage/
                 // #event-handlers-on-elements,-document-objects,-and-window-objects:event-handlers-3
                 match name {

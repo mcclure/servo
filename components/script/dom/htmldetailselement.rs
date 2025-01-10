@@ -17,9 +17,9 @@ use crate::dom::document::Document;
 use crate::dom::element::AttributeMutation;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{window_from_node, Node, NodeDamage};
+use crate::dom::node::{Node, NodeDamage, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLDetailsElement {
@@ -45,6 +45,7 @@ impl HTMLDetailsElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLDetailsElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLDetailsElement::new_inherited(
@@ -52,6 +53,7 @@ impl HTMLDetailsElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -60,7 +62,7 @@ impl HTMLDetailsElement {
     }
 }
 
-impl HTMLDetailsElementMethods for HTMLDetailsElement {
+impl HTMLDetailsElementMethods<crate::DomTypeHolder> for HTMLDetailsElement {
     // https://html.spec.whatwg.org/multipage/#dom-details-open
     make_bool_getter!(Open, "open");
 
@@ -80,18 +82,16 @@ impl VirtualMethods for HTMLDetailsElement {
             let counter = self.toggle_counter.get() + 1;
             self.toggle_counter.set(counter);
 
-            let window = window_from_node(self);
             let this = Trusted::new(self);
-            // FIXME(nox): Why are errors silenced here?
-            let _ = window.task_manager().dom_manipulation_task_source().queue(
-                task!(details_notification_task_steps: move || {
+            self.owner_global()
+                .task_manager()
+                .dom_manipulation_task_source()
+                .queue(task!(details_notification_task_steps: move || {
                     let this = this.root();
                     if counter == this.toggle_counter.get() {
-                        this.upcast::<EventTarget>().fire_event(atom!("toggle"));
+                        this.upcast::<EventTarget>().fire_event(atom!("toggle"), CanGc::note());
                     }
-                }),
-                window.upcast(),
-            );
+                }));
             self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage)
         }
     }

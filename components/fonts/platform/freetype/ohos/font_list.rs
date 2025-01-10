@@ -3,8 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -12,8 +10,6 @@ use std::{fs, io};
 
 use base::text::{UnicodeBlock, UnicodeBlockMethod};
 use log::{debug, error, warn};
-use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{
     FontStretch as StyleFontStretch, FontStyle as StyleFontStyle, FontWeight as StyleFontWeight,
@@ -22,42 +18,20 @@ use style::Atom;
 use unicode_script::Script;
 
 use crate::{
-    EmojiPresentationPreference, FallbackFontSelectionOptions, FontTemplate,
-    FontTemplateDescriptor, LowercaseFontFamilyName,
+    EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier, FontTemplate,
+    FontTemplateDescriptor, LocalFontIdentifier, LowercaseFontFamilyName,
 };
 
-static FONT_LIST: LazyLock<FontList> = LazyLock::new(|| FontList::new());
+static FONT_LIST: LazyLock<FontList> = LazyLock::new(FontList::new);
 
 /// When testing the ohos font code on linux, we can pass the fonts directory of the SDK
 /// via an environment variable.
 #[cfg(ohos_mock)]
-static OHOS_FONTS_DIR: &'static str = env!("OHOS_SDK_FONTS_DIR");
+static OHOS_FONTS_DIR: &str = env!("OHOS_SDK_FONTS_DIR");
 
 /// On OpenHarmony devices the fonts are always located here.
 #[cfg(not(ohos_mock))]
-static OHOS_FONTS_DIR: &'static str = "/system/fonts";
-
-/// An identifier for a local font on OpenHarmony systems.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub struct LocalFontIdentifier {
-    /// The path to the font.
-    pub path: Atom,
-}
-
-impl LocalFontIdentifier {
-    pub(crate) fn index(&self) -> u32 {
-        0
-    }
-
-    pub(crate) fn read_data_from_file(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        File::open(Path::new(&*self.path))
-            .expect("Couldn't open font file!")
-            .read_to_end(&mut bytes)
-            .unwrap();
-        bytes
-    }
-}
+static OHOS_FONTS_DIR: &str = "/system/fonts";
 
 #[allow(unused)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -106,15 +80,13 @@ struct FontList {
 
 fn enumerate_font_files() -> io::Result<Vec<PathBuf>> {
     let mut font_list = vec![];
-    for elem in fs::read_dir(OHOS_FONTS_DIR)? {
-        if let Ok(e) = elem {
-            if e.file_type().unwrap().is_file() {
-                let name = e.file_name();
-                let raw_name = name.as_bytes();
-                if raw_name.ends_with(b".ttf".as_ref()) || raw_name.ends_with(b".ttc".as_ref()) {
-                    debug!("Found font {}", e.file_name().to_str().unwrap());
-                    font_list.push(e.path())
-                }
+    for elem in fs::read_dir(OHOS_FONTS_DIR)?.flatten() {
+        if elem.file_type().unwrap().is_file() {
+            let name = elem.file_name();
+            let raw_name = name.as_bytes();
+            if raw_name.ends_with(b".ttf".as_ref()) || raw_name.ends_with(b".ttc".as_ref()) {
+                debug!("Found font {}", elem.file_name().to_str().unwrap());
+                font_list.push(elem.path())
             }
         }
     }
@@ -202,7 +174,7 @@ fn split_noto_font_name(name: &str) -> Vec<String> {
             }
         }
     }
-    if current_word.len() > 0 {
+    if !current_word.is_empty() {
         name_components.push(current_word);
     }
     name_components
@@ -317,11 +289,10 @@ fn parse_font_filenames(font_files: Vec<PathBuf>) -> Vec<FontFamily> {
         }
     }
 
-    let families = families
+    families
         .into_iter()
         .map(|(name, fonts)| FontFamily { name, fonts })
-        .collect();
-    families
+        .collect()
 }
 
 impl FontList {
@@ -336,7 +307,7 @@ impl FontList {
     fn detect_installed_font_families() -> Vec<FontFamily> {
         let mut families = enumerate_font_files()
             .inspect_err(|e| error!("Failed to enumerate font files due to `{e:?}`"))
-            .and_then(|font_files| Ok(parse_font_filenames(font_files)))
+            .map(|font_files| parse_font_filenames(font_files))
             .unwrap_or_else(|_| FontList::fallback_font_families());
         families.extend(Self::hardcoded_font_families());
         families
@@ -351,14 +322,14 @@ impl FontList {
             FontFamily {
                 name: "HMOS Color Emoji".to_string(),
                 fonts: vec![Font {
-                    filepath: FontList::font_absolute_path("HMOSColorEmojiCompat.ttf".into()),
+                    filepath: FontList::font_absolute_path("HMOSColorEmojiCompat.ttf"),
                     ..Default::default()
                 }],
             },
             FontFamily {
                 name: "HMOS Color Emoji Flags".to_string(),
                 fonts: vec![Font {
-                    filepath: FontList::font_absolute_path("HMOSColorEmojiFlags.ttf".into()),
+                    filepath: FontList::font_absolute_path("HMOSColorEmojiFlags.ttf"),
                     ..Default::default()
                 }],
             },
@@ -453,7 +424,7 @@ impl FontList {
     }
 }
 
-// Functions used by FontCacheThread
+// Functions used by SystemFontService
 pub fn for_each_available_family<F>(mut callback: F)
 where
     F: FnMut(String),
@@ -473,6 +444,7 @@ where
     let mut produce_font = |font: &Font| {
         let local_font_identifier = LocalFontIdentifier {
             path: Atom::from(font.filepath.clone()),
+            variation_index: 0,
         };
         let stretch = font.width.into();
         let weight = font
@@ -492,9 +464,10 @@ where
             None => StyleFontStyle::NORMAL,
         };
         let descriptor = FontTemplateDescriptor::new(weight, stretch, style);
-        callback(FontTemplate::new_for_local_font(
-            local_font_identifier,
+        callback(FontTemplate::new(
+            FontIdentifier::Local(local_font_identifier),
             descriptor,
+            None,
         ));
     };
 
@@ -566,12 +539,20 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
             UnicodeBlock::HangulJamoExtendedA |
             UnicodeBlock::HangulJamoExtendedB |
             UnicodeBlock::HangulSyllables => {
+                families.push("Noto Sans CJK");
+                families.push("Noto Serif CJK");
                 families.push("Noto Sans KR");
             },
             UnicodeBlock::Hiragana |
             UnicodeBlock::Katakana |
             UnicodeBlock::KatakanaPhoneticExtensions => {
+                families.push("Noto Sans CJK");
+                families.push("Noto Serif CJK");
                 families.push("Noto Sans JP");
+            },
+            UnicodeBlock::HalfwidthandFullwidthForms => {
+                families.push("HarmonyOS Sans SC");
+                families.push("Noto Sans CJK");
             },
             _ => {},
         }

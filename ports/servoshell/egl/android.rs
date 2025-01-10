@@ -4,6 +4,7 @@
 
 #![allow(non_snake_case)]
 
+mod resources;
 mod simpleservo;
 
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 use android_logger::{self, Config, FilterBuilder};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue, JValueOwned};
-use jni::sys::{jboolean, jfloat, jint, jobject, jstring, JNI_TRUE};
+use jni::sys::{jboolean, jfloat, jint, jobject, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use log::{debug, error, info, warn};
 use simpleservo::{
@@ -20,7 +21,6 @@ use simpleservo::{
     PromptResult, SERVO,
 };
 
-use super::gl_glue;
 use super::host_trait::HostTrait;
 use super::servo_glue::{Coordinates, ServoGlue};
 
@@ -58,7 +58,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn Java_org_servo_servoview_JNIServo_version<'local>(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
     let v = crate::servo_version();
@@ -141,9 +141,7 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
     let wakeup = Box::new(WakeupCallback::new(callbacks_ref.clone(), &env));
     let callbacks = Box::new(HostCallbacks::new(callbacks_ref, &env));
 
-    if let Err(err) = gl_glue::init()
-        .and_then(|egl_init| simpleservo::init(opts, egl_init.gl_wrapper, wakeup, callbacks))
-    {
+    if let Err(err) = simpleservo::init(opts, wakeup, callbacks) {
         throw(&mut env, err)
     };
 }
@@ -707,16 +705,6 @@ fn throw(env: &mut JNIEnv, err: &str) {
             "Failed to throw Java exception: `{}`. Exception was: `{}`",
             e, err
         );
-    }
-}
-
-fn new_string(env: &mut JNIEnv, s: &str) -> Result<jstring, &'static str> {
-    match env.new_string(s) {
-        Ok(s) => Ok(s.into_raw()),
-        Err(_) => {
-            throw(env, "Couldn't create Java string");
-            Err("Couldn't create Java String")
-        },
     }
 }
 

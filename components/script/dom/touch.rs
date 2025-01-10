@@ -10,6 +10,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{DomRoot, MutDom};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct Touch {
@@ -66,11 +67,12 @@ impl Touch {
                 identifier, target, screen_x, screen_y, client_x, client_y, page_x, page_y,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
 
-impl TouchMethods for Touch {
+impl TouchMethods<crate::DomTypeHolder> for Touch {
     /// <https://w3c.github.io/touch-events/#widl-Touch-identifier>
     fn Identifier(&self) -> i32 {
         self.identifier

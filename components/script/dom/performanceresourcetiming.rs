@@ -15,7 +15,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::performanceentry::PerformanceEntry;
-
+use crate::script_runtime::CanGc;
 // TODO UA may choose to limit how many resources are included as PerformanceResourceTiming objects
 // recommended minimum is 150, can be changed by setResourceTimingBufferSize in performance
 // https://w3c.github.io/resource-timing/#sec-extensions-performance-interface
@@ -168,6 +168,7 @@ impl PerformanceResourceTiming {
                 resource_timing,
             )),
             global,
+            CanGc::note(),
         )
     }
 
@@ -185,7 +186,7 @@ impl PerformanceResourceTiming {
 }
 
 // https://w3c.github.io/resource-timing/
-impl PerformanceResourceTimingMethods for PerformanceResourceTiming {
+impl PerformanceResourceTimingMethods<crate::DomTypeHolder> for PerformanceResourceTiming {
     // https://w3c.github.io/resource-timing/#dom-performanceresourcetiming-initiatortype
     fn InitiatorType(&self) -> DOMString {
         match self.initiator_type {

@@ -79,16 +79,18 @@ impl BluetoothAdvertisingEvent {
         }
         ev
     }
+}
 
+impl BluetoothAdvertisingEventMethods<crate::DomTypeHolder> for BluetoothAdvertisingEvent {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-bluetoothadvertisingevent
-    pub fn Constructor(
+    #[allow(non_snake_case)]
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
         type_: DOMString,
         init: &BluetoothAdvertisingEventInit,
     ) -> Fallible<DomRoot<BluetoothAdvertisingEvent>> {
-        let global = window.upcast::<GlobalScope>();
         let name = init.name.clone();
         let appearance = init.appearance;
         let txPower = init.txPower;
@@ -96,7 +98,7 @@ impl BluetoothAdvertisingEvent {
         let bubbles = EventBubbles::from(init.parent.bubbles);
         let cancelable = EventCancelable::from(init.parent.cancelable);
         Ok(BluetoothAdvertisingEvent::new(
-            global,
+            window.as_global_scope(),
             proto,
             Atom::from(type_),
             bubbles,
@@ -109,9 +111,7 @@ impl BluetoothAdvertisingEvent {
             can_gc,
         ))
     }
-}
 
-impl BluetoothAdvertisingEventMethods for BluetoothAdvertisingEvent {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-device
     fn Device(&self) -> DomRoot<BluetoothDevice> {
         DomRoot::from_ref(&*self.device)

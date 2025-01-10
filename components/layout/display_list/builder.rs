@@ -13,19 +13,21 @@ use std::sync::Arc;
 use std::{f32, mem};
 
 use app_units::{Au, AU_PER_PX};
-use base::id::{BrowsingContextId, PipelineId};
+use base::id::PipelineId;
 use bitflags::bitflags;
 use canvas_traits::canvas::{CanvasMsg, FromLayoutMsg};
 use embedder_traits::Cursor;
 use euclid::default::{Point2D, Rect, SideOffsets2D as UntypedSideOffsets2D, Size2D};
-use euclid::{rect, SideOffsets2D};
+use euclid::{rect, Scale, SideOffsets2D};
 use fnv::FnvHashMap;
 use fonts::ByteIndex;
 use ipc_channel::ipc;
 use log::{debug, warn};
 use net_traits::image_cache::UsePlaceholder;
 use range::Range;
-use script_layout_interface::{combine_id_with_fragment_type, FragmentType};
+use script_layout_interface::{
+    combine_id_with_fragment_type, FragmentType, IFrameSize, IFrameSizes,
+};
 use servo_config::opts;
 use servo_geometry::{self, MaxRect};
 use style::color::AbsoluteColor;
@@ -43,7 +45,7 @@ use style::values::computed::{ClipRectOrAuto, Gradient};
 use style::values::generics::background::BackgroundSize;
 use style::values::generics::image::PaintWorklet;
 use style::values::specified::ui::CursorKind;
-use style_traits::{CSSPixel, ToCss};
+use style_traits::ToCss;
 use webrender_api::units::{LayoutRect, LayoutTransform, LayoutVector2D};
 use webrender_api::{
     self, BorderDetails, BorderRadius, BorderSide, BoxShadowClipMode, ColorF, ColorU,
@@ -327,7 +329,7 @@ pub struct DisplayListBuildState<'a> {
 
     /// Vector containing iframe sizes, used to inform the constellation about
     /// new iframe sizes
-    pub iframe_sizes: FnvHashMap<BrowsingContextId, euclid::Size2D<f32, CSSPixel>>,
+    pub iframe_sizes: IFrameSizes,
 
     /// Stores text runs to answer text queries used to place a cursor inside text.
     pub indexable_text: IndexableText,
@@ -907,7 +909,12 @@ impl Fragment {
                     .filter_map(|(name, id)| id.as_shorthand().err().map(|id| (name, id)))
                     .map(|(name, id)| (name.clone(), style.computed_value_to_string(id)))
                     .collect();
-                painter.draw_a_paint_image(size_in_px, device_pixel_ratio, properties, arguments)
+                painter.draw_a_paint_image(
+                    size_in_px,
+                    Scale::new(device_pixel_ratio.get()),
+                    properties,
+                    arguments,
+                )
             },
             None => {
                 debug!("Worklet {} called before registration.", name);
@@ -1867,19 +1874,25 @@ impl Fragment {
             },
             SpecificFragmentInfo::Iframe(ref fragment_info) => {
                 if !stacking_relative_content_box.is_empty() {
-                    let browsing_context_id = match fragment_info.browsing_context_id {
-                        Some(browsing_context_id) => browsing_context_id,
-                        None => return warn!("No browsing context id for iframe."),
+                    let Some(browsing_context_id) = fragment_info.browsing_context_id else {
+                        return warn!("No browsing context id for iframe.");
+                    };
+                    let Some(pipeline_id) = fragment_info.pipeline_id else {
+                        return warn!("No pipeline id for iframe.");
                     };
 
                     let base = create_base_display_item(state);
                     let bounds = stacking_relative_content_box.to_layout();
 
-                    // XXXjdm: This sleight-of-hand to convert LayoutRect -> Size2D<CSSPixel>
-                    //         looks bogus.
                     state.iframe_sizes.insert(
                         browsing_context_id,
-                        euclid::Size2D::new(bounds.size().width, bounds.size().height),
+                        IFrameSize {
+                            browsing_context_id,
+                            pipeline_id,
+                            // XXXjdm: This sleight-of-hand to convert LayoutRect -> Size2D<CSSPixel>
+                            //         looks bogus.
+                            size: euclid::Size2D::new(bounds.size().width, bounds.size().height),
+                        },
                     );
 
                     let pipeline_id = match fragment_info.pipeline_id {
@@ -1919,14 +1932,14 @@ impl Fragment {
                 }
             },
             SpecificFragmentInfo::Media(ref fragment_info) => {
-                if let Some((ref image_key, _, _)) = fragment_info.current_frame {
+                if let Some(ref media_frame) = fragment_info.current_frame {
                     let base = create_base_display_item(state);
                     state.add_image_item(
                         base,
                         webrender_api::ImageDisplayItem {
                             bounds: stacking_relative_content_box.to_layout(),
                             common: items::empty_common_item_properties(),
-                            image_key: *image_key,
+                            image_key: media_frame.image_key,
                             image_rendering: ImageRendering::Auto,
                             alpha_type: webrender_api::AlphaType::PremultipliedAlpha,
                             color: webrender_api::ColorF::WHITE,
@@ -1944,20 +1957,18 @@ impl Fragment {
                 let image_key = match canvas_fragment_info.source {
                     CanvasFragmentSource::WebGL(image_key) => image_key,
                     CanvasFragmentSource::WebGPU(image_key) => image_key,
-                    CanvasFragmentSource::Image(ref ipc_renderer) => match *ipc_renderer {
-                        Some(ref ipc_renderer) => {
-                            let ipc_renderer = ipc_renderer.lock().unwrap();
-                            let (sender, receiver) = ipc::channel().unwrap();
-                            ipc_renderer
-                                .send(CanvasMsg::FromLayout(
-                                    FromLayoutMsg::SendData(sender),
-                                    canvas_fragment_info.canvas_id,
-                                ))
-                                .unwrap();
-                            receiver.recv().unwrap().image_key
-                        },
-                        None => return,
+                    CanvasFragmentSource::Image(ref ipc_renderer) => {
+                        let ipc_renderer = ipc_renderer.lock().unwrap();
+                        let (sender, receiver) = ipc::channel().unwrap();
+                        ipc_renderer
+                            .send(CanvasMsg::FromLayout(
+                                FromLayoutMsg::SendData(sender),
+                                canvas_fragment_info.canvas_id,
+                            ))
+                            .unwrap();
+                        receiver.recv().unwrap().image_key
                     },
+                    CanvasFragmentSource::Empty => return,
                 };
 
                 let base = create_base_display_item(state);

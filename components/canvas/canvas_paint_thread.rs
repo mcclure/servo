@@ -11,13 +11,12 @@ use canvas_traits::canvas::*;
 use canvas_traits::ConstellationCanvasMsg;
 use crossbeam_channel::{select, unbounded, Sender};
 use euclid::default::Size2D;
-use fonts::{FontCacheThread, FontContext};
+use fonts::{FontContext, SystemFontServiceProxy};
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use log::warn;
 use net_traits::ResourceThreads;
-use webrender_api::ImageKey;
-use webrender_traits::ImageUpdate;
+use webrender_traits::CrossProcessCompositorApi;
 
 use crate::canvas_data::*;
 
@@ -26,39 +25,36 @@ pub enum AntialiasMode {
     None,
 }
 
-pub trait WebrenderApi {
-    /// Attempt to generate an [`ImageKey`], returning `None` in case of failure.
-    fn generate_key(&self) -> Option<ImageKey>;
-    fn update_images(&self, updates: Vec<ImageUpdate>);
-    fn clone(&self) -> Box<dyn WebrenderApi>;
-}
-
 pub struct CanvasPaintThread<'a> {
     canvases: HashMap<CanvasId, CanvasData<'a>>,
     next_canvas_id: CanvasId,
-    webrender_api: Box<dyn WebrenderApi>,
-    font_context: Arc<FontContext<FontCacheThread>>,
+    compositor_api: CrossProcessCompositorApi,
+    font_context: Arc<FontContext>,
 }
 
 impl<'a> CanvasPaintThread<'a> {
     fn new(
-        webrender_api: Box<dyn WebrenderApi>,
-        font_cache_thread: FontCacheThread,
+        compositor_api: CrossProcessCompositorApi,
+        system_font_service: Arc<SystemFontServiceProxy>,
         resource_threads: ResourceThreads,
     ) -> CanvasPaintThread<'a> {
         CanvasPaintThread {
             canvases: HashMap::new(),
             next_canvas_id: CanvasId(0),
-            webrender_api,
-            font_context: Arc::new(FontContext::new(font_cache_thread, resource_threads)),
+            compositor_api: compositor_api.clone(),
+            font_context: Arc::new(FontContext::new(
+                system_font_service,
+                compositor_api,
+                resource_threads,
+            )),
         }
     }
 
     /// Creates a new `CanvasPaintThread` and returns an `IpcSender` to
     /// communicate with it.
     pub fn start(
-        webrender_api: Box<dyn WebrenderApi + Send>,
-        font_cache_thread: FontCacheThread,
+        compositor_api: CrossProcessCompositorApi,
+        system_font_service: Arc<SystemFontServiceProxy>,
         resource_threads: ResourceThreads,
     ) -> (Sender<ConstellationCanvasMsg>, IpcSender<CanvasMsg>) {
         let (ipc_sender, ipc_receiver) = ipc::channel::<CanvasMsg>().unwrap();
@@ -68,7 +64,7 @@ impl<'a> CanvasPaintThread<'a> {
             .name("Canvas".to_owned())
             .spawn(move || {
                 let mut canvas_paint_thread = CanvasPaintThread::new(
-                    webrender_api, font_cache_thread, resource_threads);
+                    compositor_api, system_font_service, resource_threads);
                 loop {
                     select! {
                         recv(msg_receiver) -> msg => {
@@ -134,7 +130,7 @@ impl<'a> CanvasPaintThread<'a> {
 
         let canvas_data = CanvasData::new(
             size,
-            self.webrender_api.clone(),
+            self.compositor_api.clone(),
             antialias,
             self.font_context.clone(),
         );

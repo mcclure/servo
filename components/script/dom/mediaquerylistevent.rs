@@ -53,19 +53,14 @@ impl MediaQueryListEvent {
         cancelable: bool,
         media: DOMString,
         matches: bool,
+        can_gc: CanGc,
     ) -> DomRoot<MediaQueryListEvent> {
         Self::new_with_proto(
-            global,
-            None,
-            type_,
-            bubbles,
-            cancelable,
-            media,
-            matches,
-            CanGc::note(),
+            global, None, type_, bubbles, cancelable, media, matches, can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -83,18 +78,19 @@ impl MediaQueryListEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl MediaQueryListEventMethods<crate::DomTypeHolder> for MediaQueryListEvent {
+    // https://drafts.csswg.org/cssom-view/#dom-mediaquerylistevent-mediaquerylistevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
         type_: DOMString,
         init: &MediaQueryListEventInit,
     ) -> Fallible<DomRoot<MediaQueryListEvent>> {
-        let global = window.upcast::<GlobalScope>();
         Ok(MediaQueryListEvent::new_with_proto(
-            global,
+            window.as_global_scope(),
             proto,
             Atom::from(type_),
             init.parent.bubbles,
@@ -104,9 +100,7 @@ impl MediaQueryListEvent {
             can_gc,
         ))
     }
-}
 
-impl MediaQueryListEventMethods for MediaQueryListEvent {
     // https://drafts.csswg.org/cssom-view/#dom-mediaquerylistevent-media
     fn Media(&self) -> DOMString {
         self.media.clone()

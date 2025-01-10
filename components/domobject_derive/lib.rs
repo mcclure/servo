@@ -5,8 +5,9 @@
 #![recursion_limit = "128"]
 
 use quote::{quote, TokenStreamExt};
-use syn::parse_quote;
 
+/// First field of DomObject must be either reflector or another dom_struct,
+/// all other fields must not implement DomObject
 #[proc_macro_derive(DomObject)]
 pub fn expand_token_stream(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse(input).unwrap();
@@ -34,7 +35,7 @@ fn expand_dom_object(input: syn::DeriveInput) -> proc_macro2::TokenStream {
 
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let mut items = quote! {
+    let items = quote! {
         impl #impl_generics ::js::conversions::ToJSValConvertible for #name #ty_generics #where_clause {
             #[allow(unsafe_code)]
             unsafe fn to_jsval(&self,
@@ -68,29 +69,43 @@ fn expand_dom_object(input: syn::DeriveInput) -> proc_macro2::TokenStream {
     };
 
     let mut params = proc_macro2::TokenStream::new();
-    params.append_separated(input.generics.type_params().map(|param| &param.ident), ", ");
+    params.append_separated(
+        input.generics.type_params().map(|param| &param.ident),
+        quote! {,},
+    );
 
-    // For each field in the struct, we implement ShouldNotImplDomObject for a
-    // pair of all the type parameters of the DomObject and and the field type.
-    // This allows us to support parameterized DOM objects
-    // such as IteratorIterable<T>.
-    items.append_all(field_types.iter().map(|ty| {
+    let mut dummy_items = quote! {
+        // Generic trait with a blanket impl over `()` for all types.
+        // becomes ambiguous if impl
+        trait NoDomObjectInDomObject<A> {
+            // Required for actually being able to reference the trait.
+            fn some_item() {}
+        }
+
+        impl<T: ?Sized> NoDomObjectInDomObject<()> for T {}
+
+        // Used for the specialized impl when DomObject is implemented.
+        #[allow(dead_code)]
+        struct Invalid;
+        // forbids DomObject
+        impl<T> NoDomObjectInDomObject<Invalid> for T where T: ?Sized + crate::DomObject {}
+    };
+
+    dummy_items.append_all(field_types.iter().enumerate().map(|(i, ty)| {
+        let s = syn::Ident::new(&format!("S{i}"), proc_macro2::Span::call_site());
         quote! {
-            impl #impl_generics ShouldNotImplDomObject for ((#params), #ty) #where_clause {}
+            struct #s<#params>(#params);
+
+            impl #impl_generics #s<#params> #where_clause {
+                fn f() {
+                    // If there is only one specialized trait impl, type inference with
+                    // `_` can be resolved and this can compile. Fails to compile if
+                    // ty implements `NoDomObjectInDomObject<Invalid>`.
+                    let _ = <#ty as NoDomObjectInDomObject<_>>::some_item;
+                }
+            }
         }
     }));
-
-    let mut generics = input.generics.clone();
-    generics.params.push(parse_quote!(
-        __T: crate::DomObject
-    ));
-
-    let (impl_generics, _, where_clause) = generics.split_for_impl();
-
-    items.append_all(quote! {
-        trait ShouldNotImplDomObject {}
-        impl #impl_generics ShouldNotImplDomObject for ((#params), __T) #where_clause {}
-    });
 
     let dummy_const = syn::Ident::new(
         &format!("_IMPL_DOMOBJECT_FOR_{}", name),
@@ -98,7 +113,8 @@ fn expand_dom_object(input: syn::DeriveInput) -> proc_macro2::TokenStream {
     );
     let tokens = quote! {
         #[allow(non_upper_case_globals)]
-        const #dummy_const: () = { #items };
+        const #dummy_const: () = { #dummy_items };
+        #items
     };
 
     tokens

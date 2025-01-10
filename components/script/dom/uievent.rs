@@ -9,15 +9,19 @@ use dom_struct::dom_struct;
 use js::rust::HandleObject;
 use servo_atoms::Atom;
 
+use super::node::NodeTraits;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::UIEventBinding;
 use crate::dom::bindings::codegen::Bindings::UIEventBinding::UIEventMethods;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::element::Element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
+use crate::dom::eventtarget::EventTarget;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
@@ -38,8 +42,8 @@ impl UIEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<UIEvent> {
-        Self::new_uninitialized_with_proto(window, None, CanGc::note())
+    pub fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<UIEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
@@ -57,19 +61,14 @@ impl UIEvent {
         cancelable: EventCancelable,
         view: Option<&Window>,
         detail: i32,
+        can_gc: CanGc,
     ) -> DomRoot<UIEvent> {
         Self::new_with_proto(
-            window,
-            None,
-            type_,
-            can_bubble,
-            cancelable,
-            view,
-            detail,
-            CanGc::note(),
+            window, None, type_, can_bubble, cancelable, view, detail, can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -81,18 +80,48 @@ impl UIEvent {
         can_gc: CanGc,
     ) -> DomRoot<UIEvent> {
         let ev = UIEvent::new_uninitialized_with_proto(window, proto, can_gc);
-        ev.InitUIEvent(
+        ev.initialize_ui_event(
             type_,
-            bool::from(can_bubble),
-            bool::from(cancelable),
-            view,
-            detail,
+            view.map(|window| window.upcast::<EventTarget>()),
+            can_bubble,
+            cancelable,
         );
+        ev.detail.set(detail);
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    /// <https://w3c.github.io/uievents/#initialize-a-uievent>
+    pub fn initialize_ui_event(
+        &self,
+        type_: DOMString,
+        target_: Option<&EventTarget>,
+        bubbles: EventBubbles,
+        cancelable: EventCancelable,
+    ) {
+        // 1. Initialize the base Event attributes:
+        self.event
+            .init_event(type_.into(), bool::from(bubbles), bool::from(cancelable));
+        self.event.set_target(target_);
+        // 2. Initialize view/detail:
+        if let Some(target_) = target_ {
+            let element = target_.downcast::<Element>();
+            let document = match element {
+                Some(element) => element.owner_document(),
+                None => target_.downcast::<Window>().unwrap().Document(),
+            };
+            self.view.set(Some(document.window()));
+        }
+        self.detail.set(0_i32);
+    }
+
+    pub fn set_detail(&self, detail_: i32) {
+        self.detail.set(detail_);
+    }
+}
+
+impl UIEventMethods<crate::DomTypeHolder> for UIEvent {
+    /// <https://w3c.github.io/uievents/#dom-uievent-uievent>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -113,9 +142,7 @@ impl UIEvent {
         );
         Ok(event)
     }
-}
 
-impl UIEventMethods for UIEvent {
     // https://w3c.github.io/uievents/#widl-UIEvent-view
     fn GetView(&self) -> Option<DomRoot<Window>> {
         self.view.get()

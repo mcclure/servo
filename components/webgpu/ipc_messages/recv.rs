@@ -9,14 +9,13 @@ use arrayvec::ArrayVec;
 use base::id::PipelineId;
 use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 use webrender_api::units::DeviceIntSize;
-use webrender_api::{ImageFormat, ImageKey};
+use webrender_api::ImageKey;
 use wgc::binding_model::{
     BindGroupDescriptor, BindGroupLayoutDescriptor, PipelineLayoutDescriptor,
 };
 use wgc::command::{
-    ImageCopyBuffer, ImageCopyTexture, RenderBundleDescriptor, RenderBundleEncoder,
+    RenderBundleDescriptor, RenderBundleEncoder, TexelCopyBufferInfo, TexelCopyTextureInfo,
 };
 use wgc::device::HostMap;
 use wgc::id;
@@ -26,14 +25,25 @@ use wgc::resource::{
     BufferDescriptor, SamplerDescriptor, TextureDescriptor, TextureViewDescriptor,
 };
 use wgpu_core::command::{RenderPassColorAttachment, RenderPassDepthStencilAttachment};
+use wgpu_core::id::AdapterId;
 use wgpu_core::Label;
 pub use {wgpu_core as wgc, wgpu_types as wgt};
 
 use crate::identity::*;
 use crate::render_commands::RenderCommand;
 use crate::swapchain::WebGPUContextId;
-use crate::{Error, ErrorFilter, WebGPUResponse, PRESENTATION_BUFFER_COUNT};
+use crate::{Error, ErrorFilter, Mapping, WebGPUResponse, PRESENTATION_BUFFER_COUNT};
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct ContextConfiguration {
+    pub device_id: id::DeviceId,
+    pub queue_id: id::QueueId,
+    pub format: wgt::TextureFormat,
+    pub is_opaque: bool,
+}
+
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, Deserialize, Serialize)]
 pub enum WebGPURequest {
     BufferMapAsync {
@@ -59,20 +69,20 @@ pub enum WebGPURequest {
     },
     CopyBufferToTexture {
         command_encoder_id: id::CommandEncoderId,
-        source: ImageCopyBuffer,
-        destination: ImageCopyTexture,
+        source: TexelCopyBufferInfo,
+        destination: TexelCopyTextureInfo,
         copy_size: wgt::Extent3d,
     },
     CopyTextureToBuffer {
         command_encoder_id: id::CommandEncoderId,
-        source: ImageCopyTexture,
-        destination: ImageCopyBuffer,
+        source: TexelCopyTextureInfo,
+        destination: TexelCopyBufferInfo,
         copy_size: wgt::Extent3d,
     },
     CopyTextureToTexture {
         command_encoder_id: id::CommandEncoderId,
-        source: ImageCopyTexture,
-        destination: ImageCopyTexture,
+        source: TexelCopyTextureInfo,
+        destination: TexelCopyTextureInfo,
         copy_size: wgt::Extent3d,
     },
     CreateBindGroup {
@@ -103,7 +113,6 @@ pub enum WebGPURequest {
         /// present only on ASYNC versions
         async_sender: Option<IpcSender<WebGPUResponse>>,
     },
-    CreateContext(IpcSender<WebGPUContextId>),
     CreatePipelineLayout {
         device_id: id::DeviceId,
         pipeline_layout_id: id::PipelineLayoutId,
@@ -129,14 +138,31 @@ pub enum WebGPURequest {
         label: Option<String>,
         sender: IpcSender<WebGPUResponse>,
     },
-    CreateSwapChain {
-        device_id: id::DeviceId,
-        queue_id: id::QueueId,
+    /// Creates context
+    CreateContext {
         buffer_ids: ArrayVec<id::BufferId, PRESENTATION_BUFFER_COUNT>,
-        context_id: WebGPUContextId,
-        sender: IpcSender<ImageKey>,
-        format: ImageFormat,
         size: DeviceIntSize,
+        sender: IpcSender<(WebGPUContextId, ImageKey)>,
+    },
+    /// Recreates swapchain (if needed)
+    UpdateContext {
+        context_id: WebGPUContextId,
+        size: DeviceIntSize,
+        configuration: Option<ContextConfiguration>,
+    },
+    /// Reads texture to swapchains buffer and maps it
+    SwapChainPresent {
+        context_id: WebGPUContextId,
+        texture_id: id::TextureId,
+        encoder_id: id::CommandEncoderId,
+    },
+    ValidateTextureDescriptor {
+        device_id: id::DeviceId,
+        texture_id: id::TextureId,
+        descriptor: TextureDescriptor<'static>,
+    },
+    DestroyContext {
+        context_id: WebGPUContextId,
     },
     CreateTexture {
         device_id: id::DeviceId,
@@ -151,14 +177,7 @@ pub enum WebGPURequest {
     },
     DestroyBuffer(id::BufferId),
     DestroyDevice(id::DeviceId),
-    DestroyTexture {
-        device_id: id::DeviceId,
-        texture_id: id::TextureId,
-    },
-    DestroySwapChain {
-        context_id: WebGPUContextId,
-        image_key: ImageKey,
-    },
+    DestroyTexture(id::TextureId),
     DropTexture(id::TextureId),
     DropAdapter(id::AdapterId),
     DropDevice(id::DeviceId),
@@ -186,7 +205,7 @@ pub enum WebGPURequest {
     RequestAdapter {
         sender: IpcSender<WebGPUResponse>,
         options: RequestAdapterOptions,
-        ids: SmallVec<[id::AdapterId; 4]>,
+        adapter_id: AdapterId,
     },
     RequestDevice {
         sender: IpcSender<WebGPUResponse>,
@@ -257,17 +276,10 @@ pub enum WebGPURequest {
         queue_id: id::QueueId,
         command_buffers: Vec<id::CommandBufferId>,
     },
-    SwapChainPresent {
-        context_id: WebGPUContextId,
-        texture_id: id::TextureId,
-        encoder_id: id::CommandEncoderId,
-    },
     UnmapBuffer {
         buffer_id: id::BufferId,
-        array_buffer: IpcSharedMemory,
-        write_back: bool,
-        offset: u64,
-        size: u64,
+        /// Return back mapping for writeback
+        mapping: Option<Mapping>,
     },
     WriteBuffer {
         device_id: id::DeviceId,
@@ -279,15 +291,14 @@ pub enum WebGPURequest {
     WriteTexture {
         device_id: id::DeviceId,
         queue_id: id::QueueId,
-        texture_cv: ImageCopyTexture,
-        data_layout: wgt::ImageDataLayout,
+        texture_cv: TexelCopyTextureInfo,
+        data_layout: wgt::TexelCopyBufferLayout,
         size: wgt::Extent3d,
         data: IpcSharedMemory,
     },
     QueueOnSubmittedWorkDone {
         sender: IpcSender<WebGPUResponse>,
         queue_id: id::QueueId,
-        device_id: id::DeviceId,
     },
     PushErrorScope {
         device_id: id::DeviceId,

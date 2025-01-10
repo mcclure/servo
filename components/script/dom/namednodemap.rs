@@ -15,6 +15,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::xmlname::namespace_from_domstring;
 use crate::dom::element::Element;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct NamedNodeMap {
@@ -31,11 +32,15 @@ impl NamedNodeMap {
     }
 
     pub fn new(window: &Window, elem: &Element) -> DomRoot<NamedNodeMap> {
-        reflect_dom_object(Box::new(NamedNodeMap::new_inherited(elem)), window)
+        reflect_dom_object(
+            Box::new(NamedNodeMap::new_inherited(elem)),
+            window,
+            CanGc::note(),
+        )
     }
 }
 
-impl NamedNodeMapMethods for NamedNodeMap {
+impl NamedNodeMapMethods<crate::DomTypeHolder> for NamedNodeMap {
     // https://dom.spec.whatwg.org/#dom-namednodemap-length
     fn Length(&self) -> u32 {
         self.owner.attrs().len() as u32

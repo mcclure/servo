@@ -5,15 +5,14 @@
 //! Definition of Window.
 //! Implemented by headless and headed windows.
 
+use std::rc::Rc;
+
 use euclid::{Length, Scale};
 use servo::compositing::windowing::{EmbedderEvent, WindowMethods};
 use servo::config::opts;
 use servo::embedder_traits::Cursor;
 use servo::servo_geometry::DeviceIndependentPixel;
-use servo::style_traits::DevicePixel;
-use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize};
-
-use super::events_loop::WakerEvent;
+use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize, DevicePixel};
 
 // This should vary by zoom level and maybe actual text size (focused or under cursor)
 pub const LINE_HEIGHT: f32 = 38.0;
@@ -43,8 +42,8 @@ pub trait WindowPortsMethods: WindowMethods {
     fn set_cursor(&self, _cursor: Cursor) {}
     fn new_glwindow(
         &self,
-        events_loop: &winit::event_loop::EventLoopWindowTarget<WakerEvent>,
-    ) -> Box<dyn webxr::glwindow::GlWindow>;
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> Rc<dyn webxr::glwindow::GlWindow>;
     fn winit_window(&self) -> Option<&winit::window::Window>;
     fn toolbar_height(&self) -> Length<f32, DeviceIndependentPixel>;
     fn set_toolbar_height(&self, height: Length<f32, DeviceIndependentPixel>);

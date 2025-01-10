@@ -8,7 +8,8 @@ use std::os::raw::c_void;
 use std::rc::Rc;
 
 use ipc_channel::ipc::IpcSender;
-use log::{debug, info, warn};
+use keyboard_types::{CompositionEvent, CompositionState};
+use log::{debug, error, info, warn};
 use servo::base::id::WebViewId;
 use servo::compositing::windowing::{
     AnimationState, EmbedderCoordinates, EmbedderEvent, EmbedderMethods, MouseWindowEvent,
@@ -18,15 +19,16 @@ use servo::embedder_traits::{
     ContextMenuResult, EmbedderMsg, EmbedderProxy, EventLoopWaker, MediaSessionEvent,
     PermissionPrompt, PermissionRequest, PromptDefinition, PromptOrigin, PromptResult,
 };
-use servo::euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use servo::euclid::{Box2D, Point2D, Rect, Scale, Size2D, Vector2D};
 use servo::keyboard_types::{Key, KeyState, KeyboardEvent};
 use servo::script_traits::{
     MediaSessionActionType, MouseButton, TouchEventType, TouchId, TraversalDirection,
 };
-use servo::style_traits::DevicePixel;
+use servo::servo_geometry::DeviceIndependentPixel;
+use servo::webrender_api::units::DevicePixel;
 use servo::webrender_api::ScrollLocation;
 use servo::webrender_traits::RenderingContext;
-use servo::{gl, Servo, TopLevelBrowsingContextId};
+use servo::{Servo, TopLevelBrowsingContextId};
 
 use crate::egl::host_trait::HostTrait;
 
@@ -55,22 +57,19 @@ impl Coordinates {
 pub(super) struct ServoWindowCallbacks {
     host_callbacks: Box<dyn HostTrait>,
     coordinates: RefCell<Coordinates>,
-    density: f32,
-    rendering_context: RenderingContext,
+    hidpi_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
 }
 
 impl ServoWindowCallbacks {
     pub(super) fn new(
         host_callbacks: Box<dyn HostTrait>,
         coordinates: RefCell<Coordinates>,
-        density: f32,
-        rendering_context: RenderingContext,
+        hidpi_factor: f32,
     ) -> Self {
         Self {
             host_callbacks,
             coordinates,
-            density,
-            rendering_context,
+            hidpi_factor: Scale::new(hidpi_factor),
         }
     }
 }
@@ -85,6 +84,7 @@ pub struct ServoGlue {
     need_present: bool,
     callbacks: Rc<ServoWindowCallbacks>,
     events: Vec<EmbedderEvent>,
+    resource_dir: Option<String>,
     context_menu_sender: Option<IpcSender<ContextMenuResult>>,
 
     /// List of top-level browsing contexts.
@@ -106,6 +106,7 @@ impl ServoGlue {
         rendering_context: RenderingContext,
         servo: Servo<ServoWindowCallbacks>,
         callbacks: Rc<ServoWindowCallbacks>,
+        resource_dir: Option<String>,
     ) -> Self {
         Self {
             rendering_context,
@@ -114,6 +115,7 @@ impl ServoGlue {
             need_present: false,
             callbacks,
             events: vec![],
+            resource_dir,
             context_menu_sender: None,
             webviews: HashMap::default(),
             creation_order: vec![],
@@ -150,7 +152,7 @@ impl ServoGlue {
     /// to act on its pending events.
     pub fn perform_updates(&mut self) -> Result<(), &'static str> {
         debug!("perform_updates");
-        let events = mem::replace(&mut self.events, Vec::new());
+        let events = mem::take(&mut self.events);
         self.servo.handle_events(events);
         let r = self.handle_servo_events();
         debug!("done perform_updates");
@@ -269,7 +271,7 @@ impl ServoGlue {
         let event = EmbedderEvent::Touch(
             TouchEventType::Down,
             TouchId(pointer_id),
-            Point2D::new(x as f32, y as f32),
+            Point2D::new(x, y),
         );
         self.process_event(event)
     }
@@ -279,18 +281,15 @@ impl ServoGlue {
         let event = EmbedderEvent::Touch(
             TouchEventType::Move,
             TouchId(pointer_id),
-            Point2D::new(x as f32, y as f32),
+            Point2D::new(x, y),
         );
         self.process_event(event)
     }
 
     /// Touch event: Lift touching finger
     pub fn touch_up(&mut self, x: f32, y: f32, pointer_id: i32) -> Result<(), &'static str> {
-        let event = EmbedderEvent::Touch(
-            TouchEventType::Up,
-            TouchId(pointer_id),
-            Point2D::new(x as f32, y as f32),
-        );
+        let event =
+            EmbedderEvent::Touch(TouchEventType::Up, TouchId(pointer_id), Point2D::new(x, y));
         self.process_event(event)
     }
 
@@ -299,7 +298,7 @@ impl ServoGlue {
         let event = EmbedderEvent::Touch(
             TouchEventType::Cancel,
             TouchId(pointer_id),
-            Point2D::new(x as f32, y as f32),
+            Point2D::new(x, y),
         );
         self.process_event(event)
     }
@@ -367,6 +366,13 @@ impl ServoGlue {
             ..KeyboardEvent::default()
         };
         self.process_event(EmbedderEvent::Keyboard(key_event))
+    }
+
+    pub fn ime_insert_text(&mut self, text: String) -> Result<(), &'static str> {
+        self.process_event(EmbedderEvent::IMEComposition(CompositionEvent {
+            state: CompositionState::End,
+            data: text,
+        }))
     }
 
     pub fn pause_compositor(&mut self) -> Result<(), &'static str> {
@@ -491,7 +497,8 @@ impl ServoGlue {
                     let trusted = origin == PromptOrigin::Trusted;
                     let res = match definition {
                         PromptDefinition::Alert(message, sender) => {
-                            sender.send(cb.prompt_alert(message, trusted))
+                            cb.prompt_alert(message, trusted);
+                            sender.send(())
                         },
                         PromptDefinition::OkCancel(message, sender) => {
                             sender.send(cb.prompt_ok_cancel(message, trusted))
@@ -501,6 +508,10 @@ impl ServoGlue {
                         },
                         PromptDefinition::Input(message, default, sender) => {
                             sender.send(cb.prompt_input(message, default, trusted))
+                        },
+                        PromptDefinition::Credentials(_) => {
+                            warn!("implement credentials prompt for OpenHarmony OS and Android");
+                            Ok(())
                         },
                     };
                     if let Err(e) = res {
@@ -535,6 +546,8 @@ impl ServoGlue {
                 },
                 EmbedderMsg::WebViewFocused(webview_id) => {
                     self.focused_webview_id = Some(webview_id);
+                    self.events
+                        .push(EmbedderEvent::ShowWebView(webview_id, true));
                 },
                 EmbedderMsg::WebViewBlurred => {
                     self.focused_webview_id = None;
@@ -614,11 +627,13 @@ impl ServoGlue {
                 EmbedderMsg::ReadyToPresent(_webview_ids) => {
                     self.need_present = true;
                 },
+                EmbedderMsg::Keyboard(..) => {
+                    error!("Received unexpected keyboard event");
+                },
                 EmbedderMsg::Status(..) |
                 EmbedderMsg::SelectFiles(..) |
                 EmbedderMsg::MoveTo(..) |
                 EmbedderMsg::ResizeTo(..) |
-                EmbedderMsg::Keyboard(..) |
                 EmbedderMsg::SetCursor(..) |
                 EmbedderMsg::NewFavicon(..) |
                 EmbedderMsg::HeadParsed |
@@ -646,21 +661,19 @@ impl ServoGlue {
 
 pub(super) struct ServoEmbedderCallbacks {
     waker: Box<dyn EventLoopWaker>,
+    #[cfg(feature = "webxr")]
     xr_discovery: Option<webxr::Discovery>,
-    #[allow(unused)]
-    gl: Rc<dyn gl::Gl>,
 }
 
 impl ServoEmbedderCallbacks {
     pub(super) fn new(
         waker: Box<dyn EventLoopWaker>,
-        xr_discovery: Option<webxr::Discovery>,
-        gl: Rc<dyn gl::Gl>,
+        #[cfg(feature = "webxr")] xr_discovery: Option<webxr::Discovery>,
     ) -> Self {
         Self {
             waker,
+            #[cfg(feature = "webxr")]
             xr_discovery,
-            gl,
         }
     }
 }
@@ -671,6 +684,7 @@ impl EmbedderMethods for ServoEmbedderCallbacks {
         self.waker.clone()
     }
 
+    #[cfg(feature = "webxr")]
     fn register_webxr(
         &mut self,
         registry: &mut webxr::MainThreadRegistry,
@@ -686,13 +700,14 @@ impl EmbedderMethods for ServoEmbedderCallbacks {
 impl WindowMethods for ServoWindowCallbacks {
     fn get_coordinates(&self) -> EmbedderCoordinates {
         let coords = self.coordinates.borrow();
+        let screen_size = (coords.viewport.size.to_f32() / self.hidpi_factor).to_i32();
         EmbedderCoordinates {
             viewport: coords.viewport.to_box2d(),
             framebuffer: coords.framebuffer,
-            window: (coords.viewport.size, Point2D::new(0, 0)),
-            screen: coords.viewport.size,
-            screen_avail: coords.viewport.size,
-            hidpi_factor: Scale::new(self.density),
+            window_rect: Box2D::from_origin_and_size(Point2D::zero(), screen_size),
+            screen_size,
+            available_screen_size: screen_size,
+            hidpi_factor: self.hidpi_factor,
         }
     }
 
@@ -700,9 +715,5 @@ impl WindowMethods for ServoWindowCallbacks {
         debug!("WindowMethods::set_animation_state: {:?}", state);
         self.host_callbacks
             .on_animating_changed(state == AnimationState::Animating);
-    }
-
-    fn rendering_context(&self) -> RenderingContext {
-        self.rendering_context.clone()
     }
 }

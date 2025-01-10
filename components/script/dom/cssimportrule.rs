@@ -16,6 +16,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct CSSImportRule {
@@ -45,6 +46,7 @@ impl CSSImportRule {
         reflect_dom_object(
             Box::new(Self::new_inherited(parent_stylesheet, import_rule)),
             window,
+            CanGc::note(),
         )
     }
 }
@@ -63,7 +65,7 @@ impl SpecificCSSRule for CSSImportRule {
     }
 }
 
-impl CSSImportRuleMethods for CSSImportRule {
+impl CSSImportRuleMethods<crate::DomTypeHolder> for CSSImportRule {
     /// <https://drafts.csswg.org/cssom-1/#dom-cssimportrule-layername>
     fn GetLayerName(&self) -> Option<DOMString> {
         let guard = self.cssrule.shared_lock().read();

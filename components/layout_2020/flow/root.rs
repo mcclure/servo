@@ -28,8 +28,9 @@ use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::FragmentTree;
 use crate::geom::{LogicalVec2, PhysicalPoint, PhysicalRect, PhysicalSize};
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
-use crate::replaced::ReplacedContent;
+use crate::replaced::ReplacedContents;
 use crate::style_ext::{ComputedValuesExt, Display, DisplayGeneratingBox, DisplayInside};
+use crate::taffy::{TaffyItemBox, TaffyItemBoxInner};
 use crate::DefiniteContainingBlock;
 
 #[derive(Serialize)]
@@ -127,6 +128,7 @@ impl BoxTree {
             AbsolutelyPositionedBlockLevelBox(ArcRefCell<BlockLevelBox>),
             AbsolutelyPositionedInlineLevelBox(ArcRefCell<InlineItem>, usize),
             AbsolutelyPositionedFlexLevelBox(ArcRefCell<FlexLevelBox>),
+            AbsolutelyPositionedTaffyLevelBox(ArcRefCell<TaffyItemBox>),
         }
 
         fn update_point<'dom, Node>(
@@ -183,7 +185,6 @@ impl BoxTree {
                         },
                         _ => return None,
                     },
-                    LayoutBox::InlineBox(_) => return None,
                     LayoutBox::InlineLevel(inline_level_box) => match &*inline_level_box.borrow() {
                         InlineItem::OutOfFlowAbsolutelyPositionedBox(_, text_offset_index)
                             if box_style.position.is_absolutely_positioned() =>
@@ -203,13 +204,24 @@ impl BoxTree {
                         },
                         _ => return None,
                     },
+                    LayoutBox::TaffyItemBox(taffy_level_box) => match &taffy_level_box
+                        .borrow()
+                        .taffy_level_box
+                    {
+                        TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(_)
+                            if box_style.position.is_absolutely_positioned() =>
+                        {
+                            UpdatePoint::AbsolutelyPositionedTaffyLevelBox(taffy_level_box.clone())
+                        },
+                        _ => return None,
+                    },
                 };
             Some((primary_style.clone(), display_inside, update_point))
         }
 
         loop {
             if let Some((primary_style, display_inside, update_point)) = update_point(dirty_node) {
-                let contents = ReplacedContent::for_element(dirty_node, context)
+                let contents = ReplacedContents::for_element(dirty_node, context)
                     .map_or_else(|| NonReplacedContents::OfElement.into(), Contents::Replaced);
                 let info = NodeAndStyleInfo::new(dirty_node, Arc::clone(&primary_style));
                 let out_of_flow_absolutely_positioned_box = ArcRefCell::new(
@@ -235,6 +247,12 @@ impl BoxTree {
                     UpdatePoint::AbsolutelyPositionedFlexLevelBox(flex_level_box) => {
                         *flex_level_box.borrow_mut() =
                             FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(
+                                out_of_flow_absolutely_positioned_box,
+                            );
+                    },
+                    UpdatePoint::AbsolutelyPositionedTaffyLevelBox(taffy_level_box) => {
+                        taffy_level_box.borrow_mut().taffy_level_box =
+                            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(
                                 out_of_flow_absolutely_positioned_box,
                             );
                     },
@@ -271,7 +289,7 @@ fn construct_for_root_element<'dom>(
         Display::GeneratingBox(display_generating_box) => display_generating_box.display_inside(),
     };
 
-    let contents = ReplacedContent::for_element(root_element, context)
+    let contents = ReplacedContents::for_element(root_element, context)
         .map_or_else(|| NonReplacedContents::OfElement.into(), Contents::Replaced);
     let root_box = if box_style.position.is_absolutely_positioned() {
         BlockLevelBox::OutOfFlowAbsolutelyPositionedBox(ArcRefCell::new(

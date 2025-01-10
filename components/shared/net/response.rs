@@ -8,13 +8,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use headers::{ContentType, HeaderMapExt};
-use http::{HeaderMap, StatusCode};
+use http::HeaderMap;
 use hyper_serde::Serde;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 
+use crate::http_status::HttpStatus;
 use crate::{
     FetchMetadata, FilteredMetadata, Metadata, NetworkError, ReferrerPolicy, ResourceFetchTiming,
     ResourceTimingType,
@@ -95,10 +96,7 @@ pub struct Response {
     pub termination_reason: Option<TerminationReason>,
     url: Option<ServoUrl>,
     pub url_list: Vec<ServoUrl>,
-    /// `None` can be considered a StatusCode of `0`.
-    #[ignore_malloc_size_of = "Defined in hyper"]
-    pub status: Option<(StatusCode, String)>,
-    pub raw_status: Option<(u16, Vec<u8>)>,
+    pub status: HttpStatus,
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
     #[ignore_malloc_size_of = "Mutex heap size undefined"]
@@ -106,7 +104,7 @@ pub struct Response {
     pub cache_state: CacheState,
     pub https_state: HttpsState,
     pub referrer: Option<ServoUrl>,
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     /// [CORS-exposed header-name list](https://fetch.spec.whatwg.org/#concept-response-cors-exposed-header-name-list)
     pub cors_exposed_header_name_list: Vec<String>,
     /// [Location URL](https://fetch.spec.whatwg.org/#concept-response-location-url)
@@ -131,14 +129,13 @@ impl Response {
             termination_reason: None,
             url: Some(url),
             url_list: vec![],
-            status: Some((StatusCode::OK, "".to_string())),
-            raw_status: Some((200, b"".to_vec())),
+            status: HttpStatus::default(),
             headers: HeaderMap::new(),
             body: Arc::new(Mutex::new(ResponseBody::Empty)),
             cache_state: CacheState::None,
             https_state: HttpsState::None,
             referrer: None,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             cors_exposed_header_name_list: vec![],
             location_url: None,
             internal_response: None,
@@ -153,9 +150,7 @@ impl Response {
         res.location_url = init.location_url;
         res.headers = init.headers;
         res.referrer = init.referrer;
-        res.status = StatusCode::from_u16(init.status_code)
-            .map(|s| (s, s.to_string()))
-            .ok();
+        res.status = HttpStatus::new_raw(init.status_code, vec![]);
         res
     }
 
@@ -165,14 +160,13 @@ impl Response {
             termination_reason: None,
             url: None,
             url_list: vec![],
-            status: None,
-            raw_status: None,
+            status: HttpStatus::new_error(),
             headers: HeaderMap::new(),
             body: Arc::new(Mutex::new(ResponseBody::Empty)),
             cache_state: CacheState::None,
             https_state: HttpsState::None,
             referrer: None,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             cors_exposed_header_name_list: vec![],
             location_url: None,
             internal_response: None,
@@ -267,7 +261,7 @@ impl Response {
             ResponseType::Cors => {
                 let headers = old_headers.iter().filter(|(name, _)| {
                     match &*name.as_str().to_ascii_lowercase() {
-                        "cache-control" | "content-language" | "content-type" |
+                        "cache-control" | "content-language" | "content-length" | "content-type" |
                         "expires" | "last-modified" | "pragma" => true,
                         "set-cookie" | "set-cookie2" => false,
                         header => {
@@ -282,14 +276,14 @@ impl Response {
                 response.url_list = vec![];
                 response.url = None;
                 response.headers = HeaderMap::new();
-                response.status = None;
+                response.status = HttpStatus::new_error();
                 response.body = Arc::new(Mutex::new(ResponseBody::Empty));
                 response.cache_state = CacheState::None;
             },
 
             ResponseType::OpaqueRedirect => {
                 response.headers = HeaderMap::new();
-                response.status = None;
+                response.status = HttpStatus::new_error();
                 response.body = Arc::new(Mutex::new(ResponseBody::Empty));
                 response.cache_state = CacheState::None;
             },
@@ -310,7 +304,7 @@ impl Response {
             );
             metadata.location_url.clone_from(&response.location_url);
             metadata.headers = Some(Serde(response.headers.clone()));
-            metadata.status.clone_from(&response.raw_status);
+            metadata.status.clone_from(&response.status);
             metadata.https_state = response.https_state;
             metadata.referrer.clone_from(&response.referrer);
             metadata.referrer_policy = response.referrer_policy;

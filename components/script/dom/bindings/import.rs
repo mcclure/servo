@@ -19,12 +19,13 @@ pub mod base {
 
     pub use crate::dom::bindings::callback::{
         wrap_call_this_object, CallSetup, CallbackContainer, CallbackFunction, CallbackInterface,
-        CallbackObject, ExceptionHandling,
+        CallbackObject, ExceptionHandling, ThisReflector,
     };
     pub use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
         ChannelCountMode, ChannelCountModeValues, ChannelInterpretation,
         ChannelInterpretationValues,
     };
+    pub use crate::dom::bindings::codegen::DomTypes::DomTypes;
     pub use crate::dom::bindings::codegen::UnionTypes;
     pub use crate::dom::bindings::conversions::{
         root_from_handlevalue, ConversionBehavior, ConversionResult, FromJSValConvertible,
@@ -33,11 +34,14 @@ pub mod base {
     pub use crate::dom::bindings::error::Error::JSFailed;
     pub use crate::dom::bindings::error::{throw_dom_exception, Fallible};
     pub use crate::dom::bindings::num::Finite;
+    pub use crate::dom::bindings::proxyhandler::CrossOriginProperties;
     pub use crate::dom::bindings::reflector::DomObject;
     pub use crate::dom::bindings::root::DomRoot;
     pub use crate::dom::bindings::str::{ByteString, DOMString, USVString};
     pub use crate::dom::bindings::trace::RootedTraceableBox;
-    pub use crate::dom::bindings::utils::{get_dictionary_property, set_dictionary_property};
+    pub use crate::dom::bindings::utils::{
+        get_dictionary_property, set_dictionary_property, ThreadUnsafeOnceLock,
+    };
     pub use crate::dom::globalscope::GlobalScope;
     pub use crate::script_runtime::JSContext as SafeJSContext;
 }
@@ -83,7 +87,7 @@ pub mod module {
     };
     pub use js::rust::{
         get_context_realm, get_object_class, get_object_realm, CustomAutoRooterGuard, GCMethods,
-        Handle, MutableHandle, RootedGuard,
+        Handle, MutableHandle,
     };
     pub use js::typedarray::{
         ArrayBuffer, ArrayBufferView, Float32Array, Float64Array, Uint8Array, Uint8ClampedArray,
@@ -103,6 +107,10 @@ pub mod module {
     pub use crate::dom::bindings::codegen::Bindings::EventTargetBinding::EventTarget_Binding;
     pub use crate::dom::bindings::codegen::{InterfaceObjectMap, PrototypeList, RegisterBindings};
     pub use crate::dom::bindings::constant::{ConstantSpec, ConstantVal};
+    pub use crate::dom::bindings::constructor::{
+        call_default_constructor, call_html_constructor, pop_current_element_queue,
+        push_new_element_queue,
+    };
     pub use crate::dom::bindings::conversions::{
         is_array_like, jsid_to_string, native_from_handlevalue, native_from_object_static,
         IDLInterface, StringificationBehavior, ToJSValConvertible, DOM_OBJECT_SLOT,
@@ -112,9 +120,6 @@ pub mod module {
         finalize_common, finalize_global, finalize_weak_referenceable,
     };
     pub use crate::dom::bindings::guard::{Condition, Guard};
-    pub use crate::dom::bindings::htmlconstructor::{
-        pop_current_element_queue, push_new_element_queue,
-    };
     pub use crate::dom::bindings::inheritance::Castable;
     pub use crate::dom::bindings::interface::{
         create_callback_interface_object, create_global_object, create_interface_prototype_object,

@@ -7,7 +7,7 @@ use std::convert::TryInto;
 use std::sync::LazyLock;
 
 use dom_struct::dom_struct;
-use js::jsval::JSVal;
+use js::rust::MutableHandleValue;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
@@ -19,7 +19,6 @@ use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::bluetooth::Bluetooth;
 use crate::dom::gamepad::Gamepad;
 use crate::dom::gamepadevent::GamepadEventType;
-use crate::dom::gpu::GPU;
 use crate::dom::mediadevices::MediaDevices;
 use crate::dom::mediasession::MediaSession;
 use crate::dom::mimetypearray::MimeTypeArray;
@@ -27,9 +26,12 @@ use crate::dom::navigatorinfo;
 use crate::dom::permissions::Permissions;
 use crate::dom::pluginarray::PluginArray;
 use crate::dom::serviceworkercontainer::ServiceWorkerContainer;
+#[cfg(feature = "webgpu")]
+use crate::dom::webgpu::gpu::GPU;
 use crate::dom::window::Window;
+#[cfg(feature = "webxr")]
 use crate::dom::xrsystem::XRSystem;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 pub(super) fn hardware_concurrency() -> u64 {
     static CPUS: LazyLock<u64> = LazyLock::new(|| num_cpus::get().try_into().unwrap_or(1));
@@ -44,12 +46,14 @@ pub struct Navigator {
     plugins: MutNullableDom<PluginArray>,
     mime_types: MutNullableDom<MimeTypeArray>,
     service_worker: MutNullableDom<ServiceWorkerContainer>,
+    #[cfg(feature = "webxr")]
     xr: MutNullableDom<XRSystem>,
     mediadevices: MutNullableDom<MediaDevices>,
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepads>
     gamepads: DomRefCell<Vec<MutNullableDom<Gamepad>>>,
     permissions: MutNullableDom<Permissions>,
     mediasession: MutNullableDom<MediaSession>,
+    #[cfg(feature = "webgpu")]
     gpu: MutNullableDom<GPU>,
     /// <https://www.w3.org/TR/gamepad/#dfn-hasgamepadgesture>
     has_gamepad_gesture: Cell<bool>,
@@ -63,20 +67,23 @@ impl Navigator {
             plugins: Default::default(),
             mime_types: Default::default(),
             service_worker: Default::default(),
+            #[cfg(feature = "webxr")]
             xr: Default::default(),
             mediadevices: Default::default(),
             gamepads: Default::default(),
             permissions: Default::default(),
             mediasession: Default::default(),
+            #[cfg(feature = "webgpu")]
             gpu: Default::default(),
             has_gamepad_gesture: Cell::new(false),
         }
     }
 
     pub fn new(window: &Window) -> DomRoot<Navigator> {
-        reflect_dom_object(Box::new(Navigator::new_inherited()), window)
+        reflect_dom_object(Box::new(Navigator::new_inherited()), window, CanGc::note())
     }
 
+    #[cfg(feature = "webxr")]
     pub fn xr(&self) -> Option<DomRoot<XRSystem>> {
         self.xr.get()
     }
@@ -85,14 +92,14 @@ impl Navigator {
         self.gamepads.borrow().get(index).and_then(|g| g.get())
     }
 
-    pub fn set_gamepad(&self, index: usize, gamepad: &Gamepad) {
+    pub fn set_gamepad(&self, index: usize, gamepad: &Gamepad, can_gc: CanGc) {
         if let Some(gamepad_to_set) = self.gamepads.borrow().get(index) {
             gamepad_to_set.set(Some(gamepad));
         }
         if self.has_gamepad_gesture.get() {
             gamepad.set_exposed(true);
             if self.global().as_window().Document().is_fully_active() {
-                gamepad.notify_event(GamepadEventType::Connected);
+                gamepad.notify_event(GamepadEventType::Connected, can_gc);
             }
         }
     }
@@ -136,7 +143,7 @@ impl Navigator {
     }
 }
 
-impl NavigatorMethods for Navigator {
+impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     // https://html.spec.whatwg.org/multipage/#dom-navigator-product
     fn Product(&self) -> DOMString {
         navigatorinfo::Product()
@@ -199,8 +206,8 @@ impl NavigatorMethods for Navigator {
 
     // https://html.spec.whatwg.org/multipage/#dom-navigator-languages
     #[allow(unsafe_code)]
-    fn Languages(&self, cx: JSContext) -> JSVal {
-        to_frozen_array(&[self.Language()], cx)
+    fn Languages(&self, cx: JSContext, retval: MutableHandleValue) {
+        to_frozen_array(&[self.Language()], cx, retval)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-navigator-plugins
@@ -250,6 +257,7 @@ impl NavigatorMethods for Navigator {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-navigator-xr>
+    #[cfg(feature = "webxr")]
     fn Xr(&self) -> DomRoot<XRSystem> {
         self.xr.or_init(|| XRSystem::new(self.global().as_window()))
     }
@@ -277,6 +285,7 @@ impl NavigatorMethods for Navigator {
     }
 
     // https://gpuweb.github.io/gpuweb/#dom-navigator-gpu
+    #[cfg(feature = "webgpu")]
     fn Gpu(&self) -> DomRoot<GPU> {
         self.gpu.or_init(|| GPU::new(&self.global()))
     }

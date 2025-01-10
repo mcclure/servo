@@ -4,8 +4,7 @@
 #![allow(unused_imports)]
 use core::ffi::c_void;
 use std::cell::Cell;
-use std::fs::{create_dir_all, read_to_string, File};
-use std::io::{Read, Seek, Write};
+use std::fs::read_to_string;
 use std::path::PathBuf;
 use std::process::Command;
 use std::ptr;
@@ -18,11 +17,11 @@ use dom_struct::dom_struct;
 use encoding_rs::Encoding;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use js::jsval::UndefinedValue;
 use js::rust::{transform_str_to_source_text, CompileOptionsWrapper, HandleObject, Stencil};
+use net_traits::http_status::HttpStatus;
 use net_traits::request::{
-    CorsSettings, CredentialsMode, Destination, ParserMetadata, RequestBuilder,
+    CorsSettings, CredentialsMode, Destination, ParserMetadata, RequestBuilder, RequestId,
 };
 use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ResourceFetchTiming,
@@ -35,6 +34,7 @@ use style::str::{StaticStringVec, HTML_SPACE_CHARACTERS};
 use uuid::Uuid;
 
 use crate::document_loader::LoadType;
+use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLScriptElementBinding::HTMLScriptElementMethods;
@@ -55,9 +55,7 @@ use crate::dom::element::{
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{
-    document_from_node, window_from_node, BindContext, ChildrenMutation, CloneChildrenFlag, Node,
-};
+use crate::dom::node::{ChildrenMutation, CloneChildrenFlag, Node, NodeTraits};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::create_a_potential_cors_request;
@@ -67,9 +65,36 @@ use crate::script_module::{
     fetch_external_module_script, fetch_inline_module_script, ModuleOwner, ScriptFetchOptions,
 };
 use crate::script_runtime::CanGc;
-use crate::task::TaskCanceller;
-use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
-use crate::task_source::{TaskSource, TaskSourceName};
+use crate::task_source::{SendableTaskSource, TaskSourceName};
+use crate::unminify::{unminify_js, ScriptSource};
+use crate::HasParent;
+
+impl ScriptSource for ScriptOrigin {
+    fn unminified_dir(&self) -> Option<String> {
+        self.unminified_dir.clone()
+    }
+
+    fn extract_bytes(&self) -> &[u8] {
+        match &self.code {
+            SourceCode::Text(text) => text.as_bytes(),
+            SourceCode::Compiled(compiled_source_code) => {
+                compiled_source_code.original_text.as_bytes()
+            },
+        }
+    }
+
+    fn rewrite_source(&mut self, source: Rc<DOMString>) {
+        self.code = SourceCode::Text(source);
+    }
+
+    fn url(&self) -> ServoUrl {
+        self.url.clone()
+    }
+
+    fn is_external(&self) -> bool {
+        self.external
+    }
+}
 
 // TODO Implement offthread compilation in mozjs
 /*pub struct OffThreadCompilationContext {
@@ -77,8 +102,7 @@ use crate::task_source::{TaskSource, TaskSourceName};
     script_kind: ExternalScriptKind,
     final_url: ServoUrl,
     url: ServoUrl,
-    task_source: DOMManipulationTaskSource,
-    canceller: TaskCanceller,
+    task_source: TaskSource,
     script_text: String,
     fetch_options: ScriptFetchOptions,
 }
@@ -99,7 +123,7 @@ unsafe extern "C" fn off_thread_compilation_callback(
     let fetch_options = context.fetch_options.clone();
 
     // Continue with <https://html.spec.whatwg.org/multipage/#fetch-a-classic-script>
-    let _ = context.task_source.queue_with_canceller(
+    let _ = context.task_source.queue(
         task!(off_thread_compile_continue: move || {
             let elem = script_element.root();
             let global = elem.global();
@@ -133,8 +157,7 @@ unsafe extern "C" fn off_thread_compilation_callback(
             };
 
             finish_fetching_a_classic_script(&elem, script_kind, url, load);
-        }),
-        &context.canceller,
+        })
     );
 }*/
 
@@ -193,6 +216,7 @@ impl HTMLScriptElement {
         document: &Document,
         proto: Option<HandleObject>,
         creator: ElementCreator,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLScriptElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLScriptElement::new_inherited(
@@ -200,6 +224,7 @@ impl HTMLScriptElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -258,6 +283,7 @@ pub struct ScriptOrigin {
     external: bool,
     fetch_options: ScriptFetchOptions,
     type_: ScriptType,
+    unminified_dir: Option<String>,
 }
 
 impl ScriptOrigin {
@@ -266,6 +292,7 @@ impl ScriptOrigin {
         url: ServoUrl,
         fetch_options: ScriptFetchOptions,
         type_: ScriptType,
+        unminified_dir: Option<String>,
     ) -> ScriptOrigin {
         ScriptOrigin {
             code: SourceCode::Text(text),
@@ -273,6 +300,7 @@ impl ScriptOrigin {
             external: false,
             fetch_options,
             type_,
+            unminified_dir,
         }
     }
 
@@ -281,6 +309,7 @@ impl ScriptOrigin {
         url: ServoUrl,
         fetch_options: ScriptFetchOptions,
         type_: ScriptType,
+        unminified_dir: Option<String>,
     ) -> ScriptOrigin {
         ScriptOrigin {
             code: SourceCode::Text(text),
@@ -288,6 +317,7 @@ impl ScriptOrigin {
             external: true,
             fetch_options,
             type_,
+            unminified_dir,
         }
     }
 
@@ -310,7 +340,7 @@ fn finish_fetching_a_classic_script(
     // Step 11, Asynchronously complete this algorithm with script,
     // which refers to step 26.6 "When the chosen algorithm asynchronously completes",
     // of https://html.spec.whatwg.org/multipage/#prepare-a-script
-    let document = document_from_node(elem);
+    let document = elem.owner_document();
 
     match script_kind {
         ExternalScriptKind::Asap => document.asap_script_loaded(elem, load),
@@ -321,7 +351,7 @@ fn finish_fetching_a_classic_script(
         },
     }
 
-    document.finish_load(LoadType::Script(url), CanGc::note());
+    document.finish_load(LoadType::Script(url), can_gc);
 }
 
 pub type ScriptResult = Result<ScriptOrigin, NoTrace<NetworkError>>;
@@ -350,38 +380,41 @@ struct ClassicContext {
 }
 
 impl FetchResponseListener for ClassicContext {
-    fn process_request_body(&mut self) {} // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {} // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    // TODO(KiChjang): Perhaps add custom steps to perform fetch here?
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(&mut self, _: RequestId, metadata: Result<FetchMetadata, NetworkError>) {
         self.metadata = metadata.ok().map(|meta| match meta {
             FetchMetadata::Unfiltered(m) => m,
             FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
         });
 
-        let status_code = self
+        let status = self
             .metadata
             .as_ref()
-            .and_then(|m| match m.status {
-                Some((c, _)) => Some(c),
-                _ => None,
-            })
-            .unwrap_or(0);
+            .map(|m| m.status.clone())
+            .unwrap_or_else(HttpStatus::new_error);
 
-        self.status = match status_code {
-            0 => Err(NetworkError::Internal(
-                "No http status code received".to_owned(),
-            )),
-            200..=299 => Ok(()), // HTTP ok status codes
-            _ => Err(NetworkError::Internal(format!(
-                "HTTP error code {}",
-                status_code
-            ))),
+        self.status = {
+            if status.is_error() {
+                Err(NetworkError::Internal(
+                    "No http status code received".to_owned(),
+                ))
+            } else if status.is_success() {
+                Ok(())
+            } else {
+                Err(NetworkError::Internal(format!(
+                    "HTTP error code {}",
+                    status.code()
+                )))
+            }
         };
     }
 
-    fn process_response_chunk(&mut self, mut chunk: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, mut chunk: Vec<u8>) {
         if self.status.is_ok() {
             self.data.append(&mut chunk);
         }
@@ -390,7 +423,11 @@ impl FetchResponseListener for ClassicContext {
     /// <https://html.spec.whatwg.org/multipage/#fetch-a-classic-script>
     /// step 4-9
     #[allow(unsafe_code)]
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let (source_text, final_url) = match (response.as_ref(), self.status.as_ref()) {
             (Err(err), _) | (_, Err(err)) => {
                 // Step 6, response is an error.
@@ -437,8 +474,7 @@ impl FetchResponseListener for ClassicContext {
                 script_kind: self.kind,
                 final_url,
                 url: self.url.clone(),
-                task_source: global.dom_manipulation_task_source(),
-                canceller: global.task_canceller(TaskSourceName::DOMManipulation),
+                task_source: elem.owner_global().task_manager().dom_manipulation_task_source(),
                 script_text: source_string,
                 fetch_options: self.fetch_options.clone(),
             });
@@ -459,6 +495,7 @@ impl FetchResponseListener for ClassicContext {
             final_url.clone(),
             self.fetch_options.clone(),
             ScriptType::Classic,
+            elem.parser_document.global().unminified_js_dir(),
         );
         finish_fetching_a_classic_script(
             &elem,
@@ -479,7 +516,7 @@ impl FetchResponseListener for ClassicContext {
     }
 
     fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self)
+        network_listener::submit_timing(self, CanGc::note())
     }
 }
 
@@ -496,7 +533,7 @@ impl ResourceTimingListener for ClassicContext {
     }
 
     fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
-        document_from_node(&*self.elem.root()).global()
+        self.elem.root().owner_document().global()
     }
 }
 
@@ -536,9 +573,8 @@ fn fetch_a_classic_script(
     options: ScriptFetchOptions,
     character_encoding: &'static Encoding,
 ) {
-    let doc = document_from_node(script);
-
     // Step 1, 2.
+    let doc = script.owner_document();
     let request = script_fetch_request(
         url.clone(),
         cors_setting,
@@ -546,10 +582,11 @@ fn fetch_a_classic_script(
         script.global().pipeline_id(),
         options.clone(),
     );
+    let request = doc.prepare_request(request);
 
     // TODO: Step 3, Add custom steps to perform fetch
 
-    let context = Arc::new(Mutex::new(ClassicContext {
+    let context = ClassicContext {
         elem: Trusted::new(script),
         kind,
         character_encoding,
@@ -559,31 +596,13 @@ fn fetch_a_classic_script(
         status: Ok(()),
         fetch_options: options,
         resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-    }));
-
-    let (action_sender, action_receiver) = ipc::channel().unwrap();
-    let (task_source, canceller) = doc
-        .window()
-        .task_manager()
-        .networking_task_source_with_canceller();
-    let listener = NetworkListener {
-        context,
-        task_source,
-        canceller: Some(canceller),
     };
-
-    ROUTER.add_route(
-        action_receiver.to_opaque(),
-        Box::new(move |message| {
-            listener.notify_fetch(message.to().unwrap());
-        }),
-    );
-    doc.fetch_async(LoadType::Script(url), request, action_sender);
+    doc.fetch(LoadType::Script(url), request, context);
 }
 
 impl HTMLScriptElement {
     /// <https://html.spec.whatwg.org/multipage/#prepare-a-script>
-    pub fn prepare(&self) {
+    pub fn prepare(&self, can_gc: CanGc) {
         // Step 1.
         if self.already_started.get() {
             return;
@@ -629,7 +648,7 @@ impl HTMLScriptElement {
         self.already_started.set(true);
 
         // Step 12.
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
         if self.parser_inserted.get() && *self.parser_document != *doc {
             return;
         }
@@ -795,6 +814,7 @@ impl HTMLScriptElement {
                         url.clone(),
                         Destination::Script,
                         options,
+                        can_gc,
                     );
 
                     if !asynch && was_parser_inserted {
@@ -818,6 +838,7 @@ impl HTMLScriptElement {
                 base_url.clone(),
                 options.clone(),
                 script_type,
+                self.global().unminified_js_dir(),
             ));
 
             // Step 27-2.
@@ -853,102 +874,10 @@ impl HTMLScriptElement {
                         base_url.clone(),
                         self.id,
                         options,
+                        can_gc,
                     );
                 },
             }
-        }
-    }
-
-    fn unminify_js(&self, script: &mut ScriptOrigin) {
-        if !self.parser_document.window().unminify_js() {
-            return;
-        }
-
-        // Write the minified code to a temporary file and pass its path as an argument
-        // to js-beautify to read from. Meanwhile, redirect the process' stdout into
-        // another temporary file and read that into a string. This avoids some hangs
-        // observed on macOS when using direct input/output pipes with very large
-        // unminified content.
-        let (input, output) = (tempfile::NamedTempFile::new(), tempfile::tempfile());
-        if let (Ok(mut input), Ok(mut output)) = (input, output) {
-            match &script.code {
-                SourceCode::Text(text) => {
-                    input.write_all(text.as_bytes()).unwrap();
-                },
-                SourceCode::Compiled(compiled_source_code) => {
-                    input
-                        .write_all(compiled_source_code.original_text.as_bytes())
-                        .unwrap();
-                },
-            }
-            match Command::new("js-beautify")
-                .arg(input.path())
-                .stdout(output.try_clone().unwrap())
-                .status()
-            {
-                Ok(status) if status.success() => {
-                    let mut script_content = String::new();
-                    output.seek(std::io::SeekFrom::Start(0)).unwrap();
-                    output.read_to_string(&mut script_content).unwrap();
-                    script.code = SourceCode::Text(Rc::new(DOMString::from(script_content)));
-                },
-                _ => {
-                    warn!("Failed to execute js-beautify. Will store unmodified script");
-                },
-            }
-        } else {
-            warn!("Error creating input and output files for unminify");
-        }
-
-        let path = match window_from_node(self).unminified_js_dir() {
-            Some(unminified_js_dir) => PathBuf::from(unminified_js_dir),
-            None => {
-                warn!("Unminified script directory not found");
-                return;
-            },
-        };
-
-        let (base, has_name) = match script.url.as_str().ends_with('/') {
-            true => (
-                path.join(&script.url[url::Position::BeforeHost..])
-                    .as_path()
-                    .to_owned(),
-                false,
-            ),
-            false => (
-                path.join(&script.url[url::Position::BeforeHost..])
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-                true,
-            ),
-        };
-        match create_dir_all(base.clone()) {
-            Ok(()) => debug!("Created base dir: {:?}", base),
-            Err(e) => {
-                debug!("Failed to create base dir: {:?}, {:?}", base, e);
-                return;
-            },
-        }
-        let path = if script.external && has_name {
-            // External script.
-            path.join(&script.url[url::Position::BeforeHost..])
-        } else {
-            // Inline script or url ends with '/'
-            base.join(Uuid::new_v4().to_string())
-        };
-
-        debug!("script will be stored in {:?}", path);
-
-        match File::create(&path) {
-            Ok(mut file) => match &script.code {
-                SourceCode::Text(text) => file.write_all(text.as_bytes()).unwrap(),
-                SourceCode::Compiled(compiled_source_code) => {
-                    file.write_all(compiled_source_code.original_text.as_bytes())
-                        .unwrap();
-                },
-            },
-            Err(why) => warn!("Could not store script {:?}", why),
         }
     }
 
@@ -983,7 +912,7 @@ impl HTMLScriptElement {
     /// <https://html.spec.whatwg.org/multipage/#execute-the-script-block>
     pub fn execute(&self, result: ScriptResult) {
         // Step 1.
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
         if self.parser_inserted.get() && *doc != *self.parser_document {
             return;
         }
@@ -992,7 +921,7 @@ impl HTMLScriptElement {
             // Step 2.
             Err(e) => {
                 warn!("error loading script {:?}", e);
-                self.dispatch_error_event();
+                self.dispatch_error_event(CanGc::note());
                 return;
             },
 
@@ -1000,14 +929,14 @@ impl HTMLScriptElement {
         };
 
         if script.type_ == ScriptType::Classic {
-            self.unminify_js(&mut script);
+            unminify_js(&mut script);
             self.substitute_with_local_script(&mut script);
         }
 
         // Step 3.
         let neutralized_doc = if script.external || script.type_ == ScriptType::Module {
             debug!("loading external script, url = {}", script.url);
-            let doc = document_from_node(self);
+            let doc = self.owner_document();
             doc.incr_ignore_destructive_writes_counter();
             Some(doc)
         } else {
@@ -1015,22 +944,28 @@ impl HTMLScriptElement {
         };
 
         // Step 4.
-        let document = document_from_node(self);
+        let document = self.owner_document();
         let old_script = document.GetCurrentScript();
 
         match script.type_ {
-            ScriptType::Classic => document.set_current_script(Some(self)),
+            ScriptType::Classic => {
+                if self.upcast::<Node>().is_in_a_shadow_tree() {
+                    document.set_current_script(None)
+                } else {
+                    document.set_current_script(Some(self))
+                }
+            },
             ScriptType::Module => document.set_current_script(None),
         }
 
         match script.type_ {
             ScriptType::Classic => {
-                self.run_a_classic_script(&script);
+                self.run_a_classic_script(&script, CanGc::note());
                 document.set_current_script(old_script.as_deref());
             },
             ScriptType::Module => {
                 assert!(document.GetCurrentScript().is_none());
-                self.run_a_module_script(&script, false);
+                self.run_a_module_script(&script, false, CanGc::note());
             },
         }
 
@@ -1041,51 +976,53 @@ impl HTMLScriptElement {
 
         // Step 6.
         if script.external {
-            self.dispatch_load_event();
+            self.dispatch_load_event(CanGc::note());
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#run-a-classic-script
-    pub fn run_a_classic_script(&self, script: &ScriptOrigin) {
+    pub fn run_a_classic_script(&self, script: &ScriptOrigin, can_gc: CanGc) {
         // TODO use a settings object rather than this element's document/window
         // Step 2
-        let document = document_from_node(self);
+        let document = self.owner_document();
         if !document.is_fully_active() || !document.is_scripting_enabled() {
             return;
         }
 
         // Steps 4-10
-        let window = window_from_node(self);
+        let window = self.owner_window();
         let line_number = if script.external {
             1
         } else {
             self.line_number as u32
         };
         rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
-        let global = window.upcast::<GlobalScope>();
-        global.evaluate_script_on_global_with_result(
-            &script.code,
-            script.url.as_str(),
-            rval.handle_mut(),
-            line_number,
-            script.fetch_options.clone(),
-            script.url.clone(),
-        );
+        window
+            .as_global_scope()
+            .evaluate_script_on_global_with_result(
+                &script.code,
+                script.url.as_str(),
+                rval.handle_mut(),
+                line_number,
+                script.fetch_options.clone(),
+                script.url.clone(),
+                can_gc,
+            );
     }
 
     #[allow(unsafe_code)]
     /// <https://html.spec.whatwg.org/multipage/#run-a-module-script>
-    pub fn run_a_module_script(&self, script: &ScriptOrigin, _rethrow_errors: bool) {
+    pub fn run_a_module_script(&self, script: &ScriptOrigin, _rethrow_errors: bool, can_gc: CanGc) {
         // TODO use a settings object rather than this element's document/window
         // Step 2
-        let document = document_from_node(self);
+        let document = self.owner_document();
         if !document.is_fully_active() || !document.is_scripting_enabled() {
             return;
         }
 
         // Step 4
-        let window = window_from_node(self);
-        let global = window.upcast::<GlobalScope>();
+        let window = self.owner_window();
+        let global = window.as_global_scope();
         let _aes = AutoEntryScript::new(global);
 
         let tree = if script.external {
@@ -1104,7 +1041,7 @@ impl HTMLScriptElement {
                 let module_error = module_tree.get_rethrow_error().borrow();
                 let network_error = module_tree.get_network_error().borrow();
                 if module_error.is_some() && network_error.is_none() {
-                    module_tree.report_error(global);
+                    module_tree.report_error(global, can_gc);
                     return;
                 }
             }
@@ -1118,37 +1055,38 @@ impl HTMLScriptElement {
             if let Some(record) = record {
                 rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
                 let evaluated =
-                    module_tree.execute_module(global, record, rval.handle_mut().into());
+                    module_tree.execute_module(global, record, rval.handle_mut().into(), can_gc);
 
                 if let Err(exception) = evaluated {
                     module_tree.set_rethrow_error(exception);
-                    module_tree.report_error(global);
+                    module_tree.report_error(global, can_gc);
                 }
             }
         }
     }
 
     pub fn queue_error_event(&self) {
-        let window = window_from_node(self);
-        window
+        self.owner_global()
             .task_manager()
             .dom_manipulation_task_source()
-            .queue_simple_event(self.upcast(), atom!("error"), &window);
+            .queue_simple_event(self.upcast(), atom!("error"));
     }
 
-    pub fn dispatch_load_event(&self) {
+    pub fn dispatch_load_event(&self, can_gc: CanGc) {
         self.dispatch_event(
             atom!("load"),
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
+            can_gc,
         );
     }
 
-    pub fn dispatch_error_event(&self) {
+    pub fn dispatch_error_event(&self, can_gc: CanGc) {
         self.dispatch_event(
             atom!("error"),
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
+            can_gc,
         );
     }
 
@@ -1227,10 +1165,11 @@ impl HTMLScriptElement {
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
+        can_gc: CanGc,
     ) -> EventStatus {
-        let window = window_from_node(self);
-        let event = Event::new(window.upcast(), type_, bubbles, cancelable);
-        event.fire(self.upcast())
+        let window = self.owner_window();
+        let event = Event::new(window.upcast(), type_, bubbles, cancelable, can_gc);
+        event.fire(self.upcast(), can_gc)
     }
 }
 
@@ -1244,31 +1183,39 @@ impl VirtualMethods for HTMLScriptElement {
         if *attr.local_name() == local_name!("src") {
             if let AttributeMutation::Set(_) = mutation {
                 if !self.parser_inserted.get() && self.upcast::<Node>().is_connected() {
-                    self.prepare();
+                    self.prepare(CanGc::note());
                 }
             }
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#script-processing-model:the-script-element-26>
     fn children_changed(&self, mutation: &ChildrenMutation) {
         if let Some(s) = self.super_type() {
             s.children_changed(mutation);
         }
-        if !self.parser_inserted.get() && self.upcast::<Node>().is_connected() {
-            self.prepare();
+
+        if self.upcast::<Node>().is_connected() && !self.parser_inserted.get() {
+            let script = Trusted::new(self);
+            // This method can be invoked while there are script/layout blockers present
+            // as DOM mutations have not yet settled. We use a delayed task to avoid
+            // running any scripts until the DOM tree is safe for interactions.
+            self.owner_document()
+                .add_delayed_task(task!(ScriptPrepare: move || {
+                    let this = script.root();
+                    this.prepare(CanGc::note());
+                }));
         }
     }
 
-    fn bind_to_tree(&self, context: &BindContext) {
+    /// <https://html.spec.whatwg.org/multipage/#script-processing-model:the-script-element-20>
+    fn post_connection_steps(&self) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context);
+            s.post_connection_steps();
         }
 
-        if context.tree_connected && !self.parser_inserted.get() {
-            let script = Trusted::new(self);
-            document_from_node(self).add_delayed_task(task!(ScriptDelayedInitialize: move || {
-                script.root().prepare();
-            }));
+        if self.upcast::<Node>().is_connected() && !self.parser_inserted.get() {
+            self.prepare(CanGc::note());
         }
     }
 
@@ -1291,7 +1238,7 @@ impl VirtualMethods for HTMLScriptElement {
     }
 }
 
-impl HTMLScriptElementMethods for HTMLScriptElement {
+impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
     // https://html.spec.whatwg.org/multipage/#dom-script-src
     make_url_getter!(Src, "src");
 
@@ -1316,10 +1263,10 @@ impl HTMLScriptElementMethods for HTMLScriptElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-script-async
-    fn SetAsync(&self, value: bool) {
+    fn SetAsync(&self, value: bool, can_gc: CanGc) {
         self.non_blocking.set(false);
         self.upcast::<Element>()
-            .set_bool_attribute(&local_name!("async"), value);
+            .set_bool_attribute(&local_name!("async"), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-script-defer
@@ -1353,8 +1300,8 @@ impl HTMLScriptElementMethods for HTMLScriptElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-script-crossorigin
-    fn SetCrossOrigin(&self, value: Option<DOMString>) {
-        set_cross_origin_attribute(self.upcast::<Element>(), value);
+    fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
+        set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-script-referrerpolicy
@@ -1371,8 +1318,8 @@ impl HTMLScriptElementMethods for HTMLScriptElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-script-text
-    fn SetText(&self, value: DOMString) {
-        self.upcast::<Node>().SetTextContent(Some(value))
+    fn SetText(&self, value: DOMString, can_gc: CanGc) {
+        self.upcast::<Node>().SetTextContent(Some(value), can_gc)
     }
 }
 

@@ -29,12 +29,24 @@ use file::FileProtocolHander;
 static FORBIDDEN_SCHEMES: [&str; 4] = ["http", "https", "chrome", "about"];
 
 pub trait ProtocolHandler: Send + Sync {
+    /// Triggers the load of a resource for this protocol and returns a future
+    /// that will produce a Response. Even if the protocol is not backed by a
+    /// http endpoint, it is recommended to a least provide:
+    /// - A relevant status code.
+    /// - A Content Type.
     fn load(
         &self,
         request: &mut Request,
         done_chan: &mut DoneChannel,
         context: &FetchContext,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>>;
+
+    /// Specify if resources served by that protocol can be retrieved
+    /// with `fetch()` without no-cors mode to allow the caller direct
+    /// access to the resource content.
+    fn is_fetchable(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -80,28 +92,29 @@ impl ProtocolRegistry {
             self.handlers.entry(scheme).or_insert(handler);
         }
     }
+
+    pub fn is_fetchable(&self, scheme: &str) -> bool {
+        self.handlers
+            .get(scheme)
+            .map(|handler| handler.is_fetchable())
+            .unwrap_or(false)
+    }
 }
 
 pub fn range_not_satisfiable_error(response: &mut Response) {
-    let reason = "Range Not Satisfiable".to_owned();
-    response.status = Some((StatusCode::RANGE_NOT_SATISFIABLE, reason.clone()));
-    response.raw_status = Some((StatusCode::RANGE_NOT_SATISFIABLE.as_u16(), reason.into()));
+    response.status = StatusCode::RANGE_NOT_SATISFIABLE.into();
 }
 
 /// Get the range bounds if the `Range` header is present.
-pub fn get_range_request_bounds(range: Option<Range>) -> RangeRequestBounds {
+pub fn get_range_request_bounds(range: Option<Range>, len: u64) -> RangeRequestBounds {
     if let Some(ref range) = range {
-        let (start, end) = match range
-            .iter()
-            .collect::<Vec<(Bound<u64>, Bound<u64>)>>()
-            .first()
-        {
-            Some(&(Bound::Included(start), Bound::Unbounded)) => (start, None),
-            Some(&(Bound::Included(start), Bound::Included(end))) => {
+        let (start, end) = match range.satisfiable_ranges(len).next() {
+            Some((Bound::Included(start), Bound::Unbounded)) => (start, None),
+            Some((Bound::Included(start), Bound::Included(end))) => {
                 // `end` should be less or equal to `start`.
                 (start, Some(i64::max(start as i64, end as i64)))
             },
-            Some(&(Bound::Unbounded, Bound::Included(offset))) => {
+            Some((Bound::Unbounded, Bound::Included(offset))) => {
                 return RangeRequestBounds::Pending(offset);
             },
             _ => (0, None),
@@ -113,7 +126,5 @@ pub fn get_range_request_bounds(range: Option<Range>) -> RangeRequestBounds {
 }
 
 pub fn partial_content(response: &mut Response) {
-    let reason = "Partial Content".to_owned();
-    response.status = Some((StatusCode::PARTIAL_CONTENT, reason.clone()));
-    response.raw_status = Some((StatusCode::PARTIAL_CONTENT.as_u16(), reason.into()));
+    response.status = StatusCode::PARTIAL_CONTENT.into();
 }

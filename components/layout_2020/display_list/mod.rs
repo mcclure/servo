@@ -6,11 +6,9 @@ use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 
 use app_units::Au;
-use base::id::BrowsingContextId;
 use base::WebRenderEpochToU16;
 use embedder_traits::Cursor;
 use euclid::{Point2D, SideOffsets2D, Size2D, UnknownUnit};
-use fnv::FnvHashMap;
 use fonts::GlyphStore;
 use gradient::WebRenderGradient;
 use net_traits::image_cache::UsePlaceholder;
@@ -25,15 +23,14 @@ use style::properties::ComputedValues;
 use style::values::computed::image::Image;
 use style::values::computed::{
     BorderImageSideWidth, BorderImageWidth, BorderStyle, Color, LengthPercentage,
-    LengthPercentageOrAuto, NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
+    NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
 };
 use style::values::generics::rect::Rect;
 use style::values::generics::NonNegative;
 use style::values::specified::text::TextDecorationLine;
 use style::values::specified::ui::CursorKind;
 use style::Zero;
-use style_traits::{CSSPixel, DevicePixel};
-use webrender_api::units::{LayoutPixel, LayoutSize};
+use webrender_api::units::{DevicePixel, LayoutPixel, LayoutRect, LayoutSize};
 use webrender_api::{
     self as wr, units, BorderDetails, BoxShadowClipMode, ClipChainId, CommonItemProperties,
     ImageRendering, NinePatchBorder, NinePatchBorderSource,
@@ -49,7 +46,7 @@ use crate::display_list::stacking_context::StackingContextSection;
 use crate::fragment_tree::{
     BackgroundMode, BoxFragment, Fragment, FragmentFlags, FragmentTree, Tag, TextFragment,
 };
-use crate::geom::{PhysicalPoint, PhysicalRect};
+use crate::geom::{LengthPercentageOrAuto, PhysicalPoint, PhysicalRect};
 use crate::replaced::NaturalSizes;
 use crate::style_ext::ComputedValuesExt;
 
@@ -162,12 +159,6 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// The [DisplayList] used to collect display list items and metadata.
     pub display_list: &'a mut DisplayList,
 
-    /// A recording of the sizes of iframes encountered when building this
-    /// display list. This information is forwarded to layout for the
-    /// iframe so that its layout knows how large the initial containing block /
-    /// viewport is.
-    iframe_sizes: FnvHashMap<BrowsingContextId, Size2D<f32, CSSPixel>>,
-
     /// Contentful paint i.e. whether the display list contains items of type
     /// text, image, non-white canvas or SVG). Used by metrics.
     /// See <https://w3c.github.io/paint-timing/#first-contentful-paint>.
@@ -175,12 +166,15 @@ pub(crate) struct DisplayListBuilder<'a> {
 }
 
 impl DisplayList {
+    /// Build the display list, returning true if it was contentful.
     pub fn build(
         &mut self,
         context: &LayoutContext,
         fragment_tree: &FragmentTree,
         root_stacking_context: &StackingContext,
-    ) -> (FnvHashMap<BrowsingContextId, Size2D<f32, CSSPixel>>, bool) {
+    ) -> bool {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!("display_list::build", servo_profiling = true).entered();
         let mut builder = DisplayListBuilder {
             current_scroll_node_id: self.compositor_info.root_reference_frame_id,
             current_reference_frame_scroll_node_id: self.compositor_info.root_reference_frame_id,
@@ -189,14 +183,13 @@ impl DisplayList {
             is_contentful: false,
             context,
             display_list: self,
-            iframe_sizes: FnvHashMap::default(),
         };
         fragment_tree.build_display_list(&mut builder, root_stacking_context);
-        (builder.iframe_sizes, builder.is_contentful)
+        builder.is_contentful
     }
 }
 
-impl<'a> DisplayListBuilder<'a> {
+impl DisplayListBuilder<'_> {
     fn wr(&mut self) -> &mut wr::DisplayListBuilder {
         &mut self.display_list.wr
     }
@@ -248,14 +241,20 @@ impl Fragment {
         builder: &mut DisplayListBuilder,
         containing_block: &PhysicalRect<Au>,
         section: StackingContextSection,
+        is_hit_test_for_scrollable_overflow: bool,
     ) {
         match self {
-            Fragment::Box(b) | Fragment::Float(b) => match b.style.get_inherited_box().visibility {
-                Visibility::Visible => {
-                    BuilderForBoxFragment::new(b, containing_block).build(builder, section)
-                },
-                Visibility::Hidden => (),
-                Visibility::Collapse => (),
+            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                match box_fragment.style.get_inherited_box().visibility {
+                    Visibility::Visible => BuilderForBoxFragment::new(
+                        box_fragment,
+                        containing_block,
+                        is_hit_test_for_scrollable_overflow,
+                    )
+                    .build(builder, section),
+                    Visibility::Hidden => (),
+                    Visibility::Collapse => (),
+                }
             },
             Fragment::AbsoluteOrFixedPositioned(_) => {},
             Fragment::Positioning(positioning_fragment) => {
@@ -291,14 +290,16 @@ impl Fragment {
                         .to_webrender();
                     let common = builder.common_properties(clip, &image.style);
 
-                    builder.wr().push_image(
-                        &common,
-                        rect,
-                        image_rendering,
-                        wr::AlphaType::PremultipliedAlpha,
-                        image.image_key,
-                        wr::ColorF::WHITE,
-                    );
+                    if let Some(image_key) = image.image_key {
+                        builder.wr().push_image(
+                            &common,
+                            rect,
+                            image_rendering,
+                            wr::AlphaType::PremultipliedAlpha,
+                            image_key,
+                            wr::ColorF::WHITE,
+                        );
+                    }
                 },
                 Visibility::Hidden => (),
                 Visibility::Collapse => (),
@@ -307,11 +308,6 @@ impl Fragment {
                 Visibility::Visible => {
                     builder.is_contentful = true;
                     let rect = iframe.rect.translate(containing_block.origin.to_vector());
-
-                    builder.iframe_sizes.insert(
-                        iframe.browsing_context_id,
-                        Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px()),
-                    );
 
                     let common = builder.common_properties(rect.to_webrender(), &iframe.style);
                     builder.wr().push_iframe(
@@ -504,10 +500,15 @@ struct BuilderForBoxFragment<'a> {
     border_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     padding_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     content_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
+    is_hit_test_for_scrollable_overflow: bool,
 }
 
 impl<'a> BuilderForBoxFragment<'a> {
-    fn new(fragment: &'a BoxFragment, containing_block: &'a PhysicalRect<Au>) -> Self {
+    fn new(
+        fragment: &'a BoxFragment,
+        containing_block: &'a PhysicalRect<Au>,
+        is_hit_test_for_scrollable_overflow: bool,
+    ) -> Self {
         let border_rect = fragment
             .border_rect()
             .translate(containing_block.origin.to_vector());
@@ -546,6 +547,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             border_edge_clip_chain_id: RefCell::new(None),
             padding_edge_clip_chain_id: RefCell::new(None),
             content_edge_clip_chain_id: RefCell::new(None),
+            is_hit_test_for_scrollable_overflow,
         }
     }
 
@@ -631,25 +633,31 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 
     fn build(&mut self, builder: &mut DisplayListBuilder, section: StackingContextSection) {
+        if self.is_hit_test_for_scrollable_overflow {
+            self.build_hit_test(builder, self.fragment.scrollable_overflow().to_webrender());
+            return;
+        }
+
         if section == StackingContextSection::Outline {
             self.build_outline(builder);
-        } else {
-            self.build_hit_test(builder);
-            if self
-                .fragment
-                .base
-                .flags
-                .contains(FragmentFlags::DO_NOT_PAINT)
-            {
-                return;
-            }
-            self.build_background(builder);
-            self.build_box_shadow(builder);
-            self.build_border(builder);
+            return;
         }
+
+        self.build_hit_test(builder, self.border_rect);
+        if self
+            .fragment
+            .base
+            .flags
+            .contains(FragmentFlags::DO_NOT_PAINT)
+        {
+            return;
+        }
+        self.build_background(builder);
+        self.build_box_shadow(builder);
+        self.build_border(builder);
     }
 
-    fn build_hit_test(&self, builder: &mut DisplayListBuilder) {
+    fn build_hit_test(&self, builder: &mut DisplayListBuilder, rect: LayoutRect) {
         let hit_info = builder.hit_info(
             &self.fragment.style,
             self.fragment.base.tag,
@@ -660,7 +668,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             None => return,
         };
 
-        let mut common = builder.common_properties(self.border_rect, &self.fragment.style);
+        let mut common = builder.common_properties(rect, &self.fragment.style);
         if let Some(clip_chain_id) = self.border_edge_clip(builder, false) {
             common.clip_chain_id = clip_chain_id;
         }
@@ -1332,7 +1340,7 @@ pub(super) fn compute_margin_box_radius(
     layout_rect: LayoutSize,
     fragment: &BoxFragment,
 ) -> wr::BorderRadius {
-    let margin = fragment.style.get_margin();
+    let margin = fragment.style.physical_margin();
     let adjust_radius = |radius: f32, margin: f32| -> f32 {
         if margin <= 0. || (radius / margin) >= 1. {
             (radius + margin).max(0.)
@@ -1344,13 +1352,14 @@ pub(super) fn compute_margin_box_radius(
                                  layout_rect: LayoutSize,
                                  margin: Size2D<LengthPercentageOrAuto, UnknownUnit>|
      -> LayoutSize {
+        let zero = LengthPercentage::zero();
         let width = margin
             .width
-            .auto_is(LengthPercentage::zero)
+            .auto_is(|| &zero)
             .to_used_value(Au::from_f32_px(layout_rect.width));
         let height = margin
             .height
-            .auto_is(LengthPercentage::zero)
+            .auto_is(|| &zero)
             .to_used_value(Au::from_f32_px(layout_rect.height));
         LayoutSize::new(
             adjust_radius(radius.width, width.to_f32_px()),
@@ -1361,22 +1370,22 @@ pub(super) fn compute_margin_box_radius(
         top_left: compute_margin_radius(
             radius.top_left,
             layout_rect,
-            Size2D::new(margin.margin_left.clone(), margin.margin_top.clone()),
+            Size2D::new(margin.left, margin.top),
         ),
         top_right: compute_margin_radius(
             radius.top_right,
             layout_rect,
-            Size2D::new(margin.margin_right.clone(), margin.margin_top.clone()),
+            Size2D::new(margin.right, margin.top),
         ),
         bottom_left: compute_margin_radius(
             radius.bottom_left,
             layout_rect,
-            Size2D::new(margin.margin_left.clone(), margin.margin_bottom.clone()),
+            Size2D::new(margin.left, margin.bottom),
         ),
         bottom_right: compute_margin_radius(
             radius.bottom_right,
             layout_rect,
-            Size2D::new(margin.margin_right.clone(), margin.margin_bottom.clone()),
+            Size2D::new(margin.right, margin.bottom),
         ),
     }
 }

@@ -12,6 +12,7 @@ use crate::dom::bindings::codegen::Bindings::ANGLEInstancedArraysBinding::{
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::webglrenderingcontext::WebGLRenderingContext;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct ANGLEInstancedArrays {
@@ -35,6 +36,7 @@ impl WebGLExtension for ANGLEInstancedArrays {
         reflect_dom_object(
             Box::new(ANGLEInstancedArrays::new_inherited(ctx)),
             &*ctx.global(),
+            CanGc::note(),
         )
     }
 
@@ -62,7 +64,7 @@ impl WebGLExtension for ANGLEInstancedArrays {
     }
 }
 
-impl ANGLEInstancedArraysMethods for ANGLEInstancedArrays {
+impl ANGLEInstancedArraysMethods<crate::DomTypeHolder> for ANGLEInstancedArrays {
     // https://www.khronos.org/registry/webgl/extensions/ANGLE_instanced_arrays/
     fn DrawArraysInstancedANGLE(&self, mode: u32, first: i32, count: i32, primcount: i32) {
         handle_potential_webgl_error!(

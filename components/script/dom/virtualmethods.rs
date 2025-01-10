@@ -5,14 +5,14 @@
 use html5ever::LocalName;
 use style::attr::AttrValue;
 
-use super::htmltablecolelement::HTMLTableColElement;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::inheritance::{
-    Castable, ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId, NodeTypeId,
-    SVGElementTypeId, SVGGraphicsElementTypeId,
+    Castable, DocumentFragmentTypeId, ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId,
+    NodeTypeId, SVGElementTypeId, SVGGraphicsElementTypeId,
 };
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
+use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::event::Event;
 use crate::dom::htmlanchorelement::HTMLAnchorElement;
@@ -46,6 +46,7 @@ use crate::dom::htmlselectelement::HTMLSelectElement;
 use crate::dom::htmlsourceelement::HTMLSourceElement;
 use crate::dom::htmlstyleelement::HTMLStyleElement;
 use crate::dom::htmltablecellelement::HTMLTableCellElement;
+use crate::dom::htmltablecolelement::HTMLTableColElement;
 use crate::dom::htmltableelement::HTMLTableElement;
 use crate::dom::htmltablerowelement::HTMLTableRowElement;
 use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
@@ -54,6 +55,7 @@ use crate::dom::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmlvideoelement::HTMLVideoElement;
 use crate::dom::node::{BindContext, ChildrenMutation, CloneChildrenFlag, Node, UnbindContext};
+use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::svgelement::SVGElement;
 use crate::dom::svgsvgelement::SVGSVGElement;
 
@@ -88,6 +90,15 @@ pub trait VirtualMethods {
         match self.super_type() {
             Some(s) => s.parse_plain_attribute(name, value),
             _ => AttrValue::String(value.into()),
+        }
+    }
+
+    /// Invoked during a DOM tree mutation after a node becomes connected, once all
+    /// related DOM tree mutations have been applied.
+    /// <https://dom.spec.whatwg.org/#concept-node-post-connection-ext>
+    fn post_connection_steps(&self) {
+        if let Some(s) = self.super_type() {
+            s.post_connection_steps();
         }
     }
 
@@ -283,6 +294,12 @@ pub fn vtable_for(node: &Node) -> &dyn VirtualMethods {
             node.downcast::<Element>().unwrap() as &dyn VirtualMethods
         },
         NodeTypeId::Element(_) => node.downcast::<HTMLElement>().unwrap() as &dyn VirtualMethods,
+        NodeTypeId::DocumentFragment(DocumentFragmentTypeId::ShadowRoot) => {
+            node.downcast::<ShadowRoot>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::DocumentFragment(_) => {
+            node.downcast::<DocumentFragment>().unwrap() as &dyn VirtualMethods
+        },
         _ => node as &dyn VirtualMethods,
     }
 }

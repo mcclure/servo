@@ -9,7 +9,7 @@ use base::id::HistoryStateId;
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
-use js::rust::HandleValue;
+use js::rust::{HandleValue, MutableHandleValue};
 use net_traits::{CoreResourceMsg, IpcSend};
 use profile_traits::ipc;
 use profile_traits::ipc::channel;
@@ -31,7 +31,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::popstateevent::PopStateEvent;
 use crate::dom::window::Window;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 enum PushOrReplace {
     Push,
@@ -62,7 +62,11 @@ impl History {
     }
 
     pub fn new(window: &Window) -> DomRoot<History> {
-        reflect_dom_object(Box::new(History::new_inherited(window)), window)
+        reflect_dom_object(
+            Box::new(History::new_inherited(window)),
+            window,
+            CanGc::note(),
+        )
     }
 }
 
@@ -74,7 +78,7 @@ impl History {
         let msg = ScriptMsg::TraverseHistory(direction);
         let _ = self
             .window
-            .upcast::<GlobalScope>()
+            .as_global_scope()
             .script_to_constellation_chan()
             .send(msg);
         Ok(())
@@ -83,7 +87,7 @@ impl History {
     /// <https://html.spec.whatwg.org/multipage/#history-traversal>
     /// Steps 5-16
     #[allow(unsafe_code)]
-    pub fn activate_state(&self, state_id: Option<HistoryStateId>, url: ServoUrl) {
+    pub fn activate_state(&self, state_id: Option<HistoryStateId>, url: ServoUrl, can_gc: CanGc) {
         // Steps 5
         let document = self.window.Document();
         let old_url = document.url().clone();
@@ -94,7 +98,7 @@ impl History {
 
         // Step 8
         if let Some(fragment) = url.fragment() {
-            document.check_and_scroll_fragment(fragment);
+            document.check_and_scroll_fragment(fragment, can_gc);
         }
 
         // Step 11
@@ -105,7 +109,7 @@ impl History {
                 let (tx, rx) = ipc::channel(self.global().time_profiler_chan().clone()).unwrap();
                 let _ = self
                     .window
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .resource_threads()
                     .send(CoreResourceMsg::GetHistoryState(state_id, tx));
                 rx.recv().unwrap()
@@ -120,9 +124,10 @@ impl History {
                     ports: None,
                     blobs: None,
                 };
-                let global_scope = self.window.upcast::<GlobalScope>();
                 rooted!(in(*GlobalScope::get_cx()) let mut state = UndefinedValue());
-                if structuredclone::read(global_scope, data, state.handle_mut()).is_err() {
+                if structuredclone::read(self.window.as_global_scope(), data, state.handle_mut())
+                    .is_err()
+                {
                     warn!("Error reading structuredclone data");
                 }
                 self.state.set(state.get());
@@ -139,6 +144,7 @@ impl History {
                 self.window.upcast::<EventTarget>(),
                 &self.window,
                 unsafe { HandleValue::from_raw(self.state.handle()) },
+                can_gc,
             );
         }
 
@@ -151,17 +157,18 @@ impl History {
                 false,
                 old_url.into_string(),
                 url.into_string(),
+                can_gc,
             );
             event
                 .upcast::<Event>()
-                .fire(self.window.upcast::<EventTarget>());
+                .fire(self.window.upcast::<EventTarget>(), can_gc);
         }
     }
 
     pub fn remove_states(&self, states: Vec<HistoryStateId>) {
         let _ = self
             .window
-            .upcast::<GlobalScope>()
+            .as_global_scope()
             .resource_threads()
             .send(CoreResourceMsg::RemoveHistoryStates(states));
     }
@@ -234,7 +241,7 @@ impl History {
                 let msg = ScriptMsg::PushHistoryState(state_id, new_url.clone());
                 let _ = self
                     .window
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .script_to_constellation_chan()
                     .send(msg);
                 state_id
@@ -251,14 +258,14 @@ impl History {
                 let msg = ScriptMsg::ReplaceHistoryState(state_id, new_url.clone());
                 let _ = self
                     .window
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .script_to_constellation_chan()
                     .send(msg);
                 state_id
             },
         };
 
-        let _ = self.window.upcast::<GlobalScope>().resource_threads().send(
+        let _ = self.window.as_global_scope().resource_threads().send(
             CoreResourceMsg::SetHistoryState(state_id, serialized_data.serialized.clone()),
         );
 
@@ -269,9 +276,14 @@ impl History {
         document.set_url(new_url);
 
         // Step 11
-        let global_scope = self.window.upcast::<GlobalScope>();
         rooted!(in(*cx) let mut state = UndefinedValue());
-        if structuredclone::read(global_scope, serialized_data, state.handle_mut()).is_err() {
+        if structuredclone::read(
+            self.window.as_global_scope(),
+            serialized_data,
+            state.handle_mut(),
+        )
+        .is_err()
+        {
             warn!("Error reading structuredclone data");
         }
 
@@ -285,13 +297,14 @@ impl History {
     }
 }
 
-impl HistoryMethods for History {
+impl HistoryMethods<crate::DomTypeHolder> for History {
     /// <https://html.spec.whatwg.org/multipage/#dom-history-state>
-    fn GetState(&self, _cx: JSContext) -> Fallible<JSVal> {
+    fn GetState(&self, _cx: JSContext, mut retval: MutableHandleValue) -> Fallible<()> {
         if !self.window.Document().is_fully_active() {
             return Err(Error::Security);
         }
-        Ok(self.state.get())
+        retval.set(self.state.get());
+        Ok(())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-history-length>
@@ -304,18 +317,18 @@ impl HistoryMethods for History {
         let msg = ScriptMsg::JointSessionHistoryLength(sender);
         let _ = self
             .window
-            .upcast::<GlobalScope>()
+            .as_global_scope()
             .script_to_constellation_chan()
             .send(msg);
         Ok(recv.recv().unwrap())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-history-go>
-    fn Go(&self, delta: i32) -> ErrorResult {
+    fn Go(&self, delta: i32, can_gc: CanGc) -> ErrorResult {
         let direction = match delta.cmp(&0) {
             Ordering::Greater => TraversalDirection::Forward(delta as usize),
             Ordering::Less => TraversalDirection::Back(-delta as usize),
-            Ordering::Equal => return self.window.Location().Reload(),
+            Ordering::Equal => return self.window.Location().Reload(can_gc),
         };
 
         self.traverse_history(direction)

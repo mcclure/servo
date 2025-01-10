@@ -8,8 +8,7 @@ use std::ops::Range;
 use app_units::Au;
 use base::text::is_bidi_control;
 use fonts::{
-    FontCacheThread, FontContext, FontRef, GlyphRun, ShapingFlags, ShapingOptions,
-    LAST_RESORT_GLYPH_ADVANCE,
+    FontContext, FontRef, GlyphRun, ShapingFlags, ShapingOptions, LAST_RESORT_GLYPH_ADVANCE,
 };
 use fonts_traits::ByteIndex;
 use log::warn;
@@ -110,6 +109,7 @@ impl TextRunSegment {
         script: Script,
         bidi_level: Level,
         fonts: &[FontKeyAndMetrics],
+        font_context: &FontContext,
     ) -> bool {
         fn is_specific(script: Script) -> bool {
             script != Script::Common && script != Script::Inherited
@@ -120,7 +120,7 @@ impl TextRunSegment {
         }
 
         let current_font_key_and_metrics = &fonts[self.font_index];
-        if new_font.font_key != current_font_key_and_metrics.key ||
+        if new_font.key(font_context) != current_font_key_and_metrics.key ||
             new_font.descriptor.pt_size != current_font_key_and_metrics.pt_size
         {
             return false;
@@ -342,14 +342,18 @@ impl TextRun {
     pub(super) fn segment_and_shape(
         &mut self,
         formatting_context_text: &str,
-        font_context: &FontContext<FontCacheThread>,
+        font_context: &FontContext,
         linebreaker: &mut LineBreaker,
         font_cache: &mut Vec<FontKeyAndMetrics>,
         bidi_info: &BidiInfo,
     ) {
         let inherited_text_style = self.parent_style.get_inherited_text().clone();
-        let letter_spacing = if inherited_text_style.letter_spacing.0.px() != 0. {
-            Some(app_units::Au::from(inherited_text_style.letter_spacing.0))
+        let letter_spacing = inherited_text_style
+            .letter_spacing
+            .0
+            .resolve(self.parent_style.clone_font().font_size.computed_size());
+        let letter_spacing = if letter_spacing.px() != 0. {
+            Some(app_units::Au::from(letter_spacing))
         } else {
             None
         };
@@ -410,7 +414,7 @@ impl TextRun {
     fn segment_text_by_font(
         &mut self,
         formatting_context_text: &str,
-        font_context: &FontContext<FontCacheThread>,
+        font_context: &FontContext,
         font_cache: &mut Vec<FontKeyAndMetrics>,
         bidi_info: &BidiInfo,
     ) -> Vec<(TextRunSegment, FontRef)> {
@@ -441,15 +445,18 @@ impl TextRun {
             let script = Script::from(character);
             let bidi_level = bidi_info.levels[current_byte_index];
             if let Some(current) = current.as_mut() {
-                if current
-                    .0
-                    .update_if_compatible(&font, script, bidi_level, font_cache)
-                {
+                if current.0.update_if_compatible(
+                    &font,
+                    script,
+                    bidi_level,
+                    font_cache,
+                    font_context,
+                ) {
                     continue;
                 }
             }
 
-            let font_index = add_or_get_font(&font, font_cache);
+            let font_index = add_or_get_font(&font, font_cache, font_context);
 
             // Add the new segment and finish the existing one, if we had one. If the first
             // characters in the run were control characters we may be creating the first
@@ -474,7 +481,7 @@ impl TextRun {
         // of those cases, just use the first font.
         if current.is_none() {
             current = font_group.write().first(font_context).map(|font| {
-                let font_index = add_or_get_font(&font, font_cache);
+                let font_index = add_or_get_font(&font, font_cache, font_context);
                 (
                     TextRunSegment::new(
                         font_index,
@@ -540,15 +547,22 @@ fn char_does_not_change_font(character: char) -> bool {
         class == XI_LINE_BREAKING_CLASS_ZWJ
 }
 
-pub(super) fn add_or_get_font(font: &FontRef, ifc_fonts: &mut Vec<FontKeyAndMetrics>) -> usize {
+pub(super) fn add_or_get_font(
+    font: &FontRef,
+    ifc_fonts: &mut Vec<FontKeyAndMetrics>,
+    font_context: &FontContext,
+) -> usize {
+    let font_instance_key = font.key(font_context);
     for (index, ifc_font_info) in ifc_fonts.iter().enumerate() {
-        if ifc_font_info.key == font.font_key && ifc_font_info.pt_size == font.descriptor.pt_size {
+        if ifc_font_info.key == font_instance_key &&
+            ifc_font_info.pt_size == font.descriptor.pt_size
+        {
             return index;
         }
     }
     ifc_fonts.push(FontKeyAndMetrics {
         metrics: font.metrics.clone(),
-        key: font.font_key,
+        key: font_instance_key,
         pt_size: font.descriptor.pt_size,
     });
     ifc_fonts.len() - 1
@@ -556,7 +570,7 @@ pub(super) fn add_or_get_font(font: &FontRef, ifc_fonts: &mut Vec<FontKeyAndMetr
 
 pub(super) fn get_font_for_first_font_for_style(
     style: &ComputedValues,
-    font_context: &FontContext<FontCacheThread>,
+    font_context: &FontContext,
 ) -> Option<FontRef> {
     let font = font_context
         .font_group(style.clone_font())

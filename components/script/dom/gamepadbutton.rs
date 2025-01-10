@@ -11,6 +11,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct GamepadButton {
@@ -34,11 +35,12 @@ impl GamepadButton {
         reflect_dom_object(
             Box::new(GamepadButton::new_inherited(pressed, touched)),
             global,
+            CanGc::note(),
         )
     }
 }
 
-impl GamepadButtonMethods for GamepadButton {
+impl GamepadButtonMethods<crate::DomTypeHolder> for GamepadButton {
     // https://www.w3.org/TR/gamepad/#widl-GamepadButton-pressed
     fn Pressed(&self) -> bool {
         self.pressed.get()

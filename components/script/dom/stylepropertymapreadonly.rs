@@ -16,6 +16,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssstylevalue::CSSStyleValue;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct StylePropertyMapReadOnly {
@@ -56,11 +57,12 @@ impl StylePropertyMapReadOnly {
         reflect_dom_object(
             Box::new(StylePropertyMapReadOnly::new_inherited(iter)),
             global,
+            CanGc::note(),
         )
     }
 }
 
-impl StylePropertyMapReadOnlyMethods for StylePropertyMapReadOnly {
+impl StylePropertyMapReadOnlyMethods<crate::DomTypeHolder> for StylePropertyMapReadOnly {
     /// <https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymapreadonly-get>
     fn Get(&self, property: DOMString) -> Option<DomRoot<CSSStyleValue>> {
         // TODO: avoid constructing an Atom

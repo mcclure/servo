@@ -28,7 +28,8 @@ use script_traits::{DrawAPaintImageResult, PaintWorkletError, Painter};
 use servo_atoms::Atom;
 use servo_config::pref;
 use servo_url::ServoUrl;
-use style_traits::{CSSPixel, DevicePixel, SpeculativePainter};
+use style_traits::{CSSPixel, SpeculativePainter};
+use webrender_api::units::DevicePixel;
 
 use super::bindings::trace::HashMapTracedValues;
 use crate::dom::bindings::callback::CallbackContainer;
@@ -85,7 +86,7 @@ pub struct PaintWorkletGlobalScope {
 
 impl PaintWorkletGlobalScope {
     #[allow(unsafe_code)]
-    pub fn new(
+    pub(crate) fn new(
         runtime: &Runtime,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
@@ -267,7 +268,7 @@ impl PaintWorkletGlobalScope {
             Entry::Occupied(entry) => paint_instance.set(entry.get().get()),
             Entry::Vacant(entry) => {
                 // Step 5.2-5.3
-                let args = HandleValueArray::new();
+                let args = HandleValueArray::empty();
                 rooted!(in(*cx) let mut result = null_mut::<JSObject>());
                 unsafe {
                     Construct1(*cx, class_constructor.handle(), &args, result.handle_mut());
@@ -305,23 +306,22 @@ impl PaintWorkletGlobalScope {
         // TODO: Step 10
         // Steps 11-12
         debug!("Invoking paint function {}.", name);
-        rooted_vec!(let arguments_values <- arguments.iter().cloned()
-                    .map(|argument| CSSStyleValue::new(self.upcast(), argument)));
-        let arguments_value_vec: Vec<JSVal> = arguments_values
-            .iter()
-            .map(|argument| ObjectValue(argument.reflector().get_jsobject().get()))
-            .collect();
-        let arguments_value_array =
-            unsafe { HandleValueArray::from_rooted_slice(&arguments_value_vec) };
+        rooted_vec!(let mut arguments_values);
+        for argument in arguments {
+            let style_value = CSSStyleValue::new(self.upcast(), argument.clone());
+            arguments_values.push(ObjectValue(style_value.reflector().get_jsobject().get()));
+        }
+        let arguments_value_array = HandleValueArray::from(&arguments_values);
         rooted!(in(*cx) let argument_object = unsafe { NewArrayObject(*cx, &arguments_value_array) });
 
-        let args_slice = [
-            ObjectValue(rendering_context.reflector().get_jsobject().get()),
-            ObjectValue(paint_size.reflector().get_jsobject().get()),
-            ObjectValue(properties.reflector().get_jsobject().get()),
-            ObjectValue(argument_object.get()),
-        ];
-        let args = unsafe { HandleValueArray::from_rooted_slice(&args_slice) };
+        rooted_vec!(let mut callback_args);
+        callback_args.push(ObjectValue(
+            rendering_context.reflector().get_jsobject().get(),
+        ));
+        callback_args.push(ObjectValue(paint_size.reflector().get_jsobject().get()));
+        callback_args.push(ObjectValue(properties.reflector().get_jsobject().get()));
+        callback_args.push(ObjectValue(argument_object.get()));
+        let args = HandleValueArray::from(&callback_args);
 
         rooted!(in(*cx) let mut result = UndefinedValue());
         unsafe {
@@ -491,7 +491,7 @@ impl PaintDefinition {
     }
 }
 
-impl PaintWorkletGlobalScopeMethods for PaintWorkletGlobalScope {
+impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobalScope {
     #[allow(unsafe_code)]
     #[allow(crown::unrooted_must_root)]
     /// <https://drafts.css-houdini.org/css-paint-api/#dom-paintworkletglobalscope-registerpaint>

@@ -15,7 +15,7 @@ use js::jsapi::{
 };
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::wrappers::{JS_GetProperty, JS_WrapObject};
-use js::rust::{MutableHandleObject, Runtime};
+use js::rust::{HandleObject, MutableHandleObject, Runtime};
 
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::error::{report_pending_exception, Error, Fallible};
@@ -27,7 +27,7 @@ use crate::dom::bindings::utils::AsCCharPtrPtr;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::realms::{enter_realm, InRealm};
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 /// The exception handling used for a call.
 #[derive(Clone, Copy, PartialEq)]
@@ -93,8 +93,9 @@ impl Drop for CallbackObject {
     #[allow(unsafe_code)]
     fn drop(&mut self) {
         unsafe {
-            let cx = Runtime::get();
-            RemoveRawValueRoot(cx, self.permanent_js_root.get_unsafe());
+            if let Some(cx) = Runtime::get() {
+                RemoveRawValueRoot(cx.as_ptr(), self.permanent_js_root.get_unsafe());
+            }
         }
     }
 }
@@ -205,9 +206,29 @@ impl CallbackInterface {
     }
 }
 
+pub trait ThisReflector {
+    fn jsobject(&self) -> *mut JSObject;
+}
+
+impl<T: DomObject> ThisReflector for T {
+    fn jsobject(&self) -> *mut JSObject {
+        self.reflector().get_jsobject().get()
+    }
+}
+
+impl ThisReflector for HandleObject<'_> {
+    fn jsobject(&self) -> *mut JSObject {
+        self.get()
+    }
+}
+
 /// Wraps the reflector for `p` into the realm of `cx`.
-pub fn wrap_call_this_object<T: DomObject>(cx: JSContext, p: &T, mut rval: MutableHandleObject) {
-    rval.set(p.reflector().get_jsobject().get());
+pub fn wrap_call_this_object<T: ThisReflector>(
+    cx: JSContext,
+    p: &T,
+    mut rval: MutableHandleObject,
+) {
+    rval.set(p.jsobject());
     assert!(!rval.get().is_null());
 
     unsafe {
@@ -271,7 +292,7 @@ impl Drop for CallSetup {
             LeaveRealm(*self.cx, self.old_realm);
             if self.handling == ExceptionHandling::Report {
                 let ar = enter_realm(&*self.exception_global);
-                report_pending_exception(*self.cx, true, InRealm::Entered(&ar));
+                report_pending_exception(*self.cx, true, InRealm::Entered(&ar), CanGc::note());
             }
             drop(self.incumbent_script.take());
             drop(self.entry_script.take().unwrap());

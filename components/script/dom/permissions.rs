@@ -12,6 +12,7 @@ use js::jsapi::JSObject;
 use js::jsval::{ObjectValue, UndefinedValue};
 use servo_config::pref;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{
     PermissionDescriptor, PermissionName, PermissionState, PermissionStatusMethods,
 };
@@ -25,10 +26,11 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::permissionstatus::PermissionStatus;
 use crate::dom::promise::Promise;
 use crate::realms::{AlreadyInRealm, InRealm};
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 pub trait PermissionAlgorithm {
     type Descriptor;
+    #[crown::unrooted_must_root_lint::must_root]
     type Status;
     fn create_descriptor(
         cx: JSContext,
@@ -46,7 +48,7 @@ pub trait PermissionAlgorithm {
         descriptor: &Self::Descriptor,
         status: &Self::Status,
     );
-    fn permission_revoke(descriptor: &Self::Descriptor, status: &Self::Status);
+    fn permission_revoke(descriptor: &Self::Descriptor, status: &Self::Status, can_gc: CanGc);
 }
 
 enum Operation {
@@ -69,7 +71,11 @@ impl Permissions {
     }
 
     pub fn new(global: &GlobalScope) -> DomRoot<Permissions> {
-        reflect_dom_object(Box::new(Permissions::new_inherited()), global)
+        reflect_dom_object(
+            Box::new(Permissions::new_inherited()),
+            global,
+            CanGc::note(),
+        )
     }
 
     // https://w3c.github.io/permissions/#dom-permissions-query
@@ -82,13 +88,14 @@ impl Permissions {
         cx: JSContext,
         permissionDesc: *mut JSObject,
         promise: Option<Rc<Promise>>,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         // (Query, Request) Step 3.
         let p = match promise {
             Some(promise) => promise,
             None => {
                 let in_realm_proof = AlreadyInRealm::assert();
-                Promise::new_in_current_realm(InRealm::Already(&in_realm_proof))
+                Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc)
             },
         };
 
@@ -138,7 +145,7 @@ impl Permissions {
                             .remove(&root_desc.name.to_string());
 
                         // (Revoke) Step 4.
-                        Bluetooth::permission_revoke(&bluetooth_desc, &result)
+                        Bluetooth::permission_revoke(&bluetooth_desc, &result, can_gc)
                     },
                 }
             },
@@ -170,14 +177,16 @@ impl Permissions {
                             .remove(&root_desc.name.to_string());
 
                         // (Revoke) Step 4.
-                        Permissions::permission_revoke(&root_desc, &status);
+                        Permissions::permission_revoke(&root_desc, &status, can_gc);
                     },
                 }
             },
         };
         match op {
             // (Revoke) Step 5.
-            Operation::Revoke => self.manipulate(Operation::Query, cx, permissionDesc, Some(p)),
+            Operation::Revoke => {
+                self.manipulate(Operation::Query, cx, permissionDesc, Some(p), can_gc)
+            },
 
             // (Query, Request) Step 4.
             _ => p,
@@ -186,20 +195,20 @@ impl Permissions {
 }
 
 #[allow(non_snake_case)]
-impl PermissionsMethods for Permissions {
+impl PermissionsMethods<crate::DomTypeHolder> for Permissions {
     // https://w3c.github.io/permissions/#dom-permissions-query
-    fn Query(&self, cx: JSContext, permissionDesc: *mut JSObject) -> Rc<Promise> {
-        self.manipulate(Operation::Query, cx, permissionDesc, None)
+    fn Query(&self, cx: JSContext, permissionDesc: *mut JSObject, can_gc: CanGc) -> Rc<Promise> {
+        self.manipulate(Operation::Query, cx, permissionDesc, None, can_gc)
     }
 
     // https://w3c.github.io/permissions/#dom-permissions-request
-    fn Request(&self, cx: JSContext, permissionDesc: *mut JSObject) -> Rc<Promise> {
-        self.manipulate(Operation::Request, cx, permissionDesc, None)
+    fn Request(&self, cx: JSContext, permissionDesc: *mut JSObject, can_gc: CanGc) -> Rc<Promise> {
+        self.manipulate(Operation::Request, cx, permissionDesc, None, can_gc)
     }
 
     // https://w3c.github.io/permissions/#dom-permissions-revoke
-    fn Revoke(&self, cx: JSContext, permissionDesc: *mut JSObject) -> Rc<Promise> {
-        self.manipulate(Operation::Revoke, cx, permissionDesc, None)
+    fn Revoke(&self, cx: JSContext, permissionDesc: *mut JSObject, can_gc: CanGc) -> Rc<Promise> {
+        self.manipulate(Operation::Revoke, cx, permissionDesc, None, can_gc)
     }
 }
 
@@ -247,8 +256,7 @@ impl PermissionAlgorithm for Permissions {
             // Step 3.
             PermissionState::Prompt => {
                 let perm_name = status.get_query();
-                let prompt =
-                    PermissionPrompt::Request(embedder_traits::PermissionName::from(perm_name));
+                let prompt = PermissionPrompt::Request(perm_name.convert());
 
                 // https://w3c.github.io/permissions/#request-permission-to-use (Step 3 - 4)
                 let globalscope = GlobalScope::current().expect("No current global object");
@@ -267,7 +275,12 @@ impl PermissionAlgorithm for Permissions {
         Permissions::permission_query(cx, promise, descriptor, status);
     }
 
-    fn permission_revoke(_descriptor: &PermissionDescriptor, _status: &PermissionStatus) {}
+    fn permission_revoke(
+        _descriptor: &PermissionDescriptor,
+        _status: &PermissionStatus,
+        _can_gc: CanGc,
+    ) {
+    }
 }
 
 // https://w3c.github.io/permissions/#permission-state
@@ -296,7 +309,7 @@ pub fn get_descriptor_permission_state(
             .borrow_mut()
             .remove(&permission_name.to_string());
         prompt_user_from_embedder(
-            PermissionPrompt::Insecure(embedder_traits::PermissionName::from(permission_name)),
+            PermissionPrompt::Insecure(permission_name.convert()),
             &globalscope,
         )
     };
@@ -365,9 +378,9 @@ fn prompt_user_from_embedder(prompt: PermissionPrompt, gs: &GlobalScope) -> Perm
     }
 }
 
-impl From<PermissionName> for embedder_traits::PermissionName {
-    fn from(permission_name: PermissionName) -> Self {
-        match permission_name {
+impl Convert<embedder_traits::PermissionName> for PermissionName {
+    fn convert(self) -> embedder_traits::PermissionName {
+        match self {
             PermissionName::Geolocation => embedder_traits::PermissionName::Geolocation,
             PermissionName::Notifications => embedder_traits::PermissionName::Notifications,
             PermissionName::Push => embedder_traits::PermissionName::Push,

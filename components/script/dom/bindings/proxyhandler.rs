@@ -486,7 +486,7 @@ pub unsafe fn cross_origin_get(
         *cx,
         receiver,
         getter_jsval.handle().into(),
-        &jsapi::HandleValueArray::new(),
+        &jsapi::HandleValueArray::empty(),
         vp,
     )
 }
@@ -631,7 +631,7 @@ pub unsafe fn cross_origin_get_own_property_helper(
         holder.handle_mut().into(),
     );
 
-    return JS_GetOwnPropertyDescriptorById(*cx, holder.handle().into(), id, desc, is_none);
+    JS_GetOwnPropertyDescriptorById(*cx, holder.handle().into(), id, desc, is_none)
 }
 
 /// Implementation of [`CrossOriginPropertyFallback`].

@@ -1,4 +1,5 @@
 // META: script=/resources/testdriver.js
+// META: script=/resources/testdriver-vendor.js
 // META: script=/common/utils.js
 // META: script=resources/ba-fledge-util.sub.js
 // META: script=resources/fledge-util.sub.js
@@ -27,12 +28,18 @@ function validateWithOneIg(decoded) {
 }
 
 subsetTest(promise_test, async test => {
-  const result = await navigator.getInterestGroupAdAuctionData({ seller: window.location.origin });
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length === 0);
 }, 'getInterestGroupAdAuctionData() with no interest groups returns a zero length result.');
 
 async function testInvalidConfig(test, configObj, desc) {
+  if (!configObj.coordinatorOrigin) {
+    configObj.coordinatorOrigin = await BA.configureCoordinator();
+  }
   await promise_rejects_js(
       test, TypeError, navigator.getInterestGroupAdAuctionData(configObj),
       desc);
@@ -83,6 +90,7 @@ subsetTest(promise_test, async test => {
 
   // These two actually succeed.
   let result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
     seller: 'https://example.org',
     perBuyerConfig:
         {'https://a.com': {targetSize: 400}, 'https://b.com': {targetSize: 500}}
@@ -90,6 +98,7 @@ subsetTest(promise_test, async test => {
   assert_true(result.requestId !== null);
 
   result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
     seller: 'https://example.org',
     perBuyerConfig: {'https://a.com': {targetSize: 400}, 'https://b.com': {}},
     requestSize: 5000
@@ -101,7 +110,10 @@ subsetTest(promise_test, async test => {
   const uuid = generateUuid(test);
   await joinInterestGroup(test, uuid);
 
-  const result = await navigator.getInterestGroupAdAuctionData({ seller: window.location.origin });
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -127,8 +139,10 @@ subsetTest(promise_test, async test => {
     ]
   });
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -153,8 +167,10 @@ subsetTest(promise_test, async test => {
     ]
   });
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -177,8 +193,10 @@ subsetTest(promise_test, async test => {
       test, uuid,
       {auctionServerRequestFlags: ['include-full-ads'], ads: adsArray});
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -252,8 +270,10 @@ subsetTest(promise_test, async test => {
   igConfig.auctionServerRequestFlags = ['include-full-ads'];
   await joinInterestGroup(test, uuid, igConfig);
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -303,8 +323,10 @@ subsetTest(promise_test, async test => {
   const igConfig = makeTemplateIgConfig(uuid);
   await joinInterestGroup(test, uuid, igConfig);
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -329,8 +351,10 @@ subsetTest(promise_test, async test => {
   igConfig.auctionServerRequestFlags = ['omit-user-bidding-signals'];
   await joinInterestGroup(test, uuid, igConfig);
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -363,8 +387,10 @@ subsetTest(promise_test, async test => {
   await waitForObservedRequests(
       uuid, [createBidderReportURL(uuid), createSellerReportURL(uuid)]);
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -373,15 +399,16 @@ subsetTest(promise_test, async test => {
   assert_equals(ig.browserSignals.joinCount, 2, 'joinCount');
   assert_equals(ig.browserSignals.bidCount, 1, 'bidCount');
 
-  // Recency is the # of seconds since the join. We can't exactly say what it
-  // is, but it shouldn't be too huge.
-  assert_true(typeof ig.browserSignals.recency === 'number');
+  // RecencyMs is the # of milliseconds since the join. We can't exactly say
+  // what it is, but it shouldn't be too huge.
+  assert_true(typeof ig.browserSignals.recencyMs === 'number');
   assert_between_inclusive(
-      ig.browserSignals.recency, 0, 60, 'Recency is between 0 and 60 seconds');
+      ig.browserSignals.recencyMs, 0, 60000,
+      'RecencyMs is between 0 and 60 seconds');
   // It's also supposed to be an integer.
   assert_equals(
-      ig.browserSignals.recency, Math.round(ig.browserSignals.recency),
-      'Recency is an integer');
+      ig.browserSignals.recencyMs, Math.round(ig.browserSignals.recencyMs),
+      'RecencyMs is an integer');
 
   // One win. The format here depends highly on whether full ads are used or
   // not.
@@ -422,8 +449,10 @@ subsetTest(promise_test, async test => {
   await waitForObservedRequests(
       uuid, [createBidderReportURL(uuid), createSellerReportURL(uuid)]);
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -432,15 +461,16 @@ subsetTest(promise_test, async test => {
   assert_equals(ig.browserSignals.joinCount, 2, 'joinCount');
   assert_equals(ig.browserSignals.bidCount, 1, 'bidCount');
 
-  // Recency is the # of seconds since the join. We can't exactly say what it
-  // is, but it shouldn't be too huge.
-  assert_true(typeof ig.browserSignals.recency === 'number');
+  // RecencyMs is the # of milliseconds since the join. We can't exactly say
+  // what it is, but it shouldn't be too huge.
+  assert_true(typeof ig.browserSignals.recencyMs === 'number');
   assert_between_inclusive(
-      ig.browserSignals.recency, 0, 60, 'Recency is between 0 and 60 seconds');
+      ig.browserSignals.recencyMs, 0, 60000,
+      'RecencyMs is between 0 and 60 seconds');
   // It's also supposed to be an integer.
   assert_equals(
-      ig.browserSignals.recency, Math.round(ig.browserSignals.recency),
-      'Recency is an integer');
+      ig.browserSignals.recencyMs, Math.round(ig.browserSignals.recencyMs),
+      'RecencyMs is an integer');
 
   // One win. The format here depends highly on whether full ads are used or
   // not.
@@ -477,8 +507,10 @@ subsetTest(promise_test, async test => {
   await joinInterestGroup(test, uuid, {...igTemplate, name: 'first'});
   await joinInterestGroup(test, uuid, {...igTemplate, name: 'second'});
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -513,8 +545,10 @@ subsetTest(promise_test, async test => {
   await joinCrossOriginIG(test, uuid, OTHER_ORIGIN3, 'o3');
   await joinCrossOriginIG(test, uuid, OTHER_ORIGIN4, 'o4');
 
-  const result = await navigator.getInterestGroupAdAuctionData(
-      {seller: window.location.origin});
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
   assert_true(result.requestId !== null);
   assert_true(result.request.length > 0);
 
@@ -545,6 +579,7 @@ subsetTest(promise_test, async test => {
   await joinCrossOriginIG(test, uuid, OTHER_ORIGIN4, 'o4');
 
   let config = {
+    coordinatorOrigin: await BA.configureCoordinator(),
     seller: window.location.origin,
     perBuyerConfig: {},
     requestSize: 5000
@@ -566,3 +601,20 @@ subsetTest(promise_test, async test => {
   assert_equals(decoded.message.interestGroups[OTHER_ORIGIN3].length, 1);
   assert_equals(decoded.message.interestGroups[OTHER_ORIGIN3][0].name, 'o3');
 }, 'getInterestGroupAdAuctionData() uses perBuyerConfig to select buyers');
+
+subsetTest(promise_test, async test => {
+  const uuid = generateUuid(test);
+  await joinInterestGroup(test, uuid);
+
+  const result = await navigator.getInterestGroupAdAuctionData({
+    coordinatorOrigin: await BA.configureCoordinator(),
+    seller: window.location.origin
+  });
+  assert_true(result.requestId !== null);
+  assert_true(result.request.length > 0);
+
+  let decoded = await BA.decodeInterestGroupData(result.request);
+
+  assert_own_property(decoded.message, 'enforceKAnon');
+  assert_equals(decoded.message.enforceKAnon, true);
+}, 'getInterestGroupAdAuctionData() requests k-anon.');

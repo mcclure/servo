@@ -83,12 +83,21 @@ interface Element : Node {
   [CEReactions, Throws]
   undefined insertAdjacentHTML(DOMString position, DOMString html);
 
-  [Throws, Pref="dom.shadowdom.enabled"] ShadowRoot attachShadow();
+  [Throws, Pref="dom.shadowdom.enabled"] ShadowRoot attachShadow(ShadowRootInit init);
+  readonly attribute ShadowRoot? shadowRoot;
+};
+
+dictionary ShadowRootInit {
+  required ShadowRootMode mode;
+  // boolean delegatesFocus = false;
+  // SlotAssignmentMode slotAssignment = "named";
+  boolean clonable = false;
+  // boolean serializable = false;
 };
 
 // http://dev.w3.org/csswg/cssom-view/#extensions-to-the-element-interface
 partial interface Element {
-  sequence<DOMRect> getClientRects();
+  DOMRectList getClientRects();
   [NewObject]
   DOMRect getBoundingClientRect();
 
@@ -112,10 +121,8 @@ partial interface Element {
 
 // https://w3c.github.io/DOM-Parsing/#extensions-to-the-element-interface
 partial interface Element {
-  [CEReactions, Throws]
-  attribute [LegacyNullToEmptyString] DOMString innerHTML;
-  [CEReactions, Throws]
-  attribute [LegacyNullToEmptyString] DOMString outerHTML;
+  [CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString innerHTML;
+  [CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString outerHTML;
 };
 
 // https://fullscreen.spec.whatwg.org/#api

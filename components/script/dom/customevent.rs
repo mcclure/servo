@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use servo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::CustomEventBinding;
@@ -36,8 +36,8 @@ impl CustomEvent {
         }
     }
 
-    pub fn new_uninitialized(global: &GlobalScope) -> DomRoot<CustomEvent> {
-        Self::new_uninitialized_with_proto(global, None, CanGc::note())
+    pub fn new_uninitialized(global: &GlobalScope, can_gc: CanGc) -> DomRoot<CustomEvent> {
+        Self::new_uninitialized_with_proto(global, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
@@ -67,25 +67,6 @@ impl CustomEvent {
         ev
     }
 
-    #[allow(unsafe_code, non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-        can_gc: CanGc,
-        type_: DOMString,
-        init: RootedTraceableBox<CustomEventBinding::CustomEventInit>,
-    ) -> DomRoot<CustomEvent> {
-        CustomEvent::new(
-            global,
-            proto,
-            Atom::from(type_),
-            init.parent.bubbles,
-            init.parent.cancelable,
-            init.detail.handle(),
-            can_gc,
-        )
-    }
-
     fn init_custom_event(
         &self,
         type_: Atom,
@@ -103,10 +84,29 @@ impl CustomEvent {
     }
 }
 
-impl CustomEventMethods for CustomEvent {
+impl CustomEventMethods<crate::DomTypeHolder> for CustomEvent {
+    // https://dom.spec.whatwg.org/#dom-customevent-customevent
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        type_: DOMString,
+        init: RootedTraceableBox<CustomEventBinding::CustomEventInit>,
+    ) -> DomRoot<CustomEvent> {
+        CustomEvent::new(
+            global,
+            proto,
+            Atom::from(type_),
+            init.parent.bubbles,
+            init.parent.cancelable,
+            init.detail.handle(),
+            can_gc,
+        )
+    }
+
     // https://dom.spec.whatwg.org/#dom-customevent-detail
-    fn Detail(&self, _cx: JSContext) -> JSVal {
-        self.detail.get()
+    fn Detail(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.detail.get())
     }
 
     // https://dom.spec.whatwg.org/#dom-customevent-initcustomevent

@@ -2,15 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::LazyLock;
 
 use base::text::{is_cjk, UnicodeBlock, UnicodeBlockMethod};
 use log::warn;
-use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{
     FontStretch as StyleFontStretch, FontStyle as StyleFontStyle, FontWeight as StyleFontWeight,
@@ -19,32 +15,11 @@ use style::Atom;
 
 use super::xml::{Attribute, Node};
 use crate::{
-    FallbackFontSelectionOptions, FontTemplate, FontTemplateDescriptor, LowercaseFontFamilyName,
+    FallbackFontSelectionOptions, FontIdentifier, FontTemplate, FontTemplateDescriptor,
+    LocalFontIdentifier, LowercaseFontFamilyName,
 };
 
 static FONT_LIST: LazyLock<FontList> = LazyLock::new(|| FontList::new());
-
-/// An identifier for a local font on Android systems.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub struct LocalFontIdentifier {
-    /// The path to the font.
-    pub path: Atom,
-}
-
-impl LocalFontIdentifier {
-    pub(crate) fn index(&self) -> u32 {
-        0
-    }
-
-    pub(crate) fn read_data_from_file(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        File::open(Path::new(&*self.path))
-            .expect("Couldn't open font file!")
-            .read_to_end(&mut bytes)
-            .unwrap();
-        bytes
-    }
-}
 
 // Android doesn't provide an API to query system fonts until Android O:
 // https://developer.android.com/reference/android/text/FontConfig.html
@@ -452,7 +427,7 @@ impl FontList {
     }
 }
 
-// Functions used by FontCacheThread
+// Functions used by SystemFontSerivce
 pub fn for_each_available_family<F>(mut callback: F)
 where
     F: FnMut(String),
@@ -472,6 +447,7 @@ where
     let mut produce_font = |font: &Font| {
         let local_font_identifier = LocalFontIdentifier {
             path: Atom::from(FontList::font_absolute_path(&font.filename)),
+            variation_index: 0,
         };
         let stretch = StyleFontStretch::NORMAL;
         let weight = font
@@ -491,9 +467,10 @@ where
             None => StyleFontStyle::NORMAL,
         };
         let descriptor = FontTemplateDescriptor::new(weight, stretch, style);
-        callback(FontTemplate::new_for_local_font(
-            local_font_identifier,
+        callback(FontTemplate::new(
+            FontIdentifier::Local(local_font_identifier),
             descriptor,
+            None,
         ));
     };
 

@@ -15,7 +15,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::window::Window;
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct AudioTrackList {
@@ -44,6 +44,7 @@ impl AudioTrackList {
         reflect_dom_object(
             Box::new(AudioTrackList::new_inherited(tracks, media_element)),
             window,
+            CanGc::note(),
         )
     }
 
@@ -88,18 +89,11 @@ impl AudioTrackList {
         // Queue a task to fire an event named change.
         let global = &self.global();
         let this = Trusted::new(self);
-        let (source, canceller) = global
-            .as_window()
-            .task_manager()
-            .media_element_task_source_with_canceller();
-
-        let _ = source.queue_with_canceller(
-            task!(media_track_change: move || {
-                let this = this.root();
-                this.upcast::<EventTarget>().fire_event(atom!("change"));
-            }),
-            &canceller,
-        );
+        let task_source = global.task_manager().media_element_task_source();
+        task_source.queue(task!(media_track_change: move || {
+            let this = this.root();
+            this.upcast::<EventTarget>().fire_event(atom!("change"), CanGc::note());
+        }));
     }
 
     pub fn add(&self, track: &AudioTrack) {
@@ -116,7 +110,7 @@ impl AudioTrackList {
     }
 }
 
-impl AudioTrackListMethods for AudioTrackList {
+impl AudioTrackListMethods<crate::DomTypeHolder> for AudioTrackList {
     // https://html.spec.whatwg.org/multipage/#dom-audiotracklist-length
     fn Length(&self) -> u32 {
         self.len() as u32

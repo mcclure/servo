@@ -16,6 +16,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, MutDom};
 use crate::dom::document::Document;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#interface-treewalker
 #[dom_struct]
@@ -50,6 +51,7 @@ impl TreeWalker {
         reflect_dom_object(
             Box::new(TreeWalker::new_inherited(root_node, what_to_show, filter)),
             document.window(),
+            CanGc::note(),
         )
     }
 
@@ -67,7 +69,7 @@ impl TreeWalker {
     }
 }
 
-impl TreeWalkerMethods for TreeWalker {
+impl TreeWalkerMethods<crate::DomTypeHolder> for TreeWalker {
     // https://dom.spec.whatwg.org/#dom-treewalker-root
     fn Root(&self) -> DomRoot<Node> {
         DomRoot::from_ref(&*self.root_node)
@@ -454,7 +456,7 @@ impl TreeWalker {
     }
 }
 
-impl<'a> Iterator for &'a TreeWalker {
+impl Iterator for &TreeWalker {
     type Item = DomRoot<Node>;
 
     fn next(&mut self) -> Option<DomRoot<Node>> {

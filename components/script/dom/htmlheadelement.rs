@@ -14,9 +14,10 @@ use crate::dom::document::{determine_policy_for_token, Document};
 use crate::dom::element::Element;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlmetaelement::HTMLMetaElement;
-use crate::dom::node::{document_from_node, BindContext, Node, ShadowIncluding};
+use crate::dom::node::{BindContext, Node, NodeTraits, ShadowIncluding};
 use crate::dom::userscripts::load_script;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLHeadElement {
@@ -40,11 +41,13 @@ impl HTMLHeadElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLHeadElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLHeadElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -53,7 +56,7 @@ impl HTMLHeadElement {
 
     /// <https://html.spec.whatwg.org/multipage/#meta-referrer>
     pub fn set_document_referrer(&self) {
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
 
         if doc.GetHead().as_deref() != Some(self) {
             return;
@@ -84,7 +87,7 @@ impl HTMLHeadElement {
 
     /// <https://html.spec.whatwg.org/multipage/#attr-meta-http-equiv-content-security-policy>
     pub fn set_content_security_policy(&self) {
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
 
         if doc.GetHead().as_deref() != Some(self) {
             return;
@@ -92,7 +95,7 @@ impl HTMLHeadElement {
 
         let mut csp_list: Option<CspList> = None;
         let node = self.upcast::<Node>();
-        let candinates = node
+        let candidates = node
             .traverse_preorder(ShadowIncluding::No)
             .filter_map(DomRoot::downcast::<Element>)
             .filter(|elem| elem.is::<HTMLMetaElement>())
@@ -106,7 +109,7 @@ impl HTMLHeadElement {
                     .is_some()
             });
 
-        for meta in candinates {
+        for meta in candidates {
             if let Some(ref content) = meta.get_attribute(&ns!(), &local_name!("content")) {
                 let content = content.value();
                 let content_val = content.trim();

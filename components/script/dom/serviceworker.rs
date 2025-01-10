@@ -27,7 +27,7 @@ use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 use crate::task::TaskOnce;
 
 pub type TrustedServiceWorkerAddress = Trusted<ServiceWorker>;
@@ -71,18 +71,19 @@ impl ServiceWorker {
                 worker_id,
             )),
             global,
+            CanGc::note(),
         )
     }
 
-    pub fn dispatch_simple_error(address: TrustedServiceWorkerAddress) {
+    pub fn dispatch_simple_error(address: TrustedServiceWorkerAddress, can_gc: CanGc) {
         let service_worker = address.root();
-        service_worker.upcast().fire_event(atom!("error"));
+        service_worker.upcast().fire_event(atom!("error"), can_gc);
     }
 
-    pub fn set_transition_state(&self, state: ServiceWorkerState) {
+    pub fn set_transition_state(&self, state: ServiceWorkerState, can_gc: CanGc) {
         self.state.set(state);
         self.upcast::<EventTarget>()
-            .fire_event(atom!("statechange"));
+            .fire_event(atom!("statechange"), can_gc);
     }
 
     pub fn get_script_url(&self) -> ServoUrl {
@@ -118,7 +119,7 @@ impl ServiceWorker {
     }
 }
 
-impl ServiceWorkerMethods for ServiceWorker {
+impl ServiceWorkerMethods<crate::DomTypeHolder> for ServiceWorker {
     // https://w3c.github.io/ServiceWorker/#service-worker-state-attribute
     fn State(&self) -> ServiceWorkerState {
         self.state.get()
@@ -167,6 +168,6 @@ impl ServiceWorkerMethods for ServiceWorker {
 impl TaskOnce for SimpleWorkerErrorHandler<ServiceWorker> {
     #[allow(crown::unrooted_must_root)]
     fn run_once(self) {
-        ServiceWorker::dispatch_simple_error(self.addr);
+        ServiceWorker::dispatch_simple_error(self.addr, CanGc::note());
     }
 }

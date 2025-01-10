@@ -10,14 +10,17 @@ use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
-use style::values::computed::{LengthPercentage, LengthPercentageOrAuto};
 use style::Zero;
 
 use super::{BaseFragment, BaseFragmentInfo, CollapsedBlockMargins, Fragment};
 use crate::cell::ArcRefCell;
 use crate::formatting_contexts::Baselines;
-use crate::geom::{AuOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize, ToLogical};
+use crate::fragment_tree::FragmentFlags;
+use crate::geom::{
+    AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, ToLogical,
+};
 use crate::style_ext::ComputedValuesExt;
+use crate::taffy::DetailedTaffyGridInfo;
 
 /// Describes how a [`BoxFragment`] paints its background.
 pub(crate) enum BackgroundMode {
@@ -35,6 +38,11 @@ pub(crate) enum BackgroundMode {
 pub(crate) struct ExtraBackground {
     pub style: ServoArc<ComputedValues>,
     pub rect: PhysicalRect<Au>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DetailedLayoutInfo {
+    Grid(Box<DetailedTaffyGridInfo>),
 }
 
 #[derive(Serialize)]
@@ -71,9 +79,6 @@ pub(crate) struct BoxFragment {
     /// The scrollable overflow of this box fragment.
     pub scrollable_overflow_from_children: PhysicalRect<Au>,
 
-    /// Whether or not this box was overconstrained in the given dimension.
-    overconstrained: PhysicalSize<bool>,
-
     /// The resolved box insets if this box is `position: sticky`. These are calculated
     /// during stacking context tree construction because they rely on the size of the
     /// scroll container.
@@ -81,6 +86,10 @@ pub(crate) struct BoxFragment {
 
     #[serde(skip_serializing)]
     pub background_mode: BackgroundMode,
+
+    /// Additional information of from layout that could be used by Javascripts and devtools.
+    #[serde(skip_serializing)]
+    pub detailed_layout_info: Option<DetailedLayoutInfo>,
 }
 
 impl BoxFragment {
@@ -95,42 +104,6 @@ impl BoxFragment {
         margin: PhysicalSides<Au>,
         clearance: Option<Au>,
         block_margins_collapsed_with_children: CollapsedBlockMargins,
-    ) -> BoxFragment {
-        let position = style.get_box().position;
-        let insets = style.get_position();
-        let width_overconstrained = position == ComputedPosition::Relative &&
-            !insets.left.is_auto() &&
-            !insets.right.is_auto();
-        let height_overconstrained = position == ComputedPosition::Relative &&
-            !insets.left.is_auto() &&
-            !insets.bottom.is_auto();
-
-        Self::new_with_overconstrained(
-            base_fragment_info,
-            style,
-            children,
-            content_rect,
-            padding,
-            border,
-            margin,
-            clearance,
-            block_margins_collapsed_with_children,
-            PhysicalSize::new(width_overconstrained, height_overconstrained),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_overconstrained(
-        base_fragment_info: BaseFragmentInfo,
-        style: ServoArc<ComputedValues>,
-        children: Vec<Fragment>,
-        content_rect: PhysicalRect<Au>,
-        padding: PhysicalSides<Au>,
-        border: PhysicalSides<Au>,
-        margin: PhysicalSides<Au>,
-        clearance: Option<Au>,
-        block_margins_collapsed_with_children: CollapsedBlockMargins,
-        overconstrained: PhysicalSize<bool>,
     ) -> BoxFragment {
         let scrollable_overflow_from_children =
             children.iter().fold(PhysicalRect::zero(), |acc, child| {
@@ -149,9 +122,9 @@ impl BoxFragment {
             baselines: Baselines::default(),
             block_margins_collapsed_with_children,
             scrollable_overflow_from_children,
-            overconstrained,
             resolved_sticky_insets: None,
             background_mode: BackgroundMode::Normal,
+            detailed_layout_info: None,
         }
     }
 
@@ -202,6 +175,11 @@ impl BoxFragment {
 
     pub fn set_does_not_paint_background(&mut self) {
         self.background_mode = BackgroundMode::None;
+    }
+
+    pub fn with_detailed_layout_info(mut self, info: Option<DetailedLayoutInfo>) -> Self {
+        self.detailed_layout_info = info;
+        self
     }
 
     pub fn scrollable_overflow(&self) -> PhysicalRect<Au> {
@@ -298,9 +276,6 @@ impl BoxFragment {
             "Should not call this method on statically positioned box."
         );
 
-        let (cb_width, cb_height) = (containing_block.width(), containing_block.height());
-        let content_rect = self.content_rect;
-
         if let Some(resolved_sticky_insets) = self.resolved_sticky_insets {
             return resolved_sticky_insets;
         }
@@ -320,7 +295,8 @@ impl BoxFragment {
         // the property is not over-constrained, then the resolved value is the
         // used value. Otherwise the resolved value is the computed value."
         // https://drafts.csswg.org/cssom/#resolved-values
-        let insets = self.style.get_position();
+        let insets = self.style.physical_box_offsets();
+        let (cb_width, cb_height) = (containing_block.width(), containing_block.height());
         if position == ComputedPosition::Relative {
             let get_resolved_axis = |start: &LengthPercentageOrAuto,
                                      end: &LengthPercentageOrAuto,
@@ -345,29 +321,32 @@ impl BoxFragment {
             position == ComputedPosition::Fixed || position == ComputedPosition::Absolute
         );
 
-        let resolve = |value: &LengthPercentageOrAuto, container_length: Au| -> Au {
-            value
-                .auto_is(LengthPercentage::zero)
-                .to_used_value(container_length)
-        };
-
-        let (top, bottom) = if self.overconstrained.height {
+        let margin_rect = self.margin_rect();
+        let (top, bottom) = match (&insets.top, &insets.bottom) {
             (
-                resolve(&insets.top, cb_height),
-                resolve(&insets.bottom, cb_height),
-            )
-        } else {
-            (content_rect.origin.y, cb_height - content_rect.max_y())
+                LengthPercentageOrAuto::LengthPercentage(top),
+                LengthPercentageOrAuto::LengthPercentage(bottom),
+            ) => (
+                top.to_used_value(cb_height),
+                bottom.to_used_value(cb_height),
+            ),
+            _ => (margin_rect.origin.y, cb_height - margin_rect.max_y()),
         };
-        let (left, right) = if self.overconstrained.width {
+        let (left, right) = match (&insets.left, &insets.right) {
             (
-                resolve(&insets.left, cb_width),
-                resolve(&insets.right, cb_width),
-            )
-        } else {
-            (content_rect.origin.x, cb_width - content_rect.max_x())
+                LengthPercentageOrAuto::LengthPercentage(left),
+                LengthPercentageOrAuto::LengthPercentage(right),
+            ) => (left.to_used_value(cb_width), right.to_used_value(cb_width)),
+            _ => (margin_rect.origin.x, cb_width - margin_rect.max_x()),
         };
 
         convert_to_au_or_auto(PhysicalSides::new(top, right, bottom, left))
+    }
+
+    /// Whether this is a non-replaced inline-level box whose inner display type is `flow`.
+    /// <https://drafts.csswg.org/css-display-3/#inline-box>
+    pub(crate) fn is_inline_box(&self) -> bool {
+        self.style.get_box().display.is_inline_flow() &&
+            !self.base.flags.contains(FragmentFlags::IS_REPLACED)
     }
 }

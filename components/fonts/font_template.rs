@@ -9,18 +9,15 @@ use std::sync::Arc;
 use atomic_refcell::AtomicRefCell;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
-use servo_url::ServoUrl;
 use style::computed_values::font_stretch::T as FontStretch;
 use style::computed_values::font_style::T as FontStyle;
 use style::stylesheets::DocumentStyleSheet;
 use style::values::computed::font::FontWeight;
 
-use crate::font::{FontDescriptor, PlatformFontMethods};
-use crate::font_cache_thread::{
+use crate::font::FontDescriptor;
+use crate::system_font_service::{
     CSSFontFaceDescriptors, ComputedFontStyleDescriptor, FontIdentifier,
 };
-use crate::platform::font::PlatformFont;
-use crate::platform::font_list::LocalFontIdentifier;
 
 /// A reference to a [`FontTemplate`] with shared ownership and mutability.
 pub type FontTemplateRef = Arc<AtomicRefCell<FontTemplate>>;
@@ -109,7 +106,7 @@ impl FontTemplateDescriptor {
             self.stretch.1 >= descriptor_to_match.stretch
     }
 
-    fn override_values_with_css_font_template_descriptors(
+    pub(crate) fn override_values_with_css_font_template_descriptors(
         &mut self,
         css_font_template_descriptors: &CSSFontFaceDescriptors,
     ) {
@@ -137,25 +134,18 @@ impl FontTemplateDescriptor {
 /// This describes all the information needed to create
 /// font instance handles. It contains a unique
 /// FontTemplateData structure that is platform specific.
-#[derive(Clone)]
+#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
 pub struct FontTemplate {
     pub identifier: FontIdentifier,
     pub descriptor: FontTemplateDescriptor,
-    /// The data to use for this [`FontTemplate`]. For web fonts, this is always filled, but
-    /// for local fonts, this is loaded only lazily in layout.
-    pub data: Option<Arc<Vec<u8>>>,
     /// If this font is a web font, this is a reference to the stylesheet that
     /// created it. This will be used to remove this font from caches, when the
     /// stylesheet is removed.
+    ///
+    /// This is not serialized, as it's only useful in the [`super::FontContext`]
+    /// that it is created in.
+    #[serde(skip)]
     pub stylesheet: Option<DocumentStyleSheet>,
-}
-
-impl malloc_size_of::MallocSizeOf for FontTemplate {
-    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
-        self.identifier.size_of(ops) +
-            self.descriptor.size_of(ops) +
-            self.data.as_ref().map_or(0, |data| (*data).size_of(ops))
-    }
 }
 
 impl Debug for FontTemplate {
@@ -168,40 +158,17 @@ impl Debug for FontTemplate {
 /// is common, regardless of the number of instances of
 /// this font handle per thread.
 impl FontTemplate {
-    /// Create a new [`FontTemplate`] for a system font installed locally.
-    pub fn new_for_local_font(
-        identifier: LocalFontIdentifier,
+    /// Create a new [`FontTemplate`].
+    pub fn new(
+        identifier: FontIdentifier,
         descriptor: FontTemplateDescriptor,
+        stylesheet: Option<DocumentStyleSheet>,
     ) -> FontTemplate {
         FontTemplate {
-            identifier: FontIdentifier::Local(identifier),
+            identifier,
             descriptor,
-            data: None,
-            stylesheet: None,
-        }
-    }
-
-    /// Create a new [`FontTemplate`] for a `@font-family` with a `url(...)` `src` font.
-    pub fn new_for_remote_web_font(
-        url: ServoUrl,
-        data: Arc<Vec<u8>>,
-        css_font_template_descriptors: &CSSFontFaceDescriptors,
-        stylesheet: Option<DocumentStyleSheet>,
-    ) -> Result<FontTemplate, &'static str> {
-        let identifier = FontIdentifier::Web(url.clone());
-        let Ok(handle) = PlatformFont::new_from_data(identifier, data.clone(), 0, None) else {
-            return Err("Could not initialize platform font data for: {url:?}");
-        };
-
-        let mut descriptor = handle.descriptor();
-        descriptor
-            .override_values_with_css_font_template_descriptors(css_font_template_descriptors);
-        Ok(FontTemplate {
-            identifier: FontIdentifier::Web(url),
-            descriptor,
-            data: Some(data),
             stylesheet,
-        })
+        }
     }
 
     /// Create a new [`FontTemplate`] for a `@font-family` with a `local(...)` `src`. This takes in
@@ -223,19 +190,9 @@ impl FontTemplate {
     pub fn identifier(&self) -> &FontIdentifier {
         &self.identifier
     }
-
-    /// Returns a reference to the bytes in this font if they are in memory.
-    /// This function never performs disk I/O.
-    pub fn data_if_in_memory(&self) -> Option<Arc<Vec<u8>>> {
-        self.data.clone()
-    }
 }
 
 pub trait FontTemplateRefMethods {
-    /// Returns a reference to the data in this font. This may be a hugely expensive
-    /// operation (depending on the platform) which performs synchronous disk I/O
-    /// and should never be done lightly.
-    fn data(&self) -> Arc<Vec<u8>>;
     /// Get the descriptor.
     fn descriptor(&self) -> FontTemplateDescriptor;
     /// Get the [`FontIdentifier`] for this template.
@@ -265,24 +222,6 @@ impl FontTemplateRefMethods for FontTemplateRef {
 
     fn descriptor_distance(&self, descriptor_to_match: &FontDescriptor) -> f32 {
         self.descriptor().distance_from(descriptor_to_match)
-    }
-
-    fn data(&self) -> Arc<Vec<u8>> {
-        if let Some(data) = self.borrow().data.clone() {
-            return data;
-        }
-
-        let mut template = self.borrow_mut();
-        let identifier = template.identifier.clone();
-        template
-            .data
-            .get_or_insert_with(|| match identifier {
-                FontIdentifier::Local(local_identifier) => {
-                    Arc::new(local_identifier.read_data_from_file())
-                },
-                FontIdentifier::Web(_) => unreachable!("Web fonts should always have data."),
-            })
-            .clone()
     }
 
     fn char_in_unicode_range(&self, character: char) -> bool {

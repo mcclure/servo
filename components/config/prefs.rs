@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use embedder_traits::resources::{self, Resource};
 use gen::Prefs;
-use log::warn;
+use log::{error, warn};
 use serde_json::{self, Value};
 
 use crate::pref_util::Preferences;
@@ -17,7 +17,10 @@ pub use crate::pref_util::{PrefError, PrefValue};
 
 static PREFS: LazyLock<Preferences<'static, Prefs>> = LazyLock::new(|| {
     let def_prefs: Prefs = serde_json::from_str(&resources::read_string(Resource::Preferences))
-        .expect("Failed to initialize config preferences.");
+        .unwrap_or_else(|_| {
+            error!("Preference json file is invalid. Setting Preference to default values");
+            Prefs::default()
+        });
     let result = Preferences::new(def_prefs, &gen::PREF_ACCESSORS);
     for (key, value) in result.iter() {
         set_stylo_pref_ref(&key, &value);
@@ -171,14 +174,6 @@ mod gen {
         13
     }
 
-    fn black() -> i64 {
-        0x000000
-    }
-
-    fn white() -> i64 {
-        0xFFFFFF
-    }
-
     build_structs! {
         // type of the accessors
         accessor_type = crate::pref_util::Accessor::<Prefs, crate::pref_util::PrefValue>,
@@ -186,14 +181,6 @@ mod gen {
         gen_accessors = PREF_ACCESSORS,
         // tree of structs to generate
         gen_types = Prefs {
-            browser: {
-                display: {
-                    #[serde(default = "white")]
-                    background_color: i64,
-                    #[serde(default = "black")]
-                    foreground_color: i64,
-                }
-            },
             fonts: {
                 #[serde(default)]
                 default: String,
@@ -210,6 +197,28 @@ mod gen {
                 #[serde(default = "default_monospace_font_size")]
                 #[serde(rename = "fonts.default-monospace-size")]
                 default_monospace_size: i64,
+            },
+            /// Allows customizing the different threadpools used by servo
+            threadpools: {
+                /// Number of workers per threadpool, if we fail to detect how much
+                /// parallelism is available at runtime.
+                fallback_worker_num: i64,
+                image_cache_workers: {
+                    /// Maximum number of workers for the Image Cache thread pool
+                    max: i64,
+                },
+                async_runtime_workers: {
+                    /// Maximum number of workers for the Networking async runtime thread pool
+                    max: i64
+                },
+                resource_workers: {
+                    /// Maximum number of workers for the Core Resource Manager
+                    max: i64,
+                },
+                webrender_workers: {
+                    /// Maximum number of workers for webrender
+                    max: i64,
+                },
             },
             css: {
                 animations: {
@@ -238,6 +247,10 @@ mod gen {
                         enabled: bool,
                     }
                 },
+                abort_controller: {
+                    /// Whether to expose the AbortControll/AbortSignal DOM interfaces.
+                    enabled: bool,
+                },
                 allow_scripts_to_close_windows: bool,
                 canvas_capture: {
                     enabled: bool,
@@ -248,6 +261,11 @@ mod gen {
                 composition_event: {
                     #[serde(rename = "dom.compositionevent.enabled")]
                     enabled: bool,
+                },
+                crypto: {
+                    subtle: {
+                        enabled: bool,
+                    }
                 },
                 custom_elements: {
                     #[serde(rename = "dom.customelements.enabled")]
@@ -267,6 +285,9 @@ mod gen {
                     enabled: bool,
                 },
                 imagebitmap: {
+                    enabled: bool,
+                },
+                intersection_observer: {
                     enabled: bool,
                 },
                 microdata: {
@@ -383,6 +404,8 @@ mod gen {
                     test: bool,
                     first_person_observer_view: bool,
                     glwindow: {
+                        /// Enable servo/webxr's glwindow port. This is enabled only if openxr is
+                        /// disabled.
                         #[serde(default)]
                         enabled: bool,
                         #[serde(rename = "dom.webxr.glwindow.left-right")]
@@ -400,6 +423,7 @@ mod gen {
                         enabled: bool,
                     },
                     openxr: {
+                        /// Enable servo/webxr's openxr port
                         enabled: bool,
                     },
                     sessionavailable: bool,
@@ -419,6 +443,9 @@ mod gen {
                     },
                     timeout_ms: i64,
                 },
+                xpath: {
+                    enabled: bool,
+                }
             },
             gfx: {
                 subpixel_text_antialiasing: {
@@ -440,6 +467,8 @@ mod gen {
                 baseline_interpreter: {
                     enabled: bool,
                 },
+                /// Whether to disable the jit within SpiderMonkey
+                disable_jit: bool,
                 baseline_jit: {
                     enabled: bool,
                     unsafe_eager_compilation: {
@@ -541,7 +570,16 @@ mod gen {
                 columns: {
                     enabled: bool,
                 },
+                css: {
+                    transition_behavior: {
+                        #[serde(rename = "layout.css.transition-behavior.enabled")]
+                        enabled: bool,
+                    }
+                },
                 flexbox: {
+                    enabled: bool,
+                },
+                grid: {
                     enabled: bool,
                 },
                 legacy_layout: bool,
@@ -577,7 +615,15 @@ mod gen {
                 },
                 mime: {
                     sniff: bool,
-                }
+                },
+                tls: {
+                    /// Ignore `std::io::Error` with `ErrorKind::UnexpectedEof` received when a TLS connection
+                    /// is closed without a close_notify.
+                    ///
+                    /// Used for tests because WPT server doesn't properly close the TLS connection.
+                    // TODO: remove this when WPT server is updated to use a proper TLS implementation.
+                    ignore_unexpected_eof: bool,
+                },
             },
             session_history: {
                 #[serde(rename = "session-history.max-length")]
@@ -594,9 +640,6 @@ mod gen {
                 },
                 /// URL string of the homepage.
                 homepage: String,
-                keep_screen_on: {
-                    enabled: bool,
-                },
                 #[serde(rename = "shell.native-orientation")]
                 native_orientation: String,
                 native_titlebar: {

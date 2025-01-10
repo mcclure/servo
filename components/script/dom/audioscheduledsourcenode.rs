@@ -17,7 +17,6 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomObject;
-use crate::task_source::TaskSource;
 
 #[dom_struct]
 pub struct AudioScheduledSourceNode {
@@ -57,7 +56,7 @@ impl AudioScheduledSourceNode {
     }
 }
 
-impl AudioScheduledSourceNodeMethods for AudioScheduledSourceNode {
+impl AudioScheduledSourceNodeMethods<crate::DomTypeHolder> for AudioScheduledSourceNode {
     // https://webaudio.github.io/web-audio-api/#dom-audioscheduledsourcenode-onended
     event_handler!(ended, GetOnended, SetOnended);
 
@@ -72,25 +71,19 @@ impl AudioScheduledSourceNodeMethods for AudioScheduledSourceNode {
         }
 
         let this = Trusted::new(self);
-        let global = self.global();
-        let window = global.as_window();
-        let (task_source, canceller) = window
+        let task_source = self
+            .global()
             .task_manager()
-            .dom_manipulation_task_source_with_canceller();
+            .dom_manipulation_task_source()
+            .to_sendable();
         let callback = OnEndedCallback::new(move || {
-            let _ = task_source.queue_with_canceller(
-                task!(ended: move || {
-                    let this = this.root();
-                    let global = this.global();
-                    let window = global.as_window();
-                    window.task_manager().dom_manipulation_task_source().queue_simple_event(
-                        this.upcast(),
-                        atom!("ended"),
-                        window
-                        );
-                }),
-                &canceller,
-            );
+            task_source.queue(task!(ended: move || {
+                let this = this.root();
+                this.global().task_manager().dom_manipulation_task_source().queue_simple_event(
+                    this.upcast(),
+                    atom!("ended"),
+                    );
+            }));
         });
 
         self.node()

@@ -16,6 +16,7 @@ use crate::dom::cssgroupingrule::CSSGroupingRule;
 use crate::dom::cssrule::SpecificCSSRule;
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct CSSLayerBlockRule {
@@ -51,6 +52,7 @@ impl CSSLayerBlockRule {
                 layerblockrule,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
@@ -66,7 +68,7 @@ impl SpecificCSSRule for CSSLayerBlockRule {
     }
 }
 
-impl CSSLayerBlockRuleMethods for CSSLayerBlockRule {
+impl CSSLayerBlockRuleMethods<crate::DomTypeHolder> for CSSLayerBlockRule {
     /// <https://drafts.csswg.org/css-cascade-5/#dom-csslayerblockrule-name>
     fn Name(&self) -> DOMString {
         if let Some(name) = &self.layerblockrule.name {

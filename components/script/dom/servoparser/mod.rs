@@ -21,13 +21,15 @@ use html5ever::tree_builder::{ElementFlags, NextParserState, NodeOrText, QuirksM
 use html5ever::{local_name, namespace_url, ns, Attribute, ExpandedName, LocalName, QualName};
 use hyper_serde::Serde;
 use mime::{self, Mime};
+use net_traits::request::RequestId;
 use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ResourceFetchTiming,
     ResourceTimingType,
 };
 use profile_traits::time::{
-    profile, ProfilerCategory, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+    ProfilerCategory, ProfilerChan, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
 };
+use profile_traits::time_profile;
 use script_traits::DocumentActivity;
 use servo_config::pref;
 use servo_url::ServoUrl;
@@ -53,7 +55,6 @@ use crate::dom::comment::Comment;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::documenttype::DocumentType;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlformelement::{FormControlElementHelpers, HTMLFormElement};
 use crate::dom::htmlimageelement::HTMLImageElement;
 use crate::dom::htmlinputelement::HTMLInputElement;
@@ -213,8 +214,8 @@ impl ServoParser {
             loader,
             None,
             None,
-            None,
             Default::default(),
+            false,
             can_gc,
         );
 
@@ -241,7 +242,7 @@ impl ServoParser {
             )),
             ParserKind::Normal,
         );
-        parser.parse_complete_string_chunk(String::from(input), CanGc::note());
+        parser.parse_complete_string_chunk(String::from(input), can_gc);
 
         // Step 14.
         let root_element = document.GetDocumentElement().expect("no document element");
@@ -361,7 +362,28 @@ impl ServoParser {
             input.push_back(String::from(chunk).into());
         }
 
-        self.tokenize(|tokenizer| tokenizer.feed(&input, can_gc));
+        let profiler_chan = self
+            .document
+            .window()
+            .as_global_scope()
+            .time_profiler_chan()
+            .clone();
+        let profiler_metadata = TimerMetadata {
+            url: self.document.url().as_str().into(),
+            iframe: TimerMetadataFrameType::RootWindow,
+            incremental: TimerMetadataReflowType::FirstReflow,
+        };
+        self.tokenize(
+            |tokenizer| {
+                tokenizer.feed(
+                    &input,
+                    can_gc,
+                    profiler_chan.clone(),
+                    profiler_metadata.clone(),
+                )
+            },
+            can_gc,
+        );
 
         if self.suspended.get() {
             // Parser got suspended, insert remaining input at end of
@@ -403,14 +425,15 @@ impl ServoParser {
 
         // Step 2.
         self.document
-            .set_ready_state(DocumentReadyState::Interactive);
+            .set_ready_state(DocumentReadyState::Interactive, can_gc);
 
         // Step 3.
         self.tokenizer.end(can_gc);
         self.document.set_current_parser(None);
 
         // Step 4.
-        self.document.set_ready_state(DocumentReadyState::Complete);
+        self.document
+            .set_ready_state(DocumentReadyState::Complete, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#active-parser
@@ -443,6 +466,7 @@ impl ServoParser {
         reflect_dom_object(
             Box::new(ServoParser::new_inherited(document, tokenizer, kind)),
             document.window(),
+            CanGc::note(),
         )
     }
 
@@ -514,22 +538,11 @@ impl ServoParser {
     }
 
     fn parse_sync(&self, can_gc: CanGc) {
-        let metadata = TimerMetadata {
-            url: self.document.url().as_str().into(),
-            iframe: TimerMetadataFrameType::RootWindow,
-            incremental: TimerMetadataReflowType::FirstReflow,
-        };
-        let profiler_category = self.tokenizer.profiler_category();
-        profile(
-            profiler_category,
-            Some(metadata),
-            self.document
-                .window()
-                .upcast::<GlobalScope>()
-                .time_profiler_chan()
-                .clone(),
-            || self.do_parse_sync(can_gc),
-        )
+        match self.tokenizer {
+            Tokenizer::Html(_) => self.do_parse_sync(can_gc),
+            Tokenizer::AsyncHtml(_) => self.do_parse_sync(can_gc),
+            Tokenizer::Xml(_) => self.do_parse_sync(can_gc),
+        }
     }
 
     fn do_parse_sync(&self, can_gc: CanGc) {
@@ -546,7 +559,29 @@ impl ServoParser {
                 }
             }
         }
-        self.tokenize(|tokenizer| tokenizer.feed(&self.network_input, can_gc));
+
+        let profiler_chan = self
+            .document
+            .window()
+            .as_global_scope()
+            .time_profiler_chan()
+            .clone();
+        let profiler_metadata = TimerMetadata {
+            url: self.document.url().as_str().into(),
+            iframe: TimerMetadataFrameType::RootWindow,
+            incremental: TimerMetadataReflowType::FirstReflow,
+        };
+        self.tokenize(
+            |tokenizer| {
+                tokenizer.feed(
+                    &self.network_input,
+                    can_gc,
+                    profiler_chan.clone(),
+                    profiler_metadata.clone(),
+                )
+            },
+            can_gc,
+        );
 
         if self.suspended.get() {
             return;
@@ -576,7 +611,7 @@ impl ServoParser {
         }
     }
 
-    fn tokenize<F>(&self, feed: F)
+    fn tokenize<F>(&self, feed: F, can_gc: CanGc)
     where
         F: Fn(&Tokenizer) -> TokenizerResult<DomRoot<HTMLScriptElement>>,
     {
@@ -584,7 +619,9 @@ impl ServoParser {
             assert!(!self.suspended.get());
             assert!(!self.aborted.get());
 
-            self.document.reflow_if_reflow_timer_expired();
+            self.document
+                .window()
+                .reflow_if_reflow_timer_expired(can_gc);
             let script = match feed(&self.tokenizer) {
                 TokenizerResult::Done => return,
                 TokenizerResult::Script(script) => script,
@@ -599,14 +636,14 @@ impl ServoParser {
             if is_execution_stack_empty() {
                 self.document
                     .window()
-                    .upcast::<GlobalScope>()
-                    .perform_a_microtask_checkpoint(CanGc::note());
+                    .as_global_scope()
+                    .perform_a_microtask_checkpoint(can_gc);
             }
 
             let script_nesting_level = self.script_nesting_level.get();
 
             self.script_nesting_level.set(script_nesting_level + 1);
-            script.prepare();
+            script.prepare(can_gc);
             self.script_nesting_level.set(script_nesting_level);
 
             if self.document.has_pending_parsing_blocking_script() {
@@ -629,7 +666,7 @@ impl ServoParser {
 
         // Step 1.
         self.document
-            .set_ready_state(DocumentReadyState::Interactive);
+            .set_ready_state(DocumentReadyState::Interactive, can_gc);
 
         // Step 2.
         self.tokenizer.end(can_gc);
@@ -637,8 +674,7 @@ impl ServoParser {
 
         // Steps 3-12 are in another castle, namely finish_load.
         let url = self.tokenizer.url().clone();
-        self.document
-            .finish_load(LoadType::PageSource(url), CanGc::note());
+        self.document.finish_load(LoadType::PageSource(url), can_gc);
     }
 }
 
@@ -685,11 +721,28 @@ impl Tokenizer {
         &self,
         input: &BufferQueue,
         can_gc: CanGc,
+        profiler_chan: ProfilerChan,
+        profiler_metadata: TimerMetadata,
     ) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         match *self {
-            Tokenizer::Html(ref tokenizer) => tokenizer.feed(input),
-            Tokenizer::AsyncHtml(ref tokenizer) => tokenizer.feed(input, can_gc),
-            Tokenizer::Xml(ref tokenizer) => tokenizer.feed(input),
+            Tokenizer::Html(ref tokenizer) => time_profile!(
+                ProfilerCategory::ScriptParseHTML,
+                Some(profiler_metadata),
+                profiler_chan,
+                || tokenizer.feed(input),
+            ),
+            Tokenizer::AsyncHtml(ref tokenizer) => time_profile!(
+                ProfilerCategory::ScriptParseHTML,
+                Some(profiler_metadata),
+                profiler_chan,
+                || tokenizer.feed(input, can_gc),
+            ),
+            Tokenizer::Xml(ref tokenizer) => time_profile!(
+                ProfilerCategory::ScriptParseXML,
+                Some(profiler_metadata),
+                profiler_chan,
+                || tokenizer.feed(input),
+            ),
         }
     }
 
@@ -714,14 +767,6 @@ impl Tokenizer {
             Tokenizer::Html(ref tokenizer) => tokenizer.set_plaintext_state(),
             Tokenizer::AsyncHtml(ref tokenizer) => tokenizer.set_plaintext_state(),
             Tokenizer::Xml(_) => unimplemented!(),
-        }
-    }
-
-    fn profiler_category(&self) -> ProfilerCategory {
-        match *self {
-            Tokenizer::Html(_) => ProfilerCategory::ScriptParseHTML,
-            Tokenizer::AsyncHtml(_) => ProfilerCategory::ScriptParseHTML,
-            Tokenizer::Xml(_) => ProfilerCategory::ScriptParseXML,
         }
     }
 }
@@ -757,11 +802,11 @@ impl ParserContext {
 }
 
 impl FetchResponseListener for ParserContext {
-    fn process_request_body(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, meta_result: Result<FetchMetadata, NetworkError>) {
+    fn process_response(&mut self, _: RequestId, meta_result: Result<FetchMetadata, NetworkError>) {
         let (metadata, error) = match meta_result {
             Ok(meta) => (
                 Some(match meta {
@@ -852,7 +897,7 @@ impl FetchResponseListener for ParserContext {
 
                 let doc = &parser.document;
                 let doc_body = DomRoot::upcast::<Node>(doc.GetBody().unwrap());
-                let img = HTMLImageElement::new(local_name!("img"), None, doc, None);
+                let img = HTMLImageElement::new(local_name!("img"), None, doc, None, CanGc::note());
                 img.SetSrc(USVString(self.url.to_string()));
                 doc_body
                     .AppendChild(&DomRoot::upcast::<Node>(img))
@@ -912,7 +957,7 @@ impl FetchResponseListener for ParserContext {
         }
     }
 
-    fn process_response_chunk(&mut self, payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, payload: Vec<u8>) {
         if self.is_synthesized_document {
             return;
         }
@@ -930,7 +975,11 @@ impl FetchResponseListener for ParserContext {
     // This method is called via script_thread::handle_fetch_eof, so we must call
     // submit_resource_timing in this function
     // Resource listeners are called via net_traits::Action::process, which handles submission for them
-    fn process_response_eof(&mut self, status: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        status: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let parser = match self.parser.as_ref() {
             Some(parser) => parser.root(),
             None => return,
@@ -999,10 +1048,10 @@ impl FetchResponseListener for ParserContext {
             CrossProcessInstant::now(),
             document,
         );
-        self.pushed_entry_index = document
-            .global()
-            .performance()
-            .queue_entry(performance_entry.upcast::<PerformanceEntry>());
+        self.pushed_entry_index = document.global().performance().queue_entry(
+            performance_entry.upcast::<PerformanceEntry>(),
+            CanGc::note(),
+        );
     }
 }
 
@@ -1046,7 +1095,7 @@ fn insert(
             if let Some(text) = text {
                 text.upcast::<CharacterData>().append_data(&t);
             } else {
-                let text = Text::new(String::from(t).into(), &parent.owner_doc());
+                let text = Text::new(String::from(t).into(), &parent.owner_doc(), can_gc);
                 parent.InsertBefore(text.upcast(), reference_child).unwrap();
             }
         },
@@ -1085,7 +1134,10 @@ impl TreeSink for Sink {
     }
 
     type Handle = Dom<Node>;
-    type ElemName<'a> = ExpandedName<'a> where Self: 'a;
+    type ElemName<'a>
+        = ExpandedName<'a>
+    where
+        Self: 'a;
 
     #[allow(crown::unrooted_must_root)]
     fn get_document(&self) -> Dom<Node> {
@@ -1138,7 +1190,12 @@ impl TreeSink for Sink {
 
     #[allow(crown::unrooted_must_root)]
     fn create_comment(&self, text: StrTendril) -> Dom<Node> {
-        let comment = Comment::new(DOMString::from(String::from(text)), &self.document, None);
+        let comment = Comment::new(
+            DOMString::from(String::from(text)),
+            &self.document,
+            None,
+            CanGc::note(),
+        );
         Dom::from_ref(comment.upcast())
     }
 
@@ -1149,6 +1206,7 @@ impl TreeSink for Sink {
             DOMString::from(String::from(target)),
             DOMString::from(String::from(data)),
             doc,
+            CanGc::note(),
         );
         Dom::from_ref(pi.upcast())
     }
@@ -1242,6 +1300,7 @@ impl TreeSink for Sink {
             Some(DOMString::from(String::from(public_id))),
             Some(DOMString::from(String::from(system_id))),
             doc,
+            CanGc::note(),
         );
         doc.upcast::<Node>()
             .AppendChild(doctype.upcast())
@@ -1257,6 +1316,7 @@ impl TreeSink for Sink {
                 attr.name,
                 DOMString::from(String::from(attr.value)),
                 None,
+                CanGc::note(),
             );
         }
     }
@@ -1340,7 +1400,7 @@ fn create_element_for_token(
         if is_execution_stack_empty() {
             document
                 .window()
-                .upcast::<GlobalScope>()
+                .as_global_scope()
                 .perform_a_microtask_checkpoint(can_gc);
         }
         // Step 6.3
@@ -1370,7 +1430,7 @@ fn create_element_for_token(
 
     // Step 8
     for attr in attrs {
-        element.set_attribute_from_parser(attr.name, attr.value, None);
+        element.set_attribute_from_parser(attr.name, attr.value, None, can_gc);
     }
 
     // _now_ we can sanitize (and we sanitize now even if the "value"

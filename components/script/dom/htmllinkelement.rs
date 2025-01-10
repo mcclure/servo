@@ -5,19 +5,19 @@
 use std::borrow::{Borrow, ToOwned};
 use std::cell::Cell;
 use std::default::Default;
-use std::sync;
 
 use cssparser::{Parser as CssParser, ParserInput};
 use dom_struct::dom_struct;
 use embedder_traits::EmbedderMsg;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use js::rust::HandleObject;
-use net_traits::request::{CorsSettings, Destination, Initiator, Referrer, RequestBuilder};
+use net_traits::policy_container::PolicyContainer;
+use net_traits::request::{
+    CorsSettings, Destination, Initiator, Referrer, RequestBuilder, RequestId,
+};
 use net_traits::{
-    CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, IpcSend, NetworkError,
-    ReferrerPolicy, ResourceFetchTiming, ResourceTimingType,
+    FetchMetadata, FetchResponseListener, NetworkError, ReferrerPolicy, ResourceFetchTiming,
+    ResourceTimingType,
 };
 use servo_arc::Arc;
 use servo_atoms::Atom;
@@ -47,16 +47,14 @@ use crate::dom::element::{
     ElementCreator,
 };
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{
-    document_from_node, stylesheets_owner_from_node, window_from_node, BindContext, Node,
-    UnbindContext,
-};
+use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::create_a_potential_cors_request;
-use crate::link_relations::LinkRelations;
-use crate::network_listener::{submit_timing, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::links::LinkRelations;
+use crate::network_listener::{submit_timing, PreInvoke, ResourceTimingListener};
+use crate::script_runtime::CanGc;
 use crate::stylesheet_loader::{StylesheetContextSource, StylesheetLoader, StylesheetOwner};
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
@@ -75,7 +73,8 @@ struct LinkProcessingOptions {
     integrity: String,
     link_type: String,
     cross_origin: Option<CorsSettings>,
-    referrer_policy: Option<ReferrerPolicy>,
+    referrer_policy: ReferrerPolicy,
+    policy_container: PolicyContainer,
     source_set: Option<()>,
     base_url: ServoUrl,
     // Some fields that we don't need yet are missing
@@ -138,6 +137,7 @@ impl HTMLLinkElement {
         document: &Document,
         proto: Option<HandleObject>,
         creator: ElementCreator,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLLinkElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLLinkElement::new_inherited(
@@ -145,6 +145,7 @@ impl HTMLLinkElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -156,7 +157,7 @@ impl HTMLLinkElement {
     // HTMLStyleElement::set_stylesheet.
     #[allow(crown::unrooted_must_root)]
     pub fn set_stylesheet(&self, s: Arc<Stylesheet>) {
-        let stylesheets_owner = stylesheets_owner_from_node(self);
+        let stylesheets_owner = self.stylesheet_list_owner();
         if let Some(ref s) = *self.stylesheet.borrow() {
             stylesheets_owner.remove_stylesheet(self.upcast(), s)
         }
@@ -173,7 +174,7 @@ impl HTMLLinkElement {
         self.get_stylesheet().map(|sheet| {
             self.cssom_stylesheet.or_init(|| {
                 CSSStyleSheet::new(
-                    &window_from_node(self),
+                    &self.owner_window(),
                     self.upcast::<Element>(),
                     "text/css".into(),
                     None, // todo handle location
@@ -294,7 +295,8 @@ impl VirtualMethods for HTMLLinkElement {
 
         if let Some(s) = self.stylesheet.borrow_mut().take() {
             self.clean_stylesheet_ownership();
-            stylesheets_owner_from_node(self).remove_stylesheet(self.upcast(), &s);
+            self.stylesheet_list_owner()
+                .remove_stylesheet(self.upcast(), &s);
         }
     }
 }
@@ -320,6 +322,7 @@ impl HTMLLinkElement {
             link_type: String::new(),
             cross_origin: cors_setting_for_element(element),
             referrer_policy: referrer_policy_for_element(element),
+            policy_container: document.policy_container().to_owned(),
             source_set: None, // FIXME
             base_url: document.borrow().base_url(),
         };
@@ -374,47 +377,19 @@ impl HTMLLinkElement {
         // (Step 7, firing load/error events is handled in the FetchResponseListener impl for PrefetchContext)
 
         // Step 8. The user agent should fetch request, with processResponseConsumeBody set to processPrefetchResponse.
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
         let document = self.upcast::<Node>().owner_doc();
-        let window = document.window();
-
-        let (task_source, canceller) = window
-            .task_manager()
-            .networking_task_source_with_canceller();
-
-        let fetch_context = sync::Arc::new(sync::Mutex::new(PrefetchContext {
+        let fetch_context = PrefetchContext {
             url,
             link: Trusted::new(self),
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-        }));
-
-        let listener = NetworkListener {
-            context: fetch_context,
-            task_source,
-            canceller: Some(canceller),
         };
 
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
-
-        window
-            .upcast::<GlobalScope>()
-            .resource_threads()
-            .sender()
-            .send(CoreResourceMsg::Fetch(
-                request,
-                FetchChannels::ResponseMsg(action_sender, None),
-            ))
-            .unwrap();
+        document.fetch_background(request, fetch_context, None);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-link-obtain>
     fn handle_stylesheet_url(&self, href: &str) {
-        let document = document_from_node(self);
+        let document = self.owner_document();
         if document.browsing_context().is_none() {
             return;
         }
@@ -486,7 +461,7 @@ impl HTMLLinkElement {
     }
 
     fn handle_favicon_url(&self, href: &str, _sizes: &Option<String>) {
-        let document = document_from_node(self);
+        let document = self.owner_document();
         match document.base_url().join(href) {
             Ok(url) => {
                 let window = document.window();
@@ -525,12 +500,12 @@ impl StylesheetOwner for HTMLLinkElement {
         self.parser_inserted.get()
     }
 
-    fn referrer_policy(&self) -> Option<ReferrerPolicy> {
+    fn referrer_policy(&self) -> ReferrerPolicy {
         if self.RelList().Contains("noreferrer".into()) {
-            return Some(ReferrerPolicy::NoReferrer);
+            return ReferrerPolicy::NoReferrer;
         }
 
-        None
+        ReferrerPolicy::EmptyString
     }
 
     fn set_origin_clean(&self, origin_clean: bool) {
@@ -540,7 +515,7 @@ impl StylesheetOwner for HTMLLinkElement {
     }
 }
 
-impl HTMLLinkElementMethods for HTMLLinkElement {
+impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-href
     make_url_getter!(Href, "href");
 
@@ -551,9 +526,9 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     make_getter!(Rel, "rel");
 
     // https://html.spec.whatwg.org/multipage/#dom-link-rel
-    fn SetRel(&self, rel: DOMString) {
+    fn SetRel(&self, rel: DOMString, can_gc: CanGc) {
         self.upcast::<Element>()
-            .set_tokenlist_attribute(&local_name!("rel"), rel);
+            .set_tokenlist_attribute(&local_name!("rel"), rel, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-media
@@ -631,8 +606,8 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-crossorigin
-    fn SetCrossOrigin(&self, value: Option<DOMString>) {
-        set_cross_origin_attribute(self.upcast::<Element>(), value);
+    fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
+        set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy
@@ -656,9 +631,7 @@ impl LinkProcessingOptions {
         assert!(!self.href.is_empty());
 
         // Step 2. If options's destination is null, then return null.
-        let Some(destination) = self.destination else {
-            return None;
-        };
+        let destination = self.destination?;
 
         // Step 3. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
         // TODO: The spec passes a base url which is incompatible with the
@@ -670,7 +643,7 @@ impl LinkProcessingOptions {
 
         // Step 5. Let request be the result of creating a potential-CORS request given
         //         url, options's destination, and options's crossorigin.
-        // FIXME: Step 6. Set request's policy container to options's policy container.
+        // Step 6. Set request's policy container to options's policy container.
         // Step 7. Set request's integrity metadata to options's integrity.
         // FIXME: Step 8. Set request's cryptographic nonce metadata to options's cryptographic nonce metadata.
         // Step 9. Set request's referrer policy to options's referrer policy.
@@ -685,6 +658,7 @@ impl LinkProcessingOptions {
             Referrer::NoReferrer,
         )
         .integrity_metadata(self.integrity)
+        .policy_container(self.policy_container)
         .referrer_policy(self.referrer_policy);
 
         // Step 12. Return request.
@@ -715,32 +689,40 @@ struct PrefetchContext {
 }
 
 impl FetchResponseListener for PrefetchContext {
-    fn process_request_body(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, fetch_metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(
+        &mut self,
+        _: RequestId,
+        fetch_metadata: Result<FetchMetadata, NetworkError>,
+    ) {
         _ = fetch_metadata;
     }
 
-    fn process_response_chunk(&mut self, chunk: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, chunk: Vec<u8>) {
         _ = chunk;
     }
 
     // Step 7 of `fetch and process the linked resource` in https://html.spec.whatwg.org/multipage/#link-type-prefetch
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         if response.is_err() {
             // Step 1. If response is a network error, fire an event named error at el.
             self.link
                 .root()
                 .upcast::<EventTarget>()
-                .fire_event(atom!("error"));
+                .fire_event(atom!("error"), CanGc::note());
         } else {
             // Step 2. Otherwise, fire an event named load at el.
             self.link
                 .root()
                 .upcast::<EventTarget>()
-                .fire_event(atom!("load"));
+                .fire_event(atom!("load"), CanGc::note());
         }
     }
 
@@ -753,7 +735,7 @@ impl FetchResponseListener for PrefetchContext {
     }
 
     fn submit_resource_timing(&mut self) {
-        submit_timing(self)
+        submit_timing(self, CanGc::note())
     }
 }
 

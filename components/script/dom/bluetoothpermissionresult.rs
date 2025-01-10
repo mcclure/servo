@@ -25,6 +25,7 @@ use crate::dom::bluetoothdevice::BluetoothDevice;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::permissionstatus::PermissionStatus;
 use crate::dom::promise::Promise;
+use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/#bluetoothpermissionresult
 #[dom_struct]
@@ -51,6 +52,7 @@ impl BluetoothPermissionResult {
         reflect_dom_object(
             Box::new(BluetoothPermissionResult::new_inherited(status)),
             global,
+            CanGc::note(),
         )
     }
 
@@ -80,7 +82,7 @@ impl BluetoothPermissionResult {
     }
 }
 
-impl BluetoothPermissionResultMethods for BluetoothPermissionResult {
+impl BluetoothPermissionResultMethods<crate::DomTypeHolder> for BluetoothPermissionResult {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothpermissionresult-devices
     fn Devices(&self) -> Vec<DomRoot<BluetoothDevice>> {
         let device_vec: Vec<DomRoot<BluetoothDevice>> = self
@@ -94,7 +96,7 @@ impl BluetoothPermissionResultMethods for BluetoothPermissionResult {
 }
 
 impl AsyncBluetoothListener for BluetoothPermissionResult {
-    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>) {
+    fn handle_response(&self, response: BluetoothResponse, promise: &Rc<Promise>, _can_gc: CanGc) {
         match response {
             // https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices
             // Step 3, 11, 13 - 14.

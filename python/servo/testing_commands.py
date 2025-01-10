@@ -18,7 +18,7 @@ import subprocess
 import textwrap
 import json
 
-from python.servo.post_build_commands import PostBuildCommands
+from servo.post_build_commands import PostBuildCommands
 import wpt
 import wpt.manifestupdate
 import wpt.run
@@ -73,6 +73,16 @@ def format_toml_files_with_taplo(check_only: bool = True) -> int:
         return call([taplo, "fmt", "--check", *TOML_GLOBS], env={'RUST_LOG': 'error'})
     else:
         return call([taplo, "fmt", *TOML_GLOBS], env={'RUST_LOG': 'error'})
+
+
+def format_with_rustfmt(check_only: bool = True) -> int:
+    maybe_check_only = ["--check"] if check_only else []
+    result = call(["cargo", "fmt", "--", *UNSTABLE_RUSTFMT_ARGUMENTS, *maybe_check_only])
+    if result != 0:
+        return result
+
+    return call(["cargo", "fmt", "--manifest-path", "support/crown/Cargo.toml",
+                 "--", *UNSTABLE_RUSTFMT_ARGUMENTS, *maybe_check_only])
 
 
 @CommandProvider
@@ -153,7 +163,6 @@ class MachCommands(CommandBase):
             "base",
             "compositing",
             "constellation",
-            "crown",
             "fonts",
             "hyper_serde",
             "layout_2013",
@@ -205,6 +214,9 @@ class MachCommands(CommandBase):
             args += ["--", "--nocapture"]
 
         env = self.build_env()
+        result = call(["cargo", "bench" if bench else "test"], cwd="support/crown")
+        if result != 0:
+            return result
         return self.run_cargo_build_like_command(
             "bench" if bench else "test",
             args,
@@ -231,7 +243,7 @@ class MachCommands(CommandBase):
         tidy_failed = tidy.scan(not all_files, not no_progress)
 
         print("\r ➤  Checking formatting of Rust files...")
-        rustfmt_failed = call(["cargo", "fmt", "--", *UNSTABLE_RUSTFMT_ARGUMENTS, "--check"])
+        rustfmt_failed = format_with_rustfmt(check_only=True)
         if rustfmt_failed:
             print("Run `./mach fmt` to fix the formatting")
 
@@ -344,7 +356,7 @@ class MachCommands(CommandBase):
         if result != 0:
             return result
 
-        return call(["cargo", "fmt", "--", *UNSTABLE_RUSTFMT_ARGUMENTS])
+        return format_with_rustfmt(check_only=False)
 
     @Command('update-wpt',
              description='Update the web platform tests',
@@ -529,8 +541,8 @@ class MachCommands(CommandBase):
             binary,
             "https://servospeedometer.netlify.app?headless=1",
             "--pref", "dom.allow_scripts_to_close_windows",
-            "--resolution=1100x900",
-            "--headless"], timeout=60).decode())
+            "--window-size=1100x900",
+            "--headless"], timeout=120).decode())
 
         print(f"Score: {speedometer['Score']['mean']} ± {speedometer['Score']['delta']}")
 
@@ -538,13 +550,25 @@ class MachCommands(CommandBase):
             output = dict()
 
             def parse_speedometer_result(result):
-                output[f"Speedometer/{result['name']}"] = {
-                    'latency': {  # speedometer has ms we need to convert to ns
-                        'value': float(result['mean']) * 1000.0,
-                        'lower_value': float(result['min']) * 1000.0,
-                        'upper_value': float(result['max']) * 1000.0,
+                if result['unit'] == "ms":
+                    output[f"Speedometer/{result['name']}"] = {
+                        'latency': {  # speedometer has ms we need to convert to ns
+                            'value': float(result['mean']) * 1000.0,
+                            'lower_value': float(result['min']) * 1000.0,
+                            'upper_value': float(result['max']) * 1000.0,
+                        }
                     }
-                }
+                elif result['unit'] == "score":
+                    output[f"Speedometer/{result['name']}"] = {
+                        'score': {
+                            'value': float(result['mean']),
+                            'lower_value': float(result['min']),
+                            'upper_value': float(result['max']),
+                        }
+                    }
+                else:
+                    raise "Unknown unit!"
+
                 for child in result['children']:
                     parse_speedometer_result(child)
 
@@ -806,7 +830,7 @@ tests/wpt/mozilla/tests for Servo-only tests""" % reference_path)
     @CommandArgument('params', nargs='...',
                      help="Command-line arguments to be passed through to Servo")
     @CommandBase.common_command_arguments(binary_selection=True)
-    def smoketest(self, servo_binary: str, params):
+    def smoketest(self, servo_binary: str, params, **kwargs):
         # We pass `-f` here so that any thread panic will cause Servo to exit,
         # preventing a panic from hanging execution. This means that these kind
         # of panics won't cause timeouts on CI.

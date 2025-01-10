@@ -2,10 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base::id::PipelineId;
-use content_security_policy::{self as csp, CspList};
+use base::id::{PipelineId, TopLevelBrowsingContextId};
+use content_security_policy::{self as csp};
 use http::header::{HeaderName, AUTHORIZATION};
 use http::{HeaderMap, Method};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
@@ -14,8 +15,20 @@ use mime::Mime;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
 
+use crate::policy_container::{PolicyContainer, RequestPolicyContainer};
 use crate::response::HttpsState;
 use crate::{ReferrerPolicy, ResourceTimingType};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+/// An id to differeniate one network request from another.
+pub struct RequestId(usize);
+
+impl RequestId {
+    pub fn next() -> Self {
+        static NEXT_REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// An [initiator](https://fetch.spec.whatwg.org/#concept-request-initiator)
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
@@ -223,6 +236,7 @@ impl RequestBody {
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct RequestBuilder {
+    pub id: RequestId,
     #[serde(
         deserialize_with = "::hyper_serde::deserialize",
         serialize_with = "::hyper_serde::serialize"
@@ -248,17 +262,14 @@ pub struct RequestBuilder {
     pub credentials_mode: CredentialsMode,
     pub use_url_credentials: bool,
     pub origin: ImmutableOrigin,
+    pub policy_container: RequestPolicyContainer,
     // XXXManishearth these should be part of the client object
     pub referrer: Referrer,
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     pub pipeline_id: Option<PipelineId>,
+    pub target_browsing_context_id: Option<TopLevelBrowsingContextId>,
     pub redirect_mode: RedirectMode,
     pub integrity_metadata: String,
-    // This is nominally a part of the client's global object.
-    // It is copied here to avoid having to reach across the thread
-    // boundary every time a redirect occurs.
-    #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
-    pub csp_list: Option<CspList>,
     // to keep track of redirects
     pub url_list: Vec<ServoUrl>,
     pub parser_metadata: ParserMetadata,
@@ -272,6 +283,7 @@ pub struct RequestBuilder {
 impl RequestBuilder {
     pub fn new(url: ServoUrl, referrer: Referrer) -> RequestBuilder {
         RequestBuilder {
+            id: RequestId::next(),
             method: Method::GET,
             url,
             headers: HeaderMap::new(),
@@ -286,15 +298,16 @@ impl RequestBuilder {
             credentials_mode: CredentialsMode::CredentialsSameOrigin,
             use_url_credentials: false,
             origin: ImmutableOrigin::new_opaque(),
+            policy_container: RequestPolicyContainer::default(),
             referrer,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             pipeline_id: None,
+            target_browsing_context_id: None,
             redirect_mode: RedirectMode::Follow,
             integrity_metadata: "".to_owned(),
             url_list: vec![],
             parser_metadata: ParserMetadata::Default,
             initiator: Initiator::None,
-            csp_list: None,
             https_state: HttpsState::None,
             response_tainting: ResponseTainting::Basic,
             crash: None,
@@ -361,13 +374,21 @@ impl RequestBuilder {
         self
     }
 
-    pub fn referrer_policy(mut self, referrer_policy: Option<ReferrerPolicy>) -> RequestBuilder {
+    pub fn referrer_policy(mut self, referrer_policy: ReferrerPolicy) -> RequestBuilder {
         self.referrer_policy = referrer_policy;
         self
     }
 
     pub fn pipeline_id(mut self, pipeline_id: Option<PipelineId>) -> RequestBuilder {
         self.pipeline_id = pipeline_id;
+        self
+    }
+
+    pub fn target_browsing_context_id(
+        mut self,
+        target_browsing_context_id: Option<TopLevelBrowsingContextId>,
+    ) -> RequestBuilder {
+        self.target_browsing_context_id = target_browsing_context_id;
         self
     }
 
@@ -401,8 +422,14 @@ impl RequestBuilder {
         self
     }
 
+    pub fn policy_container(mut self, policy_container: PolicyContainer) -> RequestBuilder {
+        self.policy_container = RequestPolicyContainer::PolicyContainer(policy_container);
+        self
+    }
+
     pub fn build(self) -> Request {
         let mut request = Request::new(
+            self.id,
             self.url.clone(),
             Some(Origin::Origin(self.origin)),
             self.referrer,
@@ -432,9 +459,10 @@ impl RequestBuilder {
         request.url_list = url_list;
         request.integrity_metadata = self.integrity_metadata;
         request.parser_metadata = self.parser_metadata;
-        request.csp_list = self.csp_list;
         request.response_tainting = self.response_tainting;
         request.crash = self.crash;
+        request.policy_container = self.policy_container;
+        request.target_browsing_context_id = self.target_browsing_context_id;
         request
     }
 }
@@ -443,13 +471,14 @@ impl RequestBuilder {
 /// the Fetch spec.
 #[derive(Clone, MallocSizeOf)]
 pub struct Request {
+    /// The id of this request so that the task that triggered it can route
+    /// messages to the correct listeners.
+    pub id: RequestId,
     /// <https://fetch.spec.whatwg.org/#concept-request-method>
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub method: Method,
     /// <https://fetch.spec.whatwg.org/#local-urls-only-flag>
     pub local_urls_only: bool,
-    /// <https://fetch.spec.whatwg.org/#sandboxed-storage-area-urls-flag>
-    pub sandboxed_storage_area_urls: bool,
     /// <https://fetch.spec.whatwg.org/#concept-request-header-list>
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
@@ -459,7 +488,7 @@ pub struct Request {
     pub body: Option<RequestBody>,
     // TODO: client object
     pub window: Window,
-    // TODO: target browsing context
+    pub target_browsing_context_id: Option<TopLevelBrowsingContextId>,
     /// <https://fetch.spec.whatwg.org/#request-keepalive-flag>
     pub keep_alive: bool,
     /// <https://fetch.spec.whatwg.org/#request-service-workers-mode>
@@ -474,7 +503,7 @@ pub struct Request {
     /// <https://fetch.spec.whatwg.org/#concept-request-referrer>
     pub referrer: Referrer,
     /// <https://fetch.spec.whatwg.org/#concept-request-referrer-policy>
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     pub pipeline_id: Option<PipelineId>,
     /// <https://fetch.spec.whatwg.org/#synchronous-flag>
     pub synchronous: bool,
@@ -502,11 +531,8 @@ pub struct Request {
     pub response_tainting: ResponseTainting,
     /// <https://fetch.spec.whatwg.org/#concept-request-parser-metadata>
     pub parser_metadata: ParserMetadata,
-    // This is nominally a part of the client's global object.
-    // It is copied here to avoid having to reach across the thread
-    // boundary every time a redirect occurs.
-    #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
-    pub csp_list: Option<CspList>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-policy-container>
+    pub policy_container: RequestPolicyContainer,
     pub https_state: HttpsState,
     /// Servo internal: if crash details are present, trigger a crash error page with these details.
     pub crash: Option<String>,
@@ -514,6 +540,7 @@ pub struct Request {
 
 impl Request {
     pub fn new(
+        id: RequestId,
         url: ServoUrl,
         origin: Option<Origin>,
         referrer: Referrer,
@@ -521,9 +548,9 @@ impl Request {
         https_state: HttpsState,
     ) -> Request {
         Request {
+            id,
             method: Method::GET,
             local_urls_only: false,
-            sandboxed_storage_area_urls: false,
             headers: HeaderMap::new(),
             unsafe_request: false,
             body: None,
@@ -534,8 +561,9 @@ impl Request {
             destination: Destination::None,
             origin: origin.unwrap_or(Origin::Client),
             referrer,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             pipeline_id,
+            target_browsing_context_id: None,
             synchronous: false,
             mode: RequestMode::NoCors,
             use_cors_preflight: false,
@@ -548,7 +576,7 @@ impl Request {
             parser_metadata: ParserMetadata::Default,
             redirect_count: 0,
             response_tainting: ResponseTainting::Basic,
-            csp_list: None,
+            policy_container: RequestPolicyContainer::Client,
             https_state,
             crash: None,
         }

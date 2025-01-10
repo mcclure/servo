@@ -61,8 +61,8 @@ fn load_root_cert_store_from_file(file_path: String) -> io::Result<RootCertStore
     let mut root_cert_store = RootCertStore::empty();
 
     let mut pem = BufReader::new(File::open(file_path)?);
-    let certs = rustls_pemfile::certs(&mut pem)?;
-    root_cert_store.add_parsable_certificates(&certs);
+    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem).collect();
+    root_cert_store.add_parsable_certificates(certs?);
     Ok(root_cert_store)
 }
 
@@ -132,7 +132,7 @@ pub fn new_core_resource_thread(
                 user_agent,
                 devtools_sender,
                 time_profiler_chan,
-                embedder_proxy,
+                embedder_proxy.clone(),
                 ca_certificates.clone(),
                 ignore_certificate_errors,
             );
@@ -151,6 +151,7 @@ pub fn new_core_resource_thread(
                         private_setup_port,
                         report_port,
                         protocols,
+                        embedder_proxy,
                     )
                 },
                 String::from("network-cache-reporter"),
@@ -173,6 +174,7 @@ fn create_http_states(
     config_dir: Option<&Path>,
     ca_certificates: CACertificates,
     ignore_certificate_errors: bool,
+    embedder_proxy: EmbedderProxy,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
     let mut hsts_list = HstsList::from_servo_preload();
     let mut auth_cache = AuthCache::default();
@@ -198,6 +200,7 @@ fn create_http_states(
             override_manager.clone(),
         )),
         override_manager,
+        embedder_proxy: Mutex::new(embedder_proxy.clone()),
     };
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -214,6 +217,7 @@ fn create_http_states(
             override_manager.clone(),
         )),
         override_manager,
+        embedder_proxy: Mutex::new(embedder_proxy),
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))
@@ -227,11 +231,13 @@ impl ResourceChannelManager {
         private_receiver: IpcReceiver<CoreResourceMsg>,
         memory_reporter: IpcReceiver<ReportsChan>,
         protocols: Arc<ProtocolRegistry>,
+        embedder_proxy: EmbedderProxy,
     ) {
         let (public_http_state, private_http_state) = create_http_states(
             self.config_dir.as_deref(),
             self.ca_certificates.clone(),
             self.ignore_certificate_errors,
+            embedder_proxy,
         );
 
         let mut rx_set = IpcReceiverSet::new().unwrap();
@@ -559,9 +565,10 @@ pub struct CoreResourceThreadPool {
 }
 
 impl CoreResourceThreadPool {
-    pub fn new(num_threads: usize) -> CoreResourceThreadPool {
+    pub fn new(num_threads: usize, pool_name: String) -> CoreResourceThreadPool {
+        debug!("Creating new CoreResourceThreadPool with {num_threads} threads!");
         let pool = rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("CoreResourceThread#{i}"))
+            .thread_name(move |i| format!("{pool_name}#{i}"))
             .num_threads(num_threads)
             .build()
             .unwrap();
@@ -645,7 +652,11 @@ impl CoreResourceManager {
         ca_certificates: CACertificates,
         ignore_certificate_errors: bool,
     ) -> CoreResourceManager {
-        let pool = CoreResourceThreadPool::new(16);
+        let num_threads = thread::available_parallelism()
+            .map(|i| i.get())
+            .unwrap_or(servo_config::pref!(threadpools.fallback_worker_num) as usize)
+            .min(servo_config::pref!(threadpools.resource_workers.max).max(1) as usize);
+        let pool = CoreResourceThreadPool::new(num_threads, "CoreResourceThreadPool".to_string());
         let pool_handle = Arc::new(pool);
         CoreResourceManager {
             user_agent,

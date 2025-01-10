@@ -11,6 +11,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::file::File;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://w3c.github.io/FileAPI/#dfn-filelist
 #[dom_struct]
@@ -35,6 +36,7 @@ impl FileList {
                 files.iter().map(|r| Dom::from_ref(&**r)).collect(),
             )),
             window,
+            CanGc::note(),
         )
     }
 
@@ -43,7 +45,7 @@ impl FileList {
     }
 }
 
-impl FileListMethods for FileList {
+impl FileListMethods<crate::DomTypeHolder> for FileList {
     // https://w3c.github.io/FileAPI/#dfn-length
     fn Length(&self) -> u32 {
         self.list.len() as u32

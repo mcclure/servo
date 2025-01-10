@@ -43,7 +43,7 @@ use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
-use crate::dom::node::{document_from_node, window_from_node, Node, ShadowIncluding};
+use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::promise::Promise;
 use crate::dom::window::Window;
 use crate::microtask::Microtask;
@@ -92,6 +92,7 @@ impl CustomElementRegistry {
         reflect_dom_object(
             Box::new(CustomElementRegistry::new_inherited(window)),
             window,
+            CanGc::note(),
         )
     }
 
@@ -332,7 +333,7 @@ fn get_callback(
     }
 }
 
-impl CustomElementRegistryMethods for CustomElementRegistry {
+impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistry {
     #[allow(unsafe_code, crown::unrooted_must_root)]
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
     fn Define(
@@ -548,16 +549,12 @@ impl CustomElementRegistryMethods for CustomElementRegistry {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-get>
     #[allow(unsafe_code)]
-    fn Get(&self, cx: JSContext, name: DOMString) -> JSVal {
+    fn Get(&self, cx: JSContext, name: DOMString, mut retval: MutableHandleValue) {
         match self.definitions.borrow().get(&LocalName::from(&*name)) {
             Some(definition) => unsafe {
-                rooted!(in(*cx) let mut constructor = UndefinedValue());
-                definition
-                    .constructor
-                    .to_jsval(*cx, constructor.handle_mut());
-                constructor.get()
+                definition.constructor.to_jsval(*cx, retval);
             },
-            None => UndefinedValue(),
+            None => retval.set(UndefinedValue()),
         }
     }
 
@@ -573,14 +570,16 @@ impl CustomElementRegistryMethods for CustomElementRegistry {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-whendefined>
     #[allow(unsafe_code)]
-    fn WhenDefined(&self, name: DOMString, comp: InRealm) -> Rc<Promise> {
-        let global_scope = self.window.upcast::<GlobalScope>();
+    fn WhenDefined(&self, name: DOMString, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let name = LocalName::from(&*name);
 
         // Step 1
         if !is_valid_custom_element_name(&name) {
-            let promise = Promise::new_in_current_realm(comp);
-            promise.reject_native(&DOMException::new(global_scope, DOMErrorName::SyntaxError));
+            let promise = Promise::new_in_current_realm(comp, can_gc);
+            promise.reject_native(&DOMException::new(
+                self.window.as_global_scope(),
+                DOMErrorName::SyntaxError,
+            ));
             return promise;
         }
 
@@ -592,19 +591,17 @@ impl CustomElementRegistryMethods for CustomElementRegistry {
                 definition
                     .constructor
                     .to_jsval(*cx, constructor.handle_mut());
-                let promise = Promise::new_in_current_realm(comp);
+                let promise = Promise::new_in_current_realm(comp, can_gc);
                 promise.resolve_native(&constructor.get());
                 return promise;
             }
         }
 
-        // Step 3
-        let mut map = self.when_defined.borrow_mut();
-
-        // Steps 4, 5
-        let promise = map.get(&name).cloned().unwrap_or_else(|| {
-            let promise = Promise::new_in_current_realm(comp);
-            map.insert(name, promise.clone());
+        // Steps 3, 4, 5
+        let existing_promise = self.when_defined.borrow().get(&name).cloned();
+        let promise = existing_promise.unwrap_or_else(|| {
+            let promise = Promise::new_in_current_realm(comp, can_gc);
+            self.when_defined.borrow_mut().insert(name, promise.clone());
             promise
         });
 
@@ -728,7 +725,7 @@ impl CustomElementDefinition {
         {
             // Go into the constructor's realm
             let _ac = JSAutoRealm::new(*cx, self.constructor.callback());
-            let args = HandleValueArray::new();
+            let args = HandleValueArray::empty();
             if unsafe { !Construct1(*cx, constructor.handle(), &args, element.handle_mut()) } {
                 return Err(Error::JSFailed);
             }
@@ -738,7 +735,7 @@ impl CustomElementDefinition {
         // https://html.spec.whatwg.org/multipage/#clean-up-after-running-script
         if is_execution_stack_empty() {
             window
-                .upcast::<GlobalScope>()
+                .as_global_scope()
                 .perform_a_microtask_checkpoint(can_gc);
         }
 
@@ -844,7 +841,7 @@ pub fn upgrade_element(definition: Rc<CustomElementDefinition>, element: &Elemen
         unsafe {
             let ar = enter_realm(&*global);
             throw_dom_exception(cx, &global, error);
-            report_pending_exception(*cx, true, InRealm::Entered(&ar));
+            report_pending_exception(*cx, true, InRealm::Entered(&ar), can_gc);
         }
 
         return;
@@ -900,7 +897,7 @@ fn run_upgrade_constructor(
     element: &Element,
     can_gc: CanGc,
 ) -> ErrorResult {
-    let window = window_from_node(element);
+    let window = element.owner_window();
     let cx = GlobalScope::get_cx();
     rooted!(in(*cx) let constructor_val = ObjectValue(constructor.callback()));
     rooted!(in(*cx) let mut element_val = UndefinedValue());
@@ -913,7 +910,7 @@ fn run_upgrade_constructor(
 
         // Go into the constructor's realm
         let _ac = JSAutoRealm::new(*cx, constructor.callback());
-        let args = HandleValueArray::new();
+        let args = HandleValueArray::empty();
         // Step 8.2
         if unsafe {
             !Construct1(
@@ -930,7 +927,7 @@ fn run_upgrade_constructor(
         // https://html.spec.whatwg.org/multipage/#clean-up-after-running-script
         if is_execution_stack_empty() {
             window
-                .upcast::<GlobalScope>()
+                .as_global_scope()
                 .perform_a_microtask_checkpoint(can_gc);
         }
 
@@ -959,7 +956,7 @@ fn run_upgrade_constructor(
 /// <https://html.spec.whatwg.org/multipage/#concept-try-upgrade>
 pub fn try_upgrade_element(element: &Element) {
     // Step 1
-    let document = document_from_node(element);
+    let document = element.owner_document();
     let namespace = element.namespace();
     let local_name = element.local_name();
     let is = element.get_is();
@@ -996,7 +993,13 @@ impl CustomElementReaction {
                     .iter()
                     .map(|arg| unsafe { HandleValue::from_raw(arg.handle()) })
                     .collect();
-                let _ = callback.Call_(element, arguments, ExceptionHandling::Report);
+                rooted!(in(*GlobalScope::get_cx()) let mut value: JSVal);
+                let _ = callback.Call_(
+                    element,
+                    arguments,
+                    value.handle_mut(),
+                    ExceptionHandling::Report,
+                );
             },
         }
     }
@@ -1317,7 +1320,8 @@ fn is_potential_custom_element_char(c: char) -> bool {
         ('\u{37F}'..='\u{1FFF}').contains(&c) ||
         ('\u{200C}'..='\u{200D}').contains(&c) ||
         ('\u{203F}'..='\u{2040}').contains(&c) ||
-        ('\u{2070}'..='\u{2FEF}').contains(&c) ||
+        ('\u{2070}'..='\u{218F}').contains(&c) ||
+        ('\u{2C00}'..='\u{2FEF}').contains(&c) ||
         ('\u{3001}'..='\u{D7FF}').contains(&c) ||
         ('\u{F900}'..='\u{FDCF}').contains(&c) ||
         ('\u{FDF0}'..='\u{FFFD}').contains(&c) ||

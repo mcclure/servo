@@ -10,7 +10,7 @@ use std::default::Default;
 use std::ops::Range;
 use std::slice::from_ref;
 use std::sync::Arc as StdArc;
-use std::{cmp, iter};
+use std::{cmp, fmt, iter};
 
 use app_units::Au;
 use base::id::{BrowsingContextId, PipelineId};
@@ -18,7 +18,7 @@ use bitflags::bitflags;
 use devtools_traits::NodeInfo;
 use dom_struct::dom_struct;
 use euclid::default::{Rect, Size2D, Vector2D};
-use html5ever::{namespace_url, ns, Namespace, Prefix, QualName};
+use html5ever::{namespace_url, ns, serialize as html_serialize, Namespace, Prefix, QualName};
 use js::jsapi::JSObject;
 use js::rust::HandleObject;
 use libc::{self, c_void, uintptr_t};
@@ -43,7 +43,9 @@ use style::properties::ComputedValues;
 use style::selector_parser::{SelectorImpl, SelectorParser};
 use style::stylesheets::{Stylesheet, UrlExtraData};
 use uuid::Uuid;
+use xml5ever::serialize as xml_serialize;
 
+use super::globalscope::GlobalScope;
 use crate::document_loader::DocumentLoader;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::{DomRefCell, Ref, RefMut};
@@ -67,6 +69,7 @@ use crate::dom::bindings::inheritance::{
     Castable, CharacterDataTypeId, ElementTypeId, EventTargetTypeId, HTMLElementTypeId, NodeTypeId,
     SVGElementTypeId, SVGGraphicsElementTypeId, TextTypeId,
 };
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, DomObjectWrap};
 use crate::dom::bindings::root::{Dom, DomRoot, DomSlice, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
@@ -88,16 +91,16 @@ use crate::dom::htmliframeelement::{HTMLIFrameElement, HTMLIFrameElementLayoutMe
 use crate::dom::htmlimageelement::{HTMLImageElement, LayoutHTMLImageElementHelpers};
 use crate::dom::htmlinputelement::{HTMLInputElement, LayoutHTMLInputElementHelpers};
 use crate::dom::htmllinkelement::HTMLLinkElement;
-use crate::dom::htmlmediaelement::{HTMLMediaElement, LayoutHTMLMediaElementHelpers};
 use crate::dom::htmlstyleelement::HTMLStyleElement;
 use crate::dom::htmltextareaelement::{HTMLTextAreaElement, LayoutHTMLTextAreaElementHelpers};
+use crate::dom::htmlvideoelement::{HTMLVideoElement, LayoutHTMLVideoElementHelpers};
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::mutationobserver::{Mutation, MutationObserver, RegisteredObserver};
 use crate::dom::nodelist::NodeList;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::range::WeakRangeVec;
 use crate::dom::raredata::NodeRareData;
-use crate::dom::shadowroot::{LayoutShadowRootHelpers, ShadowRoot};
+use crate::dom::shadowroot::{IsUserAgentWidget, LayoutShadowRootHelpers, ShadowRoot};
 use crate::dom::stylesheetlist::StyleSheetListOwner;
 use crate::dom::svgsvgelement::{LayoutSVGSVGElementHelpers, SVGSVGElement};
 use crate::dom::text::Text;
@@ -167,6 +170,23 @@ pub struct Node {
     layout_data: DomRefCell<Option<Box<GenericLayoutData>>>,
 }
 
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if matches!(self.type_id(), NodeTypeId::Element(_)) {
+            let el = self.downcast::<Element>().unwrap();
+            el.fmt(f)
+        } else {
+            write!(f, "[Node({:?})]", self.type_id())
+        }
+    }
+}
+
+impl fmt::Debug for DomRoot<Node> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
 /// Flags for node items
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
 pub struct NodeFlags(u16);
@@ -174,7 +194,9 @@ pub struct NodeFlags(u16);
 bitflags! {
     impl NodeFlags: u16 {
         /// Specifies whether this node is in a document.
-        const IS_IN_DOC = 1 << 0;
+        ///
+        /// <https://dom.spec.whatwg.org/#in-a-document-tree>
+        const IS_IN_A_DOCUMENT_TREE = 1 << 0;
 
         /// Specifies whether this node needs style recalc on next reflow.
         const HAS_DIRTY_DESCENDANTS = 1 << 1;
@@ -206,6 +228,8 @@ bitflags! {
         const IS_IN_SHADOW_TREE = 1 << 9;
 
         /// Specifies whether this node's shadow-including root is a document.
+        ///
+        /// <https://dom.spec.whatwg.org/#connected>
         const IS_CONNECTED = 1 << 10;
 
         /// Whether this node has a weird parser insertion mode. i.e whether setting innerHTML
@@ -266,8 +290,8 @@ impl Node {
         new_child.parent_node.set(Some(self));
         self.children_count.set(self.children_count.get() + 1);
 
-        let parent_in_doc = self.is_in_doc();
-        let parent_in_shadow_tree = self.is_in_shadow_tree();
+        let parent_is_in_a_document_tree = self.is_in_a_document_tree();
+        let parent_in_shadow_tree = self.is_in_a_shadow_tree();
         let parent_is_connected = self.is_connected();
 
         for node in new_child.traverse_preorder(ShadowIncluding::No) {
@@ -277,14 +301,19 @@ impl Node {
                 }
                 debug_assert!(node.containing_shadow_root().is_some());
             }
-            node.set_flag(NodeFlags::IS_IN_DOC, parent_in_doc);
+            node.set_flag(
+                NodeFlags::IS_IN_A_DOCUMENT_TREE,
+                parent_is_in_a_document_tree,
+            );
             node.set_flag(NodeFlags::IS_IN_SHADOW_TREE, parent_in_shadow_tree);
             node.set_flag(NodeFlags::IS_CONNECTED, parent_is_connected);
+
             // Out-of-document elements never have the descendants flag set.
             debug_assert!(!node.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS));
             vtable_for(&node).bind_to_tree(&BindContext {
                 tree_connected: parent_is_connected,
-                tree_in_doc: parent_in_doc,
+                tree_is_in_a_document_tree: parent_is_in_a_document_tree,
+                tree_is_in_a_shadow_tree: parent_in_shadow_tree,
             });
         }
     }
@@ -297,17 +326,28 @@ impl Node {
 
     /// Clean up flags and unbind from tree.
     pub fn complete_remove_subtree(root: &Node, context: &UnbindContext) {
-        for node in root.traverse_preorder(ShadowIncluding::Yes) {
-            // Out-of-document elements never have the descendants flag set.
-            node.set_flag(
-                NodeFlags::IS_IN_DOC |
-                    NodeFlags::IS_CONNECTED |
-                    NodeFlags::HAS_DIRTY_DESCENDANTS |
-                    NodeFlags::HAS_SNAPSHOT |
-                    NodeFlags::HANDLED_SNAPSHOT,
-                false,
-            );
+        // Flags that reset when a node is disconnected
+        const RESET_FLAGS: NodeFlags = NodeFlags::IS_IN_A_DOCUMENT_TREE
+            .union(NodeFlags::IS_CONNECTED)
+            .union(NodeFlags::HAS_DIRTY_DESCENDANTS)
+            .union(NodeFlags::HAS_SNAPSHOT)
+            .union(NodeFlags::HANDLED_SNAPSHOT);
+
+        for node in root.traverse_preorder(ShadowIncluding::No) {
+            node.set_flag(RESET_FLAGS | NodeFlags::IS_IN_SHADOW_TREE, false);
+
+            // If the element has a shadow root attached to it then we traverse that as well,
+            // but without touching the IS_IN_SHADOW_TREE flags of the children
+            if let Some(shadow_root) = node.downcast::<Element>().and_then(Element::shadow_root) {
+                for node in shadow_root
+                    .upcast::<Node>()
+                    .traverse_preorder(ShadowIncluding::Yes)
+                {
+                    node.set_flag(RESET_FLAGS, false);
+                }
+            }
         }
+
         for node in root.traverse_preorder(ShadowIncluding::Yes) {
             node.clean_up_style_and_layout_data();
 
@@ -390,11 +430,11 @@ impl Node {
     }
 
     /// <https://html.spec.whatg.org/#fire_a_synthetic_mouse_event>
-    pub fn fire_synthetic_mouse_event_not_trusted(&self, name: DOMString) {
+    pub fn fire_synthetic_mouse_event_not_trusted(&self, name: DOMString, can_gc: CanGc) {
         // Spec says the choice of which global to create
         // the mouse event on is not well-defined,
         // and refers to heycam/webidl#135
-        let win = window_from_node(self);
+        let win = self.owner_window();
 
         let mouse_event = MouseEvent::new(
             &win, // ambiguous in spec
@@ -415,6 +455,7 @@ impl Node {
             0,     // buttons uninitialized (and therefore none)
             None,  // related_target uninitialized,
             None,  // point_in_target uninitialized,
+            can_gc,
         );
 
         // Step 4: TODO composed flag for shadow root
@@ -426,7 +467,7 @@ impl Node {
 
         mouse_event
             .upcast::<Event>()
-            .dispatch(self.upcast::<EventTarget>(), false);
+            .dispatch(self.upcast::<EventTarget>(), false, can_gc);
     }
 
     pub fn parent_directionality(&self) -> String {
@@ -566,11 +607,13 @@ impl Node {
         format!("{:?}", self.type_id())
     }
 
-    pub fn is_in_doc(&self) -> bool {
-        self.flags.get().contains(NodeFlags::IS_IN_DOC)
+    /// <https://dom.spec.whatwg.org/#in-a-document-tree>
+    pub fn is_in_a_document_tree(&self) -> bool {
+        self.flags.get().contains(NodeFlags::IS_IN_A_DOCUMENT_TREE)
     }
 
-    pub fn is_in_shadow_tree(&self) -> bool {
+    /// Return true iff node's root is a shadow-root.
+    pub fn is_in_a_shadow_tree(&self) -> bool {
         self.flags.get().contains(NodeFlags::IS_IN_SHADOW_TREE)
     }
 
@@ -584,6 +627,7 @@ impl Node {
         self.set_flag(NodeFlags::HAS_WEIRD_PARSER_INSERTION_MODE, true)
     }
 
+    /// <https://dom.spec.whatwg.org/#connected>
     pub fn is_connected(&self) -> bool {
         self.flags.get().contains(NodeFlags::IS_CONNECTED)
     }
@@ -792,25 +836,25 @@ impl Node {
 
     /// Returns the rendered bounding content box if the element is rendered,
     /// and none otherwise.
-    pub fn bounding_content_box(&self) -> Option<Rect<Au>> {
-        window_from_node(self).content_box_query(self)
+    pub fn bounding_content_box(&self, can_gc: CanGc) -> Option<Rect<Au>> {
+        self.owner_window().content_box_query(self, can_gc)
     }
 
-    pub fn bounding_content_box_or_zero(&self) -> Rect<Au> {
-        self.bounding_content_box().unwrap_or_else(Rect::zero)
+    pub fn bounding_content_box_or_zero(&self, can_gc: CanGc) -> Rect<Au> {
+        self.bounding_content_box(can_gc).unwrap_or_else(Rect::zero)
     }
 
-    pub fn content_boxes(&self) -> Vec<Rect<Au>> {
-        window_from_node(self).content_boxes_query(self)
+    pub fn content_boxes(&self, can_gc: CanGc) -> Vec<Rect<Au>> {
+        self.owner_window().content_boxes_query(self, can_gc)
     }
 
-    pub fn client_rect(&self) -> Rect<i32> {
-        window_from_node(self).client_rect_query(self)
+    pub fn client_rect(&self, can_gc: CanGc) -> Rect<i32> {
+        self.owner_window().client_rect_query(self, can_gc)
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth>
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollheight>
-    pub fn scroll_area(&self) -> Rect<i32> {
+    pub fn scroll_area(&self, can_gc: CanGc) -> Rect<i32> {
         // "1. Let document be the element’s node document.""
         let document = self.owner_doc();
 
@@ -836,7 +880,7 @@ impl Node {
         // element is not potentially scrollable, return max(viewport scrolling area
         // width, viewport width)."
         if (is_root && !in_quirks_mode) || (is_body_element && in_quirks_mode) {
-            let viewport_scrolling_area = window.scrolling_area_query(None);
+            let viewport_scrolling_area = window.scrolling_area_query(None, can_gc);
             return Rect::new(
                 viewport_scrolling_area.origin,
                 viewport_scrolling_area.size.max(viewport),
@@ -846,7 +890,7 @@ impl Node {
         // "6. If the element does not have any associated box return zero and terminate
         // these steps."
         // "7. Return the width of the element’s scrolling area."
-        window.scrolling_area_query(Some(self))
+        window.scrolling_area_query(Some(self), can_gc)
     }
 
     pub fn scroll_offset(&self) -> Vector2D<f32> {
@@ -856,7 +900,7 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-childnode-before>
-    pub fn before(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+    pub fn before(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         let parent = &self.parent_node;
 
@@ -870,7 +914,9 @@ impl Node {
         let viable_previous_sibling = first_node_not_in(self.preceding_siblings(), &nodes);
 
         // Step 4.
-        let node = self.owner_doc().node_from_nodes_and_strings(nodes)?;
+        let node = self
+            .owner_doc()
+            .node_from_nodes_and_strings(nodes, can_gc)?;
 
         // Step 5.
         let viable_previous_sibling = match viable_previous_sibling {
@@ -885,7 +931,7 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-childnode-after>
-    pub fn after(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+    pub fn after(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         let parent = &self.parent_node;
 
@@ -899,7 +945,9 @@ impl Node {
         let viable_next_sibling = first_node_not_in(self.following_siblings(), &nodes);
 
         // Step 4.
-        let node = self.owner_doc().node_from_nodes_and_strings(nodes)?;
+        let node = self
+            .owner_doc()
+            .node_from_nodes_and_strings(nodes, can_gc)?;
 
         // Step 5.
         Node::pre_insert(&node, &parent, viable_next_sibling.as_deref())?;
@@ -908,7 +956,7 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-childnode-replacewith>
-    pub fn replace_with(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+    pub fn replace_with(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         let parent = if let Some(parent) = self.GetParentNode() {
             parent
@@ -919,7 +967,9 @@ impl Node {
         // Step 3.
         let viable_next_sibling = first_node_not_in(self.following_siblings(), &nodes);
         // Step 4.
-        let node = self.owner_doc().node_from_nodes_and_strings(nodes)?;
+        let node = self
+            .owner_doc()
+            .node_from_nodes_and_strings(nodes, can_gc)?;
         if self.parent_node == Some(&*parent) {
             // Step 5.
             parent.ReplaceChild(&node, self)?;
@@ -931,29 +981,29 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-parentnode-prepend>
-    pub fn prepend(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+    pub fn prepend(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         let doc = self.owner_doc();
-        let node = doc.node_from_nodes_and_strings(nodes)?;
+        let node = doc.node_from_nodes_and_strings(nodes, can_gc)?;
         // Step 2.
         let first_child = self.first_child.get();
         Node::pre_insert(&node, self, first_child.as_deref()).map(|_| ())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-parentnode-append>
-    pub fn append(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+    pub fn append(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         let doc = self.owner_doc();
-        let node = doc.node_from_nodes_and_strings(nodes)?;
+        let node = doc.node_from_nodes_and_strings(nodes, can_gc)?;
         // Step 2.
         self.AppendChild(&node).map(|_| ())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-parentnode-replacechildren>
-    pub fn replace_children(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
+    pub fn replace_children(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         let doc = self.owner_doc();
-        let node = doc.node_from_nodes_and_strings(nodes)?;
+        let node = doc.node_from_nodes_and_strings(nodes, can_gc)?;
         // Step 2.
         Node::ensure_pre_insertion_validity(&node, self, None)?;
         // Step 3.
@@ -1018,7 +1068,7 @@ impl Node {
     /// <https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>
     #[allow(unsafe_code)]
     pub fn query_selector_all(&self, selectors: DOMString) -> Fallible<DomRoot<NodeList>> {
-        let window = window_from_node(self);
+        let window = self.owner_window();
         let iter = self.query_selector_iter(selectors)?;
         Ok(NodeList::new_simple_list(&window, iter))
     }
@@ -1232,27 +1282,6 @@ impl Node {
         }
     }
 
-    /// <https://dom.spec.whatwg.org/#retarget>
-    pub fn retarget(&self, b: &Node) -> DomRoot<Node> {
-        let mut a = DomRoot::from_ref(self);
-        loop {
-            // Step 1.
-            let a_root = a.GetRootNode(&GetRootNodeOptions::empty());
-            if !a_root.is::<ShadowRoot>() || a_root.is_shadow_including_inclusive_ancestor_of(b) {
-                return DomRoot::from_ref(&a);
-            }
-
-            // Step 2.
-            a = DomRoot::from_ref(
-                a_root
-                    .downcast::<ShadowRoot>()
-                    .unwrap()
-                    .Host()
-                    .upcast::<Node>(),
-            );
-        }
-    }
-
     pub fn is_styled(&self) -> bool {
         self.style_data.borrow().is_some()
     }
@@ -1269,8 +1298,11 @@ impl Node {
         })
     }
 
-    pub fn style(&self) -> Option<Arc<ComputedValues>> {
-        if !window_from_node(self).layout_reflow(QueryMsg::StyleQuery) {
+    pub fn style(&self, can_gc: CanGc) -> Option<Arc<ComputedValues>> {
+        if !self
+            .owner_window()
+            .layout_reflow(QueryMsg::StyleQuery, can_gc)
+        {
             return None;
         }
         self.style_data
@@ -1546,7 +1578,7 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     }
 
     fn media_data(self) -> Option<HTMLMediaData> {
-        self.downcast::<HTMLMediaElement>()
+        self.downcast::<HTMLVideoElement>()
             .map(|media| media.data())
     }
 
@@ -1736,9 +1768,14 @@ impl Iterator for TreeIterator {
     fn next(&mut self) -> Option<DomRoot<Node>> {
         let current = self.current.take()?;
 
-        if !self.shadow_including {
-            if let Some(element) = current.downcast::<Element>() {
-                if element.is_shadow_host() {
+        // Handle a potential shadow root on the element
+        if let Some(element) = current.downcast::<Element>() {
+            if let Some(shadow_root) = element.shadow_root() {
+                if self.shadow_including {
+                    self.current = Some(DomRoot::from_ref(shadow_root.upcast::<Node>()));
+                    self.depth += 1;
+                    return Some(current);
+                } else {
                     return self.next_skipping_children_impl(current);
                 }
             }
@@ -1766,23 +1803,24 @@ fn as_uintptr<T>(t: &T) -> uintptr_t {
 }
 
 impl Node {
-    pub fn reflect_node<N>(node: Box<N>, document: &Document) -> DomRoot<N>
+    pub fn reflect_node<N>(node: Box<N>, document: &Document, can_gc: CanGc) -> DomRoot<N>
     where
         N: DerivedFrom<Node> + DomObject + DomObjectWrap,
     {
-        Self::reflect_node_with_proto(node, document, None)
+        Self::reflect_node_with_proto(node, document, None, can_gc)
     }
 
     pub fn reflect_node_with_proto<N>(
         node: Box<N>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<N>
     where
         N: DerivedFrom<Node> + DomObject + DomObjectWrap,
     {
         let window = document.window();
-        reflect_dom_object_with_proto(node, window, proto, CanGc::note())
+        reflect_dom_object_with_proto(node, window, proto, can_gc)
     }
 
     pub fn new_inherited(doc: &Document) -> Node {
@@ -1791,7 +1829,10 @@ impl Node {
 
     #[allow(crown::unrooted_must_root)]
     pub fn new_document_node() -> Node {
-        Node::new_(NodeFlags::IS_IN_DOC | NodeFlags::IS_CONNECTED, None)
+        Node::new_(
+            NodeFlags::IS_IN_A_DOCUMENT_TREE | NodeFlags::IS_CONNECTED,
+            None,
+        )
     }
 
     #[allow(crown::unrooted_must_root)]
@@ -1986,8 +2027,7 @@ impl Node {
         };
 
         // Step 4.
-        let document = document_from_node(parent);
-        Node::adopt(node, &document);
+        Node::adopt(node, &parent.owner_document());
 
         // Step 5.
         Node::insert(
@@ -2097,9 +2137,39 @@ impl Node {
             };
             MutationObserver::queue_a_mutation_record(parent, mutation);
         }
-        node.owner_doc().remove_script_and_layout_blocker();
 
-        ScriptThread::note_rendering_opportunity(window_from_node(parent).pipeline_id());
+        // Step 10. Let staticNodeList be a list of nodes, initially « ».
+        let mut static_node_list = vec![];
+
+        // Step 11. For each node of nodes, in tree order:
+        for node in new_nodes {
+            // Step 11.1 For each shadow-including inclusive descendant inclusiveDescendant of node,
+            //           in shadow-including tree order, append inclusiveDescendant to staticNodeList.
+            static_node_list.extend(
+                node.traverse_preorder(ShadowIncluding::Yes)
+                    .map(|n| Trusted::new(&*n)),
+            );
+        }
+
+        // We use a delayed task for this step to work around an awkward interaction between
+        // script/layout blockers, Node::replace_all, and the children_changed vtable method.
+        // Any node with a post connection step that triggers layout (such as iframes) needs
+        // to be marked as dirty before doing so. This is handled by Node's children_changed
+        // callback, but when Node::insert is called as part of Node::replace_all then the
+        // callback is suppressed until we return to Node::replace_all. To ensure the sequence:
+        // 1) children_changed in Node::replace_all,
+        // 2) post_connection_steps from Node::insert,
+        // we use a delayed task that will run as soon as Node::insert removes its
+        // script/layout blocker.
+        node.owner_doc().add_delayed_task(task!(PostConnectionSteps: move || {
+            // Step 12. For each node of staticNodeList, if node is connected, then run the
+            //          post-connection steps with node.
+            for node in static_node_list.iter().map(Trusted::root).filter(|n| n.is_connected()) {
+                vtable_for(&node).post_connection_steps();
+            }
+        }));
+
+        node.owner_doc().remove_script_and_layout_blocker();
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-replace-all>
@@ -2110,7 +2180,7 @@ impl Node {
             Node::adopt(node, &parent.owner_doc());
         }
         // Step 2.
-        rooted_vec!(let removed_nodes <- parent.children());
+        rooted_vec!(let removed_nodes <- parent.children().map(|c| DomRoot::as_traced(&c)));
         // Step 3.
         rooted_vec!(let mut added_nodes);
         let added_nodes = if let Some(node) = node.as_ref() {
@@ -2150,11 +2220,11 @@ impl Node {
     }
 
     /// <https://dom.spec.whatwg.org/multipage/#string-replace-all>
-    pub fn string_replace_all(string: DOMString, parent: &Node) {
+    pub fn string_replace_all(string: DOMString, parent: &Node, can_gc: CanGc) {
         if string.len() == 0 {
             Node::replace_all(None, parent);
         } else {
-            let text = Text::new(string, &document_from_node(parent));
+            let text = Text::new(string, &parent.owner_document(), can_gc);
             Node::replace_all(Some(text.upcast::<Node>()), parent);
         };
     }
@@ -2223,7 +2293,6 @@ impl Node {
             MutationObserver::queue_a_mutation_record(parent, mutation);
         }
         parent.owner_doc().remove_script_and_layout_blocker();
-        ScriptThread::note_rendering_opportunity(window_from_node(parent).pipeline_id());
     }
 
     /// <https://dom.spec.whatwg.org/#concept-node-clone>
@@ -2233,13 +2302,13 @@ impl Node {
         clone_children: CloneChildrenFlag,
         can_gc: CanGc,
     ) -> DomRoot<Node> {
-        // Step 1.
+        // Step 1. If document is not given, let document be node’s node document.
         let document = match maybe_doc {
             Some(doc) => DomRoot::from_ref(doc),
             None => node.owner_doc(),
         };
 
-        // Step 2.
+        // Step 2. / Step 3.
         // XXXabinader: clone() for each node as trait?
         let copy: DomRoot<Node> = match node.type_id() {
             NodeTypeId::DocumentType => {
@@ -2249,6 +2318,7 @@ impl Node {
                     Some(doctype.public_id().clone()),
                     Some(doctype.system_id().clone()),
                     &document,
+                    can_gc,
                 );
                 DomRoot::upcast::<Node>(doctype)
             },
@@ -2262,16 +2332,17 @@ impl Node {
                     attr.namespace().clone(),
                     attr.prefix().cloned(),
                     None,
+                    can_gc,
                 );
                 DomRoot::upcast::<Node>(attr)
             },
             NodeTypeId::DocumentFragment(_) => {
-                let doc_fragment = DocumentFragment::new(&document);
+                let doc_fragment = DocumentFragment::new(&document, can_gc);
                 DomRoot::upcast::<Node>(doc_fragment)
             },
             NodeTypeId::CharacterData(_) => {
                 let cdata = node.downcast::<CharacterData>().unwrap();
-                cdata.clone_with_data(cdata.Data(), &document)
+                cdata.clone_with_data(cdata.Data(), &document, can_gc)
             },
             NodeTypeId::Document(_) => {
                 let document = node.downcast::<Document>().unwrap();
@@ -2295,10 +2366,10 @@ impl Node {
                     DocumentSource::NotFromParser,
                     loader,
                     None,
-                    None,
                     document.status_code(),
                     Default::default(),
-                    CanGc::note(),
+                    false,
+                    can_gc,
                 );
                 DomRoot::upcast::<Node>(document)
             },
@@ -2322,14 +2393,15 @@ impl Node {
             },
         };
 
-        // Step 3.
+        // Step 4. Set copy’s node document and document to copy, if copy is a document,
+        // and set copy’s node document to document otherwise.
         let document = match copy.downcast::<Document>() {
             Some(doc) => DomRoot::from_ref(doc),
             None => DomRoot::from_ref(&*document),
         };
         assert!(copy.owner_doc() == document);
 
-        // Step 4 (some data already copied in step 2).
+        // TODO: The spec tells us to do this in step 3.
         match node.type_id() {
             NodeTypeId::Document(_) => {
                 let node_doc = node.downcast::<Document>().unwrap();
@@ -2348,25 +2420,63 @@ impl Node {
                         attr.name().clone(),
                         attr.namespace().clone(),
                         attr.prefix().cloned(),
+                        can_gc,
                     );
                 }
             },
             _ => (),
         }
 
-        // Step 5: cloning steps.
+        // Step 5: Run any cloning steps defined for node in other applicable specifications and pass copy,
+        // node, document, and the clone children flag if set, as parameters.
         vtable_for(node).cloning_steps(&copy, maybe_doc, clone_children);
 
-        // Step 6.
+        // Step 6. If the clone children flag is set, then for each child child of node, in tree order: append the
+        // result of cloning child with document and the clone children flag set, to copy.
         if clone_children == CloneChildrenFlag::CloneChildren {
             for child in node.children() {
-                let child_copy =
-                    Node::clone(&child, Some(&document), clone_children, CanGc::note());
+                let child_copy = Node::clone(&child, Some(&document), clone_children, can_gc);
                 let _inserted_node = Node::pre_insert(&child_copy, &copy, None);
             }
         }
 
-        // Step 7.
+        // Step 7. If node is a shadow host whose shadow root’s clonable is true:
+        // NOTE: Only elements can be shadow hosts
+        if matches!(node.type_id(), NodeTypeId::Element(_)) {
+            let node_elem = node.downcast::<Element>().unwrap();
+            let copy_elem = copy.downcast::<Element>().unwrap();
+
+            if let Some(shadow_root) = node_elem.shadow_root().filter(|r| r.Clonable()) {
+                // Step 7.1 Assert: copy is not a shadow host.
+                assert!(!copy_elem.is_shadow_host());
+
+                // Step 7.2 Run attach a shadow root with copy, node’s shadow root’s mode, true,
+                // node’s shadow root’s serializable, node’s shadow root’s delegates focus,
+                // and node’s shadow root’s slot assignment.
+                let copy_shadow_root =
+                    copy_elem.attach_shadow(IsUserAgentWidget::No, shadow_root.Mode(), true)
+                    .expect("placement of attached shadow root must be valid, as this is a copy of an existing one");
+
+                // TODO: Step 7.3 Set copy’s shadow root’s declarative to node’s shadow root’s declarative.
+
+                // Step 7.4 For each child child of node’s shadow root, in tree order: append the result of
+                // cloning child with document and the clone children flag set, to copy’s shadow root.
+                for child in shadow_root.upcast::<Node>().children() {
+                    let child_copy = Node::clone(
+                        &child,
+                        Some(&document),
+                        CloneChildrenFlag::CloneChildren,
+                        can_gc,
+                    );
+
+                    // TODO: Should we handle the error case here and in step 6?
+                    let _inserted_node =
+                        Node::pre_insert(&child_copy, copy_shadow_root.upcast::<Node>(), None);
+                }
+            }
+        }
+
+        // Step 8. Return copy.
         copy
     }
 
@@ -2439,9 +2549,55 @@ impl Node {
         }
         &*(conversions::private_from_object(object) as *const Self)
     }
+
+    pub fn html_serialize(&self, traversal_scope: html_serialize::TraversalScope) -> DOMString {
+        let mut writer = vec![];
+        html_serialize::serialize(
+            &mut writer,
+            &self,
+            html_serialize::SerializeOpts {
+                traversal_scope,
+                ..Default::default()
+            },
+        )
+        .expect("Cannot serialize node");
+
+        // FIXME(ajeffrey): Directly convert UTF8 to DOMString
+        DOMString::from(String::from_utf8(writer).unwrap())
+    }
+
+    pub fn xml_serialize(&self, traversal_scope: xml_serialize::TraversalScope) -> DOMString {
+        let mut writer = vec![];
+        xml_serialize::serialize(
+            &mut writer,
+            &self,
+            xml_serialize::SerializeOpts { traversal_scope },
+        )
+        .expect("Cannot serialize node");
+
+        // FIXME(ajeffrey): Directly convert UTF8 to DOMString
+        DOMString::from(String::from_utf8(writer).unwrap())
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#fragment-serializing-algorithm-steps>
+    pub fn fragment_serialization_algorithm(&self, require_well_formed: bool) -> DOMString {
+        // Step 1. Let context document be node's node document.
+        let context_document = self.owner_document();
+
+        // Step 2. If context document is an HTML document, return the result of HTML fragment serialization algorithm
+        // with node, false, and « ».
+        if context_document.is_html_document() {
+            return self.html_serialize(html_serialize::TraversalScope::ChildrenOnly(None));
+        }
+
+        // Step 3. Return the XML serialization of node given require well-formed.
+        // TODO: xml5ever doesn't seem to want require_well_formed
+        let _ = require_well_formed;
+        self.xml_serialize(xml_serialize::TraversalScope::ChildrenOnly(None))
+    }
 }
 
-impl NodeMethods for Node {
+impl NodeMethods<crate::DomTypeHolder> for Node {
     /// <https://dom.spec.whatwg.org/#dom-node-nodetype>
     fn NodeType(&self) -> u16 {
         match self.type_id() {
@@ -2513,7 +2669,7 @@ impl NodeMethods for Node {
             };
         }
 
-        if self.is_in_doc() {
+        if self.is_in_a_document_tree() {
             DomRoot::from_ref(self.owner_doc().upcast::<Node>())
         } else {
             self.inclusive_ancestors(ShadowIncluding::No)
@@ -2610,7 +2766,7 @@ impl NodeMethods for Node {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-node-textcontent>
-    fn SetTextContent(&self, value: Option<DOMString>) {
+    fn SetTextContent(&self, value: Option<DOMString>, can_gc: CanGc) {
         let value = value.unwrap_or_default();
         match self.type_id() {
             NodeTypeId::DocumentFragment(_) | NodeTypeId::Element(..) => {
@@ -2618,7 +2774,9 @@ impl NodeMethods for Node {
                 let node = if value.is_empty() {
                     None
                 } else {
-                    Some(DomRoot::upcast(self.owner_doc().CreateTextNode(value)))
+                    Some(DomRoot::upcast(
+                        self.owner_doc().CreateTextNode(value, can_gc),
+                    ))
                 };
 
                 // Step 3.
@@ -2744,7 +2902,7 @@ impl NodeMethods for Node {
         let previous_sibling = child.GetPreviousSibling();
 
         // Step 10.
-        let document = document_from_node(self);
+        let document = self.owner_document();
         Node::adopt(node, &document);
 
         let removed_child = if node != child {
@@ -2830,7 +2988,7 @@ impl NodeMethods for Node {
 
     /// <https://dom.spec.whatwg.org/#dom-node-clonenode>
     fn CloneNode(&self, deep: bool, can_gc: CanGc) -> Fallible<DomRoot<Node>> {
-        if deep && self.is::<ShadowRoot>() {
+        if self.is::<ShadowRoot>() {
             return Err(Error::NotSupported);
         }
         Ok(Node::clone(
@@ -3160,30 +3318,52 @@ impl NodeMethods for Node {
     }
 }
 
-pub fn document_from_node<T: DerivedFrom<Node> + DomObject>(derived: &T) -> DomRoot<Document> {
-    derived.upcast().owner_doc()
+pub(crate) trait NodeTraits {
+    /// Get the [`Document`] that owns this node. Note that this may differ from the
+    /// [`Document`] that the node was created in if it was adopted by a different
+    /// [`Document`] (the owner).
+    fn owner_document(&self) -> DomRoot<Document>;
+    /// Get the [`Window`] of the [`Document`] that owns this node. Note that this may
+    /// differ from the [`Document`] that the node was created in if it was adopted by a
+    /// different [`Document`] (the owner).
+    fn owner_window(&self) -> DomRoot<Window>;
+    /// Get the [`GlobalScope`] of the [`Document`] that owns this node. Note that this may
+    /// differ from the [`GlobalScope`] that the node was created in if it was adopted by a
+    /// different [`Document`] (the owner).
+    fn owner_global(&self) -> DomRoot<GlobalScope>;
+    /// If this [`Node`] is contained in a [`ShadowRoot`] return it, otherwise `None`.
+    fn containing_shadow_root(&self) -> Option<DomRoot<ShadowRoot>>;
+    /// Get the stylesheet owner for this node: either the [`Document`] or the [`ShadowRoot`]
+    /// of the node.
+    #[allow(crown::unrooted_must_root)]
+    fn stylesheet_list_owner(&self) -> StyleSheetListOwner;
 }
 
-pub fn containing_shadow_root<T: DerivedFrom<Node> + DomObject>(
-    derived: &T,
-) -> Option<DomRoot<ShadowRoot>> {
-    derived.upcast().containing_shadow_root()
-}
-
-#[allow(crown::unrooted_must_root)]
-pub fn stylesheets_owner_from_node<T: DerivedFrom<Node> + DomObject>(
-    derived: &T,
-) -> StyleSheetListOwner {
-    if let Some(shadow_root) = containing_shadow_root(derived) {
-        StyleSheetListOwner::ShadowRoot(Dom::from_ref(&*shadow_root))
-    } else {
-        StyleSheetListOwner::Document(Dom::from_ref(&*document_from_node(derived)))
+impl<T: DerivedFrom<Node> + DomObject> NodeTraits for T {
+    fn owner_document(&self) -> DomRoot<Document> {
+        self.upcast().owner_doc()
     }
-}
 
-pub fn window_from_node<T: DerivedFrom<Node> + DomObject>(derived: &T) -> DomRoot<Window> {
-    let document = document_from_node(derived);
-    DomRoot::from_ref(document.window())
+    fn owner_window(&self) -> DomRoot<Window> {
+        DomRoot::from_ref(self.owner_document().window())
+    }
+
+    fn owner_global(&self) -> DomRoot<GlobalScope> {
+        DomRoot::from_ref(self.owner_window().upcast())
+    }
+
+    fn containing_shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
+        Node::containing_shadow_root(self.upcast())
+    }
+
+    #[allow(crown::unrooted_must_root)]
+    fn stylesheet_list_owner(&self) -> StyleSheetListOwner {
+        self.containing_shadow_root()
+            .map(|shadow_root| StyleSheetListOwner::ShadowRoot(Dom::from_ref(&*shadow_root)))
+            .unwrap_or_else(|| {
+                StyleSheetListOwner::Document(Dom::from_ref(&*self.owner_document()))
+            })
+    }
 }
 
 impl VirtualMethods for Node {
@@ -3376,9 +3556,24 @@ impl<'a> ChildrenMutation<'a> {
 /// The context of the binding to tree of a node.
 pub struct BindContext {
     /// Whether the tree is connected.
+    ///
+    /// <https://dom.spec.whatwg.org/#connected>
     pub tree_connected: bool,
-    /// Whether the tree is in the document.
-    pub tree_in_doc: bool,
+
+    /// Whether the tree's root is a document.
+    ///
+    /// <https://dom.spec.whatwg.org/#in-a-document-tree>
+    pub tree_is_in_a_document_tree: bool,
+
+    /// Whether the tree's root is a shadow root
+    pub tree_is_in_a_shadow_tree: bool,
+}
+
+impl BindContext {
+    /// Return true iff the tree is inside either a document- or a shadow tree.
+    pub fn is_in_tree(&self) -> bool {
+        self.tree_is_in_a_document_tree || self.tree_is_in_a_shadow_tree
+    }
 }
 
 /// The context of the unbinding from a tree of a node when one of its
@@ -3392,10 +3587,19 @@ pub struct UnbindContext<'a> {
     prev_sibling: Option<&'a Node>,
     /// The next sibling of the inclusive ancestor that was removed.
     pub next_sibling: Option<&'a Node>,
+
     /// Whether the tree is connected.
+    ///
+    /// <https://dom.spec.whatwg.org/#connected>
     pub tree_connected: bool,
-    /// Whether the tree is in doc.
-    pub tree_in_doc: bool,
+
+    /// Whether the tree's root is a document.
+    ///
+    /// <https://dom.spec.whatwg.org/#in-a-document-tree>
+    pub tree_is_in_a_document_tree: bool,
+
+    /// Whether the tree's root is a shadow root
+    pub tree_is_in_a_shadow_tree: bool,
 }
 
 impl<'a> UnbindContext<'a> {
@@ -3412,7 +3616,8 @@ impl<'a> UnbindContext<'a> {
             prev_sibling,
             next_sibling,
             tree_connected: parent.is_connected(),
-            tree_in_doc: parent.is_in_doc(),
+            tree_is_in_a_document_tree: parent.is_in_a_document_tree(),
+            tree_is_in_a_shadow_tree: parent.is_in_a_shadow_tree(),
         }
     }
 
@@ -3506,11 +3711,23 @@ impl From<ElementTypeId> for LayoutElementType {
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLInputElement) => {
                 LayoutElementType::HTMLInputElement
             },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLOptGroupElement) => {
+                LayoutElementType::HTMLOptGroupElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLOptionElement) => {
+                LayoutElementType::HTMLOptionElement
+            },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLObjectElement) => {
                 LayoutElementType::HTMLObjectElement
             },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLParagraphElement) => {
                 LayoutElementType::HTMLParagraphElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLPreElement) => {
+                LayoutElementType::HTMLPreElement
+            },
+            ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLSelectElement) => {
+                LayoutElementType::HTMLSelectElement
             },
             ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTableCellElement) => {
                 LayoutElementType::HTMLTableCellElement

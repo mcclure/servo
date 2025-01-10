@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use servo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -69,8 +69,21 @@ impl PopStateEvent {
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    pub fn dispatch_jsval(
+        target: &EventTarget,
+        window: &Window,
+        state: HandleValue,
+        can_gc: CanGc,
+    ) {
+        let event =
+            PopStateEvent::new(window, None, atom!("popstate"), false, false, state, can_gc);
+        event.upcast::<Event>().fire(target, can_gc);
+    }
+}
+
+impl PopStateEventMethods<crate::DomTypeHolder> for PopStateEvent {
+    // https://html.spec.whatwg.org/multipage/#popstateevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -88,24 +101,9 @@ impl PopStateEvent {
         ))
     }
 
-    pub fn dispatch_jsval(target: &EventTarget, window: &Window, state: HandleValue) {
-        let event = PopStateEvent::new(
-            window,
-            None,
-            atom!("popstate"),
-            false,
-            false,
-            state,
-            CanGc::note(),
-        );
-        event.upcast::<Event>().fire(target);
-    }
-}
-
-impl PopStateEventMethods for PopStateEvent {
     // https://html.spec.whatwg.org/multipage/#dom-popstateevent-state
-    fn State(&self, _cx: JSContext) -> JSVal {
-        self.state.get()
+    fn State(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.state.get())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-istrusted

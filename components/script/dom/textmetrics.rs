@@ -9,6 +9,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 #[allow(non_snake_case)]
@@ -94,11 +95,12 @@ impl TextMetrics {
                 ideographicBaseline,
             )),
             global,
+            CanGc::note(),
         )
     }
 }
 
-impl TextMetricsMethods for TextMetrics {
+impl TextMetricsMethods<crate::DomTypeHolder> for TextMetrics {
     /// <https://html.spec.whatwg.org/multipage/#dom-textmetrics-width>
     fn Width(&self) -> Finite<f64> {
         self.width

@@ -13,6 +13,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::videotracklist::VideoTrackList;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct VideoTrack {
@@ -57,6 +58,7 @@ impl VideoTrack {
                 id, kind, label, language, track_list,
             )),
             window,
+            CanGc::note(),
         )
     }
 
@@ -85,7 +87,7 @@ impl VideoTrack {
     }
 }
 
-impl VideoTrackMethods for VideoTrack {
+impl VideoTrackMethods<crate::DomTypeHolder> for VideoTrack {
     // https://html.spec.whatwg.org/multipage/#dom-videotrack-id
     fn Id(&self) -> DOMString {
         self.id()

@@ -6,18 +6,17 @@ use std::future::{ready, Future};
 use std::pin::Pin;
 
 use headers::{HeaderMapExt, Range};
-use http::{Method, StatusCode};
+use http::Method;
 use log::debug;
 use net_traits::blob_url_store::{parse_blob_url, BlobURLStoreError};
+use net_traits::http_status::HttpStatus;
 use net_traits::request::Request;
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{NetworkError, ResourceFetchTiming};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::fetch::methods::{Data, DoneChannel, FetchContext};
-use crate::protocols::{
-    get_range_request_bounds, partial_content, range_not_satisfiable_error, ProtocolHandler,
-};
+use crate::protocols::{partial_content, range_not_satisfiable_error, ProtocolHandler};
 
 #[derive(Default)]
 pub struct BlobProtocolHander {}
@@ -41,9 +40,6 @@ impl ProtocolHandler for BlobProtocolHander {
 
         let range_header = request.headers.typed_get::<Range>();
         let is_range_request = range_header.is_some();
-        // We will get a final version of this range once we have
-        // the length of the data backing the blob.
-        let range = get_range_request_bounds(range_header);
 
         let (id, origin) = match parse_blob_url(&url) {
             Ok((id, origin)) => (id, origin),
@@ -55,8 +51,7 @@ impl ProtocolHandler for BlobProtocolHander {
         };
 
         let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-        response.status = Some((StatusCode::OK, "OK".to_string()));
-        response.raw_status = Some((StatusCode::OK.as_u16(), b"OK".to_vec()));
+        response.status = HttpStatus::default();
 
         if is_range_request {
             partial_content(&mut response);
@@ -73,7 +68,7 @@ impl ProtocolHandler for BlobProtocolHander {
             &context.file_token,
             origin,
             &mut response,
-            range,
+            range_header,
         ) {
             let _ = done_sender.send(Data::Done);
             let err = match err {

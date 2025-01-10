@@ -42,6 +42,8 @@ pub fn is_execution_stack_empty() -> bool {
 /// RAII struct that pushes and pops entries from the script settings stack.
 pub struct AutoEntryScript {
     global: DomRoot<GlobalScope>,
+    #[cfg(feature = "tracing")]
+    span: tracing::span::EnteredSpan,
 }
 
 impl AutoEntryScript {
@@ -56,6 +58,13 @@ impl AutoEntryScript {
             });
             AutoEntryScript {
                 global: DomRoot::from_ref(global),
+                #[cfg(feature = "tracing")]
+                span: tracing::info_span!(
+                    "ScriptEvaluate",
+                    servo_profiling = true,
+                    url = global.get_url().to_string(),
+                )
+                .entered(),
             }
         })
     }
@@ -108,9 +117,9 @@ impl AutoIncumbentScript {
     pub fn new(global: &GlobalScope) -> Self {
         // Step 2-3.
         unsafe {
-            let cx = Runtime::get();
-            assert!(!cx.is_null());
-            HideScriptedCaller(cx);
+            let cx =
+                Runtime::get().expect("Creating a new incumbent script after runtime shutdown");
+            HideScriptedCaller(cx.as_ptr());
         }
         STACK.with(|stack| {
             trace!("Prepare to run a callback with {:p}", global);
@@ -147,9 +156,9 @@ impl Drop for AutoIncumbentScript {
         });
         unsafe {
             // Step 1-2.
-            let cx = Runtime::get();
-            assert!(!cx.is_null());
-            UnhideScriptedCaller(cx);
+            if let Some(cx) = Runtime::get() {
+                UnhideScriptedCaller(cx.as_ptr());
+            }
         }
     }
 }
@@ -165,9 +174,12 @@ pub fn incumbent_global() -> Option<DomRoot<GlobalScope>> {
     // there's nothing on the JS stack, which will cause us to check the
     // incumbent script stack below.
     unsafe {
-        let cx = Runtime::get();
-        assert!(!cx.is_null());
-        let global = GetScriptedCallerGlobal(cx);
+        let Some(cx) = Runtime::get() else {
+            // It's not meaningful to return a global object if the runtime
+            // no longer exists.
+            return None;
+        };
+        let global = GetScriptedCallerGlobal(cx.as_ptr());
         if !global.is_null() {
             return Some(GlobalScope::from_object(global));
         }

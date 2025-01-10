@@ -12,7 +12,8 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{document_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLFrameSetElement {
@@ -36,6 +37,7 @@ impl HTMLFrameSetElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFrameSetElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLFrameSetElement::new_inherited(
@@ -43,13 +45,14 @@ impl HTMLFrameSetElement {
             )),
             document,
             proto,
+            can_gc,
         );
         n.upcast::<Node>().set_weird_parser_insertion_mode();
         n
     }
 }
 
-impl HTMLFrameSetElementMethods for HTMLFrameSetElement {
+impl HTMLFrameSetElementMethods<crate::DomTypeHolder> for HTMLFrameSetElement {
     // https://html.spec.whatwg.org/multipage/#windoweventhandlers
     window_event_handlers!(ForwardToWindow);
 }

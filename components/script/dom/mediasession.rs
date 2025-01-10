@@ -9,6 +9,7 @@ use embedder_traits::{MediaMetadata as EmbedderMediaMetadata, MediaSessionEvent}
 use script_traits::{MediaSessionActionType, ScriptMsg};
 
 use super::bindings::trace::HashMapTracedValues;
+use crate::conversions::Convert;
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementMethods;
@@ -61,7 +62,11 @@ impl MediaSession {
     }
 
     pub fn new(window: &Window) -> DomRoot<MediaSession> {
-        reflect_dom_object(Box::new(MediaSession::new_inherited()), window)
+        reflect_dom_object(
+            Box::new(MediaSession::new_inherited()),
+            window,
+            CanGc::note(),
+        )
     }
 
     pub fn register_media_instance(&self, media_instance: &HTMLMediaElement) {
@@ -124,16 +129,16 @@ impl MediaSession {
     }
 }
 
-impl MediaSessionMethods for MediaSession {
+impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
     /// <https://w3c.github.io/mediasession/#dom-mediasession-metadata>
-    fn GetMetadata(&self) -> Option<DomRoot<MediaMetadata>> {
+    fn GetMetadata(&self, can_gc: CanGc) -> Option<DomRoot<MediaMetadata>> {
         if let Some(ref metadata) = *self.metadata.borrow() {
             let mut init = MediaMetadataInit::empty();
             init.title = DOMString::from_string(metadata.title.clone());
             init.artist = DOMString::from_string(metadata.artist.clone());
             init.album = DOMString::from_string(metadata.album.clone());
             let global = self.global();
-            Some(MediaMetadata::new(global.as_window(), &init))
+            Some(MediaMetadata::new(global.as_window(), &init, can_gc))
         } else {
             None
         }
@@ -188,8 +193,8 @@ impl MediaSessionMethods for MediaSession {
             Some(handler) => self
                 .action_handlers
                 .borrow_mut()
-                .insert(action.into(), handler.clone()),
-            None => self.action_handlers.borrow_mut().remove(&action.into()),
+                .insert(action.convert(), handler.clone()),
+            None => self.action_handlers.borrow_mut().remove(&action.convert()),
         };
     }
 
@@ -249,9 +254,9 @@ impl MediaSessionMethods for MediaSession {
     }
 }
 
-impl From<MediaSessionAction> for MediaSessionActionType {
-    fn from(action: MediaSessionAction) -> MediaSessionActionType {
-        match action {
+impl Convert<MediaSessionActionType> for MediaSessionAction {
+    fn convert(self) -> MediaSessionActionType {
+        match self {
             MediaSessionAction::Play => MediaSessionActionType::Play,
             MediaSessionAction::Pause => MediaSessionActionType::Pause,
             MediaSessionAction::Seekbackward => MediaSessionActionType::SeekBackward,

@@ -25,6 +25,10 @@ on:
       github-release-id:
         required: false
         type: string
+      force-github-hosted-runner:
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       profile:
@@ -48,19 +52,40 @@ on:
         required: false
         default: false
         type: boolean
+      force-github-hosted-runner:
+        required: false
+        type: boolean
+        default: false
 
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
-  CCACHE: "sccache"
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Runs the underlying job (“workload”) on a self-hosted runner if available,
+  # with the help of a `runner-select` job and a `runner-timeout` job.
+  runner-select:
+    uses: ./.github/workflows/self-hosted-runner-select.yml
+    secrets: inherit
+    with:
+      github-hosted-runner-label: macos-13
+      self-hosted-image-name: servo-macos13
+      force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+  runner-timeout:
+    needs:
+      - runner-select
+    uses: ./.github/workflows/self-hosted-runner-timeout.yml
+    secrets: inherit
+    with:
+      unique-id: ${{ needs.runner-select.outputs.unique-id }}
+      is-self-hosted: ${{ fromJSON(needs.runner-select.outputs.is-self-hosted) }}
+
   build:
-    name: MacOS Build
-    runs-on: macos-13
+    needs:
+      - runner-select
+    name: MacOS Build [${{ needs.runner-select.outputs.unique-id }}]
+    runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
     steps:
       # XProtect can cause random failures if it decides that the DMG we create
       # during the packaging phase is malware.
@@ -70,43 +95,57 @@ jobs:
         run: |
           echo Killing XProtect.; sudo pkill -9 XProtect >/dev/null || true;
       - uses: actions/checkout@v4
-        if: github.event_name != 'pull_request_target'
+        if: runner.environment != 'self-hosted' && github.event_name != 'pull_request_target'
       # This is necessary to checkout the pull request if this run was triggered via a
       # `pull_request_target` event.
       - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
+        if: runner.environment != 'self-hosted' && github.event_name == 'pull_request_target'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.4
-      - name: Install crown
-        run: cargo install --path support/crown
-      - name: Bootstrap
+      # Faster checkout for self-hosted runner that uses prebaked repo.
+      - if: ${{ runner.environment == 'self-hosted' && github.event_name != 'pull_request_target' }}
+        run: git fetch --depth=1 origin $GITHUB_SHA
+      - if: ${{ runner.environment == 'self-hosted' && github.event_name == 'pull_request_target' }}
+        run: git fetch --depth=1 origin ${{ github.event.pull_request.head.sha }}
+      - if: ${{ runner.environment == 'self-hosted' }}
+        # Same as `git switch --detach FETCH_HEAD`, but fixes up dirty working
+        # trees, in case the runner image was baked with a dirty working tree.
         run: |
-          python3 -m pip install --upgrade pip
-          python3 ./mach bootstrap --skip-lints
+          git switch --detach
+          git reset --hard FETCH_HEAD
+
+      - if: runner.environment != 'self-hosted'
+        name: Setup Python
+        uses: ./.github/actions/setup-python
+      - if: runner.environment != 'self-hosted'
+        name: Install crown
+        run: cargo install --path support/crown
+      - if: runner.environment != 'self-hosted'
+        name: Bootstrap
+        run: |
+          ./mach bootstrap --skip-lints
           brew install gnu-tar
       - name: Build (${{ inputs.profile }})
         run: |
-          python3 ./mach build --use-crown --locked --${{ inputs.profile }}
+          ./mach build --use-crown --locked --${{ inputs.profile }}
           cp -r target/cargo-timings target/cargo-timings-macos
       - name: Smoketest
         uses: nick-fields/retry@v3
         with: # See https://github.com/servo/servo/issues/30757
           timeout_minutes: 5
           max_attempts: 2
-          command: python3 ./mach smoketest --${{ inputs.profile }}
+          command: ./mach smoketest --${{ inputs.profile }}
       - name: Script tests
         run: ./mach test-scripts
       - name: Unit tests
         if: ${{ inputs.unit-tests }}
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 20 # https://github.com/servo/servo/issues/30275
+          timeout_minutes: 40 # https://github.com/servo/servo/issues/30275
           max_attempts: 3 # https://github.com/servo/servo/issues/30683
-          command: python3 ./mach test-unit --${{ inputs.profile }}
+          command: ./mach test-unit --${{ inputs.profile }}
       - name: Build mach package
-        run: python3 ./mach package --${{ inputs.profile }}
+        run: ./mach package --${{ inputs.profile }}
       - name: Run DMG smoketest
         uses: nick-fields/retry@v3
         with: # See https://github.com/servo/servo/issues/30757
@@ -127,7 +166,7 @@ jobs:
       - name: Upload nightly
         if: ${{ inputs.upload }}
         run: |
-          python3 ./mach upload-nightly mac --secret-from-environment \
+          ./mach upload-nightly mac --secret-from-environment \
             --github-release-id ${{ inputs.github-release-id }}
         env:
           S3_UPLOAD_CREDENTIALS: ${{ secrets.S3_UPLOAD_CREDENTIALS }}

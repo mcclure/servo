@@ -17,6 +17,7 @@ use crate::dom::element::Element;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::texttrack::TextTrack;
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 #[repr(u16)]
@@ -54,6 +55,7 @@ impl HTMLTrackElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTrackElement> {
         let track = TextTrack::new(
             document.window(),
@@ -70,11 +72,12 @@ impl HTMLTrackElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLTrackElementMethods for HTMLTrackElement {
+impl HTMLTrackElementMethods<crate::DomTypeHolder> for HTMLTrackElement {
     // https://html.spec.whatwg.org/multipage/#dom-track-kind
     fn Kind(&self) -> DOMString {
         let element = self.upcast::<Element>();

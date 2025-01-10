@@ -8,7 +8,7 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
 use servo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -51,6 +51,7 @@ impl PromiseRejectionEvent {
         cancelable: EventCancelable,
         promise: Rc<Promise>,
         reason: HandleValue,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         Self::new_with_proto(
             global,
@@ -60,11 +61,12 @@ impl PromiseRejectionEvent {
             cancelable,
             promise.promise_obj(),
             reason,
-            CanGc::note(),
+            can_gc,
         )
     }
 
     #[allow(crown::unrooted_must_root)]
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -91,9 +93,11 @@ impl PromiseRejectionEvent {
         }
         ev
     }
+}
 
-    #[allow(crown::unrooted_must_root, non_snake_case)]
-    pub fn Constructor(
+impl PromiseRejectionEventMethods<crate::DomTypeHolder> for PromiseRejectionEvent {
+    // https://html.spec.whatwg.org/multipage/#promiserejectionevent
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         can_gc: CanGc,
@@ -116,17 +120,15 @@ impl PromiseRejectionEvent {
         );
         Ok(event)
     }
-}
 
-impl PromiseRejectionEventMethods for PromiseRejectionEvent {
     // https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-promise
     fn Promise(&self, _cx: JSContext) -> NonNull<JSObject> {
         NonNull::new(self.promise.get()).unwrap()
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-reason
-    fn Reason(&self, _cx: JSContext) -> JSVal {
-        self.reason.get()
+    fn Reason(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.reason.get())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-istrusted

@@ -18,17 +18,14 @@ use dom_struct::dom_struct;
 use embedder_traits::InputMethodType;
 use euclid::default::{Rect, Size2D};
 use html5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
-use html5ever::serialize::{SerializeOpts, TraversalScope};
 use html5ever::{
-    local_name, namespace_prefix, namespace_url, ns, serialize, LocalName, Namespace, Prefix,
-    QualName,
+    local_name, namespace_prefix, namespace_url, ns, LocalName, Namespace, Prefix, QualName,
 };
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::HandleObject;
 use net_traits::request::CorsSettings;
 use net_traits::ReferrerPolicy;
-use script_layout_interface::ReflowGoal;
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
 use selectors::bloom::{BloomFilter, BLOOM_HASH_MASK};
 use selectors::matching::{ElementSelectorFlags, MatchingContext};
@@ -55,27 +52,30 @@ use style::selector_parser::{
 use style::shared_lock::{Locked, SharedRwLock};
 use style::stylesheets::layer_rule::LayerOrder;
 use style::stylesheets::{CssRuleType, UrlExtraData};
+use style::values::generics::position::PreferredRatio;
+use style::values::generics::ratio::Ratio;
 use style::values::generics::NonNegative;
 use style::values::{computed, specified, AtomIdent, AtomString, CSSFloat};
 use style::{dom_apis, thread_state, ArcSlice, CaseSensitivityExt};
 use style_dom::ElementState;
-use xml5ever::serialize as xmlSerialize;
 use xml5ever::serialize::TraversalScope::{
     ChildrenOnly as XmlChildrenOnly, IncludeNode as XmlIncludeNode,
 };
-use xml5ever::serialize::{SerializeOpts as XmlSerializeOpts, TraversalScope as XmlTraversalScope};
 
+use super::customelementregistry::is_valid_custom_element_name;
 use super::htmltablecolelement::{HTMLTableColElement, HTMLTableColElementLayoutHelpers};
 use crate::dom::activation::Activatable;
 use crate::dom::attr::{Attr, AttrHelpersForLayout};
 use crate::dom::bindings::cell::{ref_filter_map, DomRefCell, Ref, RefMut};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
-use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
+use crate::dom::bindings::codegen::Bindings::ElementBinding::{ElementMethods, ShadowRootInit};
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
 use crate::dom::bindings::codegen::Bindings::HTMLTemplateElementBinding::HTMLTemplateElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
-use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRoot_Binding::ShadowRootMethods;
+use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::{
+    ShadowRootMethods, ShadowRootMode,
+};
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
     ScrollBehavior, ScrollToOptions, WindowMethods,
 };
@@ -101,6 +101,7 @@ use crate::dom::document::{
 };
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::domrect::DOMRect;
+use crate::dom::domrectlist::DOMRectList;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::elementinternals::ElementInternals;
 use crate::dom::eventtarget::EventTarget;
@@ -132,11 +133,12 @@ use crate::dom::htmltablesectionelement::{
 };
 use crate::dom::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::htmltextareaelement::{HTMLTextAreaElement, LayoutHTMLTextAreaElementHelpers};
+use crate::dom::htmlvideoelement::{HTMLVideoElement, LayoutHTMLVideoElementHelpers};
 use crate::dom::mutationobserver::{Mutation, MutationObserver};
 use crate::dom::namednodemap::NamedNodeMap;
 use crate::dom::node::{
-    document_from_node, window_from_node, BindContext, ChildrenMutation, LayoutNodeHelpers, Node,
-    NodeDamage, NodeFlags, ShadowIncluding, UnbindContext,
+    BindContext, ChildrenMutation, LayoutNodeHelpers, Node, NodeDamage, NodeFlags, NodeTraits,
+    ShadowIncluding, UnbindContext,
 };
 use crate::dom::nodelist::NodeList;
 use crate::dom::promise::Promise;
@@ -147,7 +149,6 @@ use crate::dom::text::Text;
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::{vtable_for, VirtualMethods};
-use crate::dom::window::ReflowReason;
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 use crate::stylesheet_loader::StylesheetOwner;
@@ -314,6 +315,7 @@ impl Element {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<Element> {
         Node::reflect_node_with_proto(
             Box::new(Element::new_inherited(
@@ -321,6 +323,7 @@ impl Element {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -423,18 +426,18 @@ impl Element {
 
     /// style will be `None` for elements in a `display: none` subtree. otherwise, the element has a
     /// layout box iff it doesn't have `display: none`.
-    pub fn style(&self) -> Option<Arc<ComputedValues>> {
-        self.upcast::<Node>().style()
+    pub fn style(&self, can_gc: CanGc) -> Option<Arc<ComputedValues>> {
+        self.upcast::<Node>().style(can_gc)
     }
 
     // https://drafts.csswg.org/cssom-view/#css-layout-box
-    pub fn has_css_layout_box(&self) -> bool {
-        self.style()
+    pub fn has_css_layout_box(&self, can_gc: CanGc) -> bool {
+        self.style(can_gc)
             .is_some_and(|s| !s.get_box().clone_display().is_none())
     }
 
     // https://drafts.csswg.org/cssom-view/#potentially-scrollable
-    fn is_potentially_scrollable_body(&self) -> bool {
+    fn is_potentially_scrollable_body(&self, can_gc: CanGc) -> bool {
         let node = self.upcast::<Node>();
         debug_assert!(
             node.owner_doc().GetBody().as_deref() == self.downcast::<HTMLElement>(),
@@ -444,14 +447,14 @@ impl Element {
         // "An element body (which will be the body element) is potentially
         // scrollable if all of the following conditions are true:
         //  - body has an associated box."
-        if !self.has_css_layout_box() {
+        if !self.has_css_layout_box(can_gc) {
             return false;
         }
 
         // " - body’s parent element’s computed value of the overflow-x or
         //     overflow-y properties is neither visible nor clip."
         if let Some(parent) = node.GetParentElement() {
-            if let Some(style) = parent.style() {
+            if let Some(style) = parent.style(can_gc) {
                 if !style.get_box().clone_overflow_x().is_scrollable() &&
                     !style.get_box().clone_overflow_y().is_scrollable()
                 {
@@ -462,7 +465,7 @@ impl Element {
 
         // " - body’s computed value of the overflow-x or overflow-y properties
         //     is neither visible nor clip."
-        if let Some(style) = self.style() {
+        if let Some(style) = self.style(can_gc) {
             if !style.get_box().clone_overflow_x().is_scrollable() &&
                 !style.get_box().clone_overflow_y().is_scrollable()
             {
@@ -474,20 +477,21 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#scrolling-box
-    fn has_scrolling_box(&self) -> bool {
+    fn has_scrolling_box(&self, can_gc: CanGc) -> bool {
         // TODO: scrolling mechanism, such as scrollbar (We don't have scrollbar yet)
         //       self.has_scrolling_mechanism()
-        self.style().is_some_and(|style| {
+        self.style(can_gc).is_some_and(|style| {
             style.get_box().clone_overflow_x().is_scrollable() ||
                 style.get_box().clone_overflow_y().is_scrollable()
         })
     }
 
-    fn has_overflow(&self) -> bool {
-        self.ScrollHeight() > self.ClientHeight() || self.ScrollWidth() > self.ClientWidth()
+    fn has_overflow(&self, can_gc: CanGc) -> bool {
+        self.ScrollHeight(can_gc) > self.ClientHeight(can_gc) ||
+            self.ScrollWidth(can_gc) > self.ClientWidth(can_gc)
     }
 
-    fn shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
+    pub(crate) fn shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
         self.rare_data()
             .as_ref()?
             .shadow_root
@@ -500,68 +504,69 @@ impl Element {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-element-attachshadow>
-    /// XXX This is not exposed to web content yet. It is meant to be used
-    ///     for UA widgets only.
-    pub fn attach_shadow(&self, is_ua_widget: IsUserAgentWidget) -> Fallible<DomRoot<ShadowRoot>> {
+    pub fn attach_shadow(
+        &self,
+        // TODO: remove is_ua_widget argument
+        is_ua_widget: IsUserAgentWidget,
+        mode: ShadowRootMode,
+        clonable: bool,
+    ) -> Fallible<DomRoot<ShadowRoot>> {
         // Step 1.
+        // If element’s namespace is not the HTML namespace,
+        // then throw a "NotSupportedError" DOMException.
         if self.namespace != ns!(html) {
             return Err(Error::NotSupported);
         }
 
         // Step 2.
-        match self.local_name() {
-            &local_name!("article") |
-            &local_name!("aside") |
-            &local_name!("blockquote") |
-            &local_name!("body") |
-            &local_name!("div") |
-            &local_name!("footer") |
-            &local_name!("h1") |
-            &local_name!("h2") |
-            &local_name!("h3") |
-            &local_name!("h4") |
-            &local_name!("h5") |
-            &local_name!("h6") |
-            &local_name!("header") |
-            &local_name!("main") |
-            &local_name!("nav") |
-            &local_name!("p") |
-            &local_name!("section") |
-            &local_name!("span") => {},
-            &local_name!("video") | &local_name!("audio")
-                if is_ua_widget == IsUserAgentWidget::Yes => {},
-            _ => return Err(Error::NotSupported),
-        };
+        // If element’s local name is not a valid shadow host name,
+        // then throw a "NotSupportedError" DOMException.
+        if !is_valid_shadow_host_name(self.local_name()) {
+            match self.local_name() {
+                &local_name!("video") | &local_name!("audio")
+                    if is_ua_widget == IsUserAgentWidget::Yes => {},
+                _ => return Err(Error::NotSupported),
+            }
+        }
 
+        // TODO: Update the following steps to align with the newer spec.
         // Step 3.
         if self.is_shadow_host() {
             return Err(Error::InvalidState);
         }
 
         // Steps 4, 5 and 6.
-        let shadow_root = ShadowRoot::new(self, &self.node.owner_doc());
+        let shadow_root = ShadowRoot::new(self, &self.node.owner_doc(), mode, clonable);
         self.ensure_rare_data().shadow_root = Some(Dom::from_ref(&*shadow_root));
         shadow_root
             .upcast::<Node>()
             .set_containing_shadow_root(Some(&shadow_root));
 
-        if self.is_connected() {
-            self.node.owner_doc().register_shadow_root(&shadow_root);
-        }
+        let bind_context = BindContext {
+            tree_connected: self.upcast::<Node>().is_connected(),
+            tree_is_in_a_document_tree: self.upcast::<Node>().is_in_a_document_tree(),
+            tree_is_in_a_shadow_tree: true,
+        };
+        shadow_root.bind_to_tree(&bind_context);
 
-        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+        let node = self.upcast::<Node>();
+        node.dirty(NodeDamage::OtherNodeDamage);
+        node.rev_version();
 
         Ok(shadow_root)
     }
 
     pub fn detach_shadow(&self) {
-        if let Some(ref shadow_root) = self.shadow_root() {
-            self.upcast::<Node>().note_dirty_descendants();
-            shadow_root.detach();
-            self.ensure_rare_data().shadow_root = None;
-        } else {
-            debug_assert!(false, "Trying to detach a non-attached shadow root");
-        }
+        let Some(ref shadow_root) = self.shadow_root() else {
+            unreachable!("Trying to detach a non-attached shadow root");
+        };
+
+        let node = self.upcast::<Node>();
+        node.note_dirty_descendants();
+        node.rev_version();
+
+        shadow_root.detach();
+        self.ensure_rare_data().shadow_root = None;
     }
 
     // https://html.spec.whatwg.org/multipage/#translation-mode
@@ -598,6 +603,40 @@ impl Element {
             Some(node) => node.is::<Document>(),
         }
     }
+}
+
+/// <https://dom.spec.whatwg.org/#valid-shadow-host-name>
+#[inline]
+pub fn is_valid_shadow_host_name(name: &LocalName) -> bool {
+    // > A valid shadow host name is:
+    // > - a valid custom element name
+    if is_valid_custom_element_name(name) {
+        return true;
+    }
+
+    // > - "article", "aside", "blockquote", "body", "div", "footer", "h1", "h2", "h3",
+    // >   "h4", "h5", "h6", "header", "main", "nav", "p", "section", or "span"
+    matches!(
+        name,
+        &local_name!("article") |
+            &local_name!("aside") |
+            &local_name!("blockquote") |
+            &local_name!("body") |
+            &local_name!("div") |
+            &local_name!("footer") |
+            &local_name!("h1") |
+            &local_name!("h2") |
+            &local_name!("h3") |
+            &local_name!("h4") |
+            &local_name!("h5") |
+            &local_name!("h6") |
+            &local_name!("header") |
+            &local_name!("main") |
+            &local_name!("nav") |
+            &local_name!("p") |
+            &local_name!("section") |
+            &local_name!("span")
+    )
 }
 
 #[inline]
@@ -643,7 +682,7 @@ pub trait LayoutElementHelpers<'dom> {
     fn get_attr_vals_for_layout(self, name: &LocalName) -> Vec<&'dom AttrValue>;
 }
 
-impl<'dom> LayoutDom<'dom, Element> {
+impl LayoutDom<'_, Element> {
     pub(super) fn focus_state(self) -> bool {
         self.unsafe_get().state.get().contains(ElementState::FOCUS)
     }
@@ -846,6 +885,8 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             this.get_width()
         } else if let Some(this) = self.downcast::<HTMLImageElement>() {
             this.get_width()
+        } else if let Some(this) = self.downcast::<HTMLVideoElement>() {
+            this.get_width()
         } else if let Some(this) = self.downcast::<HTMLTableElement>() {
             this.get_width()
         } else if let Some(this) = self.downcast::<HTMLTableCellElement>() {
@@ -888,6 +929,8 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             this.get_height()
         } else if let Some(this) = self.downcast::<HTMLImageElement>() {
             this.get_height()
+        } else if let Some(this) = self.downcast::<HTMLVideoElement>() {
+            this.get_height()
         } else if let Some(this) = self.downcast::<HTMLTableElement>() {
             this.get_height()
         } else if let Some(this) = self.downcast::<HTMLTableCellElement>() {
@@ -922,6 +965,27 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                     PropertyDeclaration::Height(height_value),
                 ));
             },
+        }
+
+        // Aspect ratio when providing both width and height.
+        // https://html.spec.whatwg.org/multipage/#attributes-for-embedded-content-and-images
+        if self.downcast::<HTMLImageElement>().is_some() ||
+            self.downcast::<HTMLVideoElement>().is_some()
+        {
+            if let LengthOrPercentageOrAuto::Length(width) = width {
+                if let LengthOrPercentageOrAuto::Length(height) = height {
+                    let width_value = NonNegative(specified::Number::new(width.to_f32_px()));
+                    let height_value = NonNegative(specified::Number::new(height.to_f32_px()));
+                    let aspect_ratio = specified::position::AspectRatio {
+                        auto: true,
+                        ratio: PreferredRatio::Ratio(Ratio(width_value, height_value)),
+                    };
+                    hints.push(from_declaration(
+                        shared_lock,
+                        PropertyDeclaration::AspectRatio(aspect_ratio),
+                    ));
+                }
+            }
         }
 
         let cols = if let Some(this) = self.downcast::<HTMLTextAreaElement>() {
@@ -1291,37 +1355,8 @@ impl Element {
         }
     }
 
-    pub fn serialize(&self, traversal_scope: TraversalScope) -> Fallible<DOMString> {
-        let mut writer = vec![];
-        match serialize(
-            &mut writer,
-            &self.upcast::<Node>(),
-            SerializeOpts {
-                traversal_scope,
-                ..Default::default()
-            },
-        ) {
-            // FIXME(ajeffrey): Directly convert UTF8 to DOMString
-            Ok(()) => Ok(DOMString::from(String::from_utf8(writer).unwrap())),
-            Err(_) => panic!("Cannot serialize element"),
-        }
-    }
-
-    #[allow(non_snake_case)]
-    pub fn xmlSerialize(&self, traversal_scope: XmlTraversalScope) -> Fallible<DOMString> {
-        let mut writer = vec![];
-        match xmlSerialize::serialize(
-            &mut writer,
-            &self.upcast::<Node>(),
-            XmlSerializeOpts { traversal_scope },
-        ) {
-            Ok(()) => Ok(DOMString::from(String::from_utf8(writer).unwrap())),
-            Err(_) => panic!("Cannot serialize element"),
-        }
-    }
-
     pub fn root_element(&self) -> DomRoot<Element> {
-        if self.node.is_in_doc() {
+        if self.node.is_in_a_document_tree() {
             self.upcast::<Node>()
                 .owner_doc()
                 .GetDocumentElement()
@@ -1440,6 +1475,7 @@ impl Element {
         name: LocalName,
         namespace: Namespace,
         prefix: Option<Prefix>,
+        can_gc: CanGc,
     ) {
         let attr = Attr::new(
             &self.node.owner_doc(),
@@ -1449,6 +1485,7 @@ impl Element {
             namespace,
             prefix,
             Some(self),
+            can_gc,
         );
         self.push_attribute(&attr);
     }
@@ -1518,6 +1555,7 @@ impl Element {
         qname: QualName,
         value: DOMString,
         prefix: Option<Prefix>,
+        can_gc: CanGc,
     ) {
         // Don't set if the attribute already exists, so we can handle add_attrs_if_missing
         if self
@@ -1537,20 +1575,31 @@ impl Element {
             },
         };
         let value = self.parse_attribute(&qname.ns, &qname.local, value);
-        self.push_new_attribute(qname.local, value, name, qname.ns, prefix);
+        self.push_new_attribute(qname.local, value, name, qname.ns, prefix, can_gc);
     }
 
-    pub fn set_attribute(&self, name: &LocalName, value: AttrValue) {
+    pub fn set_attribute(&self, name: &LocalName, value: AttrValue, can_gc: CanGc) {
         assert!(name == &name.to_ascii_lowercase());
         assert!(!name.contains(':'));
 
-        self.set_first_matching_attribute(name.clone(), value, name.clone(), ns!(), None, |attr| {
-            attr.local_name() == name
-        });
+        self.set_first_matching_attribute(
+            name.clone(),
+            value,
+            name.clone(),
+            ns!(),
+            None,
+            |attr| attr.local_name() == name,
+            can_gc,
+        );
     }
 
     // https://html.spec.whatwg.org/multipage/#attr-data-*
-    pub fn set_custom_attribute(&self, name: DOMString, value: DOMString) -> ErrorResult {
+    pub fn set_custom_attribute(
+        &self,
+        name: DOMString,
+        value: DOMString,
+        can_gc: CanGc,
+    ) -> ErrorResult {
         // Step 1.
         if let Invalid = xml_name_type(&name) {
             return Err(Error::InvalidCharacter);
@@ -1559,12 +1608,19 @@ impl Element {
         // Steps 2-5.
         let name = LocalName::from(name);
         let value = self.parse_attribute(&ns!(), &name, value);
-        self.set_first_matching_attribute(name.clone(), value, name.clone(), ns!(), None, |attr| {
-            *attr.name() == name && *attr.namespace() == ns!()
-        });
+        self.set_first_matching_attribute(
+            name.clone(),
+            value,
+            name.clone(),
+            ns!(),
+            None,
+            |attr| *attr.name() == name && *attr.namespace() == ns!(),
+            can_gc,
+        );
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_first_matching_attribute<F>(
         &self,
         local_name: LocalName,
@@ -1573,6 +1629,7 @@ impl Element {
         namespace: Namespace,
         prefix: Option<Prefix>,
         find: F,
+        can_gc: CanGc,
     ) where
         F: Fn(&Attr) -> bool,
     {
@@ -1585,7 +1642,7 @@ impl Element {
         if let Some(attr) = attr {
             attr.set_value(value, self);
         } else {
-            self.push_new_attribute(local_name, value, name, namespace, prefix);
+            self.push_new_attribute(local_name, value, name, namespace, prefix, can_gc);
         };
     }
 
@@ -1659,10 +1716,10 @@ impl Element {
             })
     }
 
-    pub fn set_atomic_attribute(&self, local_name: &LocalName, value: DOMString) {
+    pub fn set_atomic_attribute(&self, local_name: &LocalName, value: DOMString, can_gc: CanGc) {
         assert!(*local_name == local_name.to_ascii_lowercase());
         let value = AttrValue::from_atomic(value.into());
-        self.set_attribute(local_name, value);
+        self.set_attribute(local_name, value, can_gc);
     }
 
     pub fn has_attribute(&self, local_name: &LocalName) -> bool {
@@ -1673,12 +1730,12 @@ impl Element {
             .any(|attr| attr.local_name() == local_name && attr.namespace() == &ns!())
     }
 
-    pub fn set_bool_attribute(&self, local_name: &LocalName, value: bool) {
+    pub fn set_bool_attribute(&self, local_name: &LocalName, value: bool, can_gc: CanGc) {
         if self.has_attribute(local_name) == value {
             return;
         }
         if value {
-            self.set_string_attribute(local_name, DOMString::new());
+            self.set_string_attribute(local_name, DOMString::new(), can_gc);
         } else {
             self.remove_attribute(&ns!(), local_name);
         }
@@ -1692,16 +1749,16 @@ impl Element {
         };
         let value = &**attr.value();
         // XXXManishearth this doesn't handle `javascript:` urls properly
-        document_from_node(self)
+        self.owner_document()
             .base_url()
             .join(value)
             .map(|parsed| USVString(parsed.into_string()))
             .unwrap_or_else(|_| USVString(value.to_owned()))
     }
 
-    pub fn set_url_attribute(&self, local_name: &LocalName, value: USVString) {
+    pub fn set_url_attribute(&self, local_name: &LocalName, value: USVString, can_gc: CanGc) {
         assert!(*local_name == local_name.to_ascii_lowercase());
-        self.set_attribute(local_name, AttrValue::String(value.to_string()));
+        self.set_attribute(local_name, AttrValue::String(value.to_string()), can_gc);
     }
 
     pub fn get_string_attribute(&self, local_name: &LocalName) -> DOMString {
@@ -1711,9 +1768,9 @@ impl Element {
         }
     }
 
-    pub fn set_string_attribute(&self, local_name: &LocalName, value: DOMString) {
+    pub fn set_string_attribute(&self, local_name: &LocalName, value: DOMString, can_gc: CanGc) {
         assert!(*local_name == local_name.to_ascii_lowercase());
-        self.set_attribute(local_name, AttrValue::String(value.into()));
+        self.set_attribute(local_name, AttrValue::String(value.into()), can_gc);
     }
 
     /// Used for string attribute reflections where absence of the attribute returns `null`,
@@ -1728,10 +1785,15 @@ impl Element {
 
     /// Used for string attribute reflections where setting `null`/`undefined` removes the
     /// attribute, e.g. `element.ariaLabel = null` removing the `aria-label` attribute.
-    fn set_nullable_string_attribute(&self, local_name: &LocalName, value: Option<DOMString>) {
+    fn set_nullable_string_attribute(
+        &self,
+        local_name: &LocalName,
+        value: Option<DOMString>,
+        can_gc: CanGc,
+    ) {
         match value {
             Some(val) => {
-                self.set_string_attribute(local_name, val);
+                self.set_string_attribute(local_name, val, can_gc);
             },
             None => {
                 self.remove_attribute(&ns!(), local_name);
@@ -1745,17 +1807,23 @@ impl Element {
             .unwrap_or_default()
     }
 
-    pub fn set_tokenlist_attribute(&self, local_name: &LocalName, value: DOMString) {
+    pub fn set_tokenlist_attribute(&self, local_name: &LocalName, value: DOMString, can_gc: CanGc) {
         assert!(*local_name == local_name.to_ascii_lowercase());
         self.set_attribute(
             local_name,
             AttrValue::from_serialized_tokenlist(value.into()),
+            can_gc,
         );
     }
 
-    pub fn set_atomic_tokenlist_attribute(&self, local_name: &LocalName, tokens: Vec<Atom>) {
+    pub fn set_atomic_tokenlist_attribute(
+        &self,
+        local_name: &LocalName,
+        tokens: Vec<Atom>,
+        can_gc: CanGc,
+    ) {
         assert!(*local_name == local_name.to_ascii_lowercase());
-        self.set_attribute(local_name, AttrValue::from_atomic_tokens(tokens));
+        self.set_attribute(local_name, AttrValue::from_atomic_tokens(tokens), can_gc);
     }
 
     pub fn get_int_attribute(&self, local_name: &LocalName, default: i32) -> i32 {
@@ -1777,9 +1845,9 @@ impl Element {
         }
     }
 
-    pub fn set_int_attribute(&self, local_name: &LocalName, value: i32) {
+    pub fn set_int_attribute(&self, local_name: &LocalName, value: i32, can_gc: CanGc) {
         assert!(*local_name == local_name.to_ascii_lowercase());
-        self.set_attribute(local_name, AttrValue::Int(value.to_string(), value));
+        self.set_attribute(local_name, AttrValue::Int(value.to_string(), value), can_gc);
     }
 
     pub fn get_uint_attribute(&self, local_name: &LocalName, default: u32) -> u32 {
@@ -1795,9 +1863,13 @@ impl Element {
             None => default,
         }
     }
-    pub fn set_uint_attribute(&self, local_name: &LocalName, value: u32) {
+    pub fn set_uint_attribute(&self, local_name: &LocalName, value: u32, can_gc: CanGc) {
         assert!(*local_name == local_name.to_ascii_lowercase());
-        self.set_attribute(local_name, AttrValue::UInt(value.to_string(), value));
+        self.set_attribute(
+            local_name,
+            AttrValue::UInt(value.to_string(), value),
+            can_gc,
+        );
     }
 
     pub fn will_mutate_attr(&self, attr: &Attr) {
@@ -1835,7 +1907,7 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    pub fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior) {
+    pub fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior, can_gc: CanGc) {
         // Step 1.2 or 2.3
         let x = if x_.is_finite() { x_ } else { 0.0f64 };
         let y = if y_.is_finite() { y_ } else { 0.0f64 };
@@ -1859,7 +1931,7 @@ impl Element {
         // Step 7
         if *self.root_element() == *self {
             if doc.quirks_mode() != QuirksMode::Quirks {
-                win.scroll(x, y, behavior);
+                win.scroll(x, y, behavior, can_gc);
             }
 
             return;
@@ -1868,22 +1940,25 @@ impl Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
-            win.scroll(x, y, behavior);
+            win.scroll(x, y, behavior, can_gc);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
+        if !self.has_css_layout_box(can_gc) ||
+            !self.has_scrolling_box(can_gc) ||
+            !self.has_overflow(can_gc)
+        {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, x, y, behavior);
+        win.scroll_node(node, x, y, behavior, can_gc);
     }
 
-    // https://w3c.github.io/DOM-Parsing/#parsing
+    /// <https://html.spec.whatwg.org/multipage/#fragment-parsing-algorithm-steps>
     pub fn parse_fragment(
         &self,
         markup: DOMString,
@@ -1896,12 +1971,12 @@ impl Element {
         // See https://github.com/w3c/DOM-Parsing/issues/61.
         let context_document = {
             if let Some(template) = self.downcast::<HTMLTemplateElement>() {
-                template.Content(CanGc::note()).upcast::<Node>().owner_doc()
+                template.Content(can_gc).upcast::<Node>().owner_doc()
             } else {
-                document_from_node(self)
+                self.owner_document()
             }
         };
-        let fragment = DocumentFragment::new(&context_document);
+        let fragment = DocumentFragment::new(&context_document, can_gc);
         // Step 4.
         for child in new_children {
             fragment.upcast::<Node>().AppendChild(&child).unwrap();
@@ -1910,7 +1985,11 @@ impl Element {
         Ok(fragment)
     }
 
-    pub fn fragment_parsing_context(owner_doc: &Document, element: Option<&Self>) -> DomRoot<Self> {
+    pub fn fragment_parsing_context(
+        owner_doc: &Document,
+        element: Option<&Self>,
+        can_gc: CanGc,
+    ) -> DomRoot<Self> {
         match element {
             Some(elem)
                 if elem.local_name() != &local_name!("html") ||
@@ -1923,6 +2002,7 @@ impl Element {
                 None,
                 owner_doc,
                 None,
+                can_gc,
             )),
         }
     }
@@ -1932,8 +2012,7 @@ impl Element {
         if !self.is_connected() {
             return false;
         }
-        let document = document_from_node(self);
-        document.get_allow_fullscreen()
+        self.owner_document().get_allow_fullscreen()
     }
 
     // https://html.spec.whatwg.org/multipage/#home-subtree
@@ -2002,15 +2081,14 @@ impl Element {
         }
     }
 
-    pub(crate) fn update_sequentially_focusable_status(&self) {
+    pub(crate) fn update_sequentially_focusable_status(&self, can_gc: CanGc) {
         let node = self.upcast::<Node>();
         let is_sequentially_focusable = self.is_sequentially_focusable();
         node.set_flag(NodeFlags::SEQUENTIALLY_FOCUSABLE, is_sequentially_focusable);
 
         // https://html.spec.whatwg.org/multipage/#focus-fixup-rule
         if !is_sequentially_focusable {
-            let document = document_from_node(self);
-            document.perform_focus_fixup_rule(self);
+            self.owner_document().perform_focus_fixup_rule(self, can_gc);
         }
     }
 
@@ -2033,7 +2111,7 @@ impl Element {
     }
 }
 
-impl ElementMethods for Element {
+impl ElementMethods<crate::DomTypeHolder> for Element {
     // https://dom.spec.whatwg.org/#dom-element-namespaceuri
     fn GetNamespaceURI(&self) -> Option<DOMString> {
         Node::namespace_to_string(self.namespace.clone())
@@ -2074,8 +2152,8 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-id
-    fn SetId(&self, id: DOMString) {
-        self.set_atomic_attribute(&local_name!("id"), id);
+    fn SetId(&self, id: DOMString, can_gc: CanGc) {
+        self.set_atomic_attribute(&local_name!("id"), id, can_gc);
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classname
@@ -2084,8 +2162,8 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classname
-    fn SetClassName(&self, class: DOMString) {
-        self.set_tokenlist_attribute(&local_name!("class"), class);
+    fn SetClassName(&self, class: DOMString, can_gc: CanGc) {
+        self.set_tokenlist_attribute(&local_name!("class"), class, can_gc);
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classlist
@@ -2097,7 +2175,7 @@ impl ElementMethods for Element {
     // https://dom.spec.whatwg.org/#dom-element-attributes
     fn Attributes(&self) -> DomRoot<NamedNodeMap> {
         self.attr_list
-            .or_init(|| NamedNodeMap::new(&window_from_node(self), self))
+            .or_init(|| NamedNodeMap::new(&self.owner_window(), self))
     }
 
     // https://dom.spec.whatwg.org/#dom-element-hasattributes
@@ -2141,7 +2219,12 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-toggleattribute
-    fn ToggleAttribute(&self, name: DOMString, force: Option<bool>) -> Fallible<bool> {
+    fn ToggleAttribute(
+        &self,
+        name: DOMString,
+        force: Option<bool>,
+        can_gc: CanGc,
+    ) -> Fallible<bool> {
         // Step 1.
         if xml_name_type(&name) == Invalid {
             return Err(Error::InvalidCharacter);
@@ -2164,6 +2247,7 @@ impl ElementMethods for Element {
                         ns!(),
                         None,
                         |attr| *attr.name() == name,
+                        can_gc,
                     );
                     Ok(true)
                 },
@@ -2183,7 +2267,7 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattribute
-    fn SetAttribute(&self, name: DOMString, value: DOMString) -> ErrorResult {
+    fn SetAttribute(&self, name: DOMString, value: DOMString, can_gc: CanGc) -> ErrorResult {
         // Step 1.
         if xml_name_type(&name) == Invalid {
             return Err(Error::InvalidCharacter);
@@ -2194,9 +2278,15 @@ impl ElementMethods for Element {
 
         // Step 3-5.
         let value = self.parse_attribute(&ns!(), &name, value);
-        self.set_first_matching_attribute(name.clone(), value, name.clone(), ns!(), None, |attr| {
-            *attr.name() == name
-        });
+        self.set_first_matching_attribute(
+            name.clone(),
+            value,
+            name.clone(),
+            ns!(),
+            None,
+            |attr| *attr.name() == name,
+            can_gc,
+        );
         Ok(())
     }
 
@@ -2206,6 +2296,7 @@ impl ElementMethods for Element {
         namespace: Option<DOMString>,
         qualified_name: DOMString,
         value: DOMString,
+        can_gc: CanGc,
     ) -> ErrorResult {
         let (namespace, prefix, local_name) = validate_and_extract(namespace, &qualified_name)?;
         let qualified_name = LocalName::from(qualified_name);
@@ -2217,6 +2308,7 @@ impl ElementMethods for Element {
             namespace.clone(),
             prefix,
             |attr| *attr.local_name() == local_name && *attr.namespace() == namespace,
+            can_gc,
         );
         Ok(())
     }
@@ -2320,7 +2412,7 @@ impl ElementMethods for Element {
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbytagname
     fn GetElementsByTagName(&self, localname: DOMString) -> DomRoot<HTMLCollection> {
-        let window = window_from_node(self);
+        let window = self.owner_window();
         HTMLCollection::by_qualified_name(&window, self.upcast(), LocalName::from(&*localname))
     }
 
@@ -2330,21 +2422,21 @@ impl ElementMethods for Element {
         maybe_ns: Option<DOMString>,
         localname: DOMString,
     ) -> DomRoot<HTMLCollection> {
-        let window = window_from_node(self);
+        let window = self.owner_window();
         HTMLCollection::by_tag_name_ns(&window, self.upcast(), localname, maybe_ns)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbyclassname
     fn GetElementsByClassName(&self, classes: DOMString) -> DomRoot<HTMLCollection> {
-        let window = window_from_node(self);
+        let window = self.owner_window();
         HTMLCollection::by_class_name(&window, self.upcast(), classes)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
-    fn GetClientRects(&self) -> Vec<DomRoot<DOMRect>> {
-        let win = window_from_node(self);
-        let raw_rects = self.upcast::<Node>().content_boxes();
-        raw_rects
+    fn GetClientRects(&self, can_gc: CanGc) -> DomRoot<DOMRectList> {
+        let win = self.owner_window();
+        let raw_rects = self.upcast::<Node>().content_boxes(can_gc);
+        let rects: Vec<DomRoot<DOMRect>> = raw_rects
             .iter()
             .map(|rect| {
                 DOMRect::new(
@@ -2353,66 +2445,74 @@ impl ElementMethods for Element {
                     rect.origin.y.to_f64_px(),
                     rect.size.width.to_f64_px(),
                     rect.size.height.to_f64_px(),
+                    can_gc,
                 )
             })
-            .collect()
+            .collect();
+        DOMRectList::new(&win, rects, can_gc)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
-    fn GetBoundingClientRect(&self) -> DomRoot<DOMRect> {
-        let win = window_from_node(self);
-        let rect = self.upcast::<Node>().bounding_content_box_or_zero();
+    fn GetBoundingClientRect(&self, can_gc: CanGc) -> DomRoot<DOMRect> {
+        let win = self.owner_window();
+        let rect = self.upcast::<Node>().bounding_content_box_or_zero(can_gc);
         DOMRect::new(
             win.upcast(),
             rect.origin.x.to_f64_px(),
             rect.origin.y.to_f64_px(),
             rect.size.width.to_f64_px(),
             rect.size.height.to_f64_px(),
+            can_gc,
         )
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    fn Scroll(&self, options: &ScrollToOptions) {
+    fn Scroll(&self, options: &ScrollToOptions, can_gc: CanGc) {
         // Step 1
-        let left = options.left.unwrap_or(self.ScrollLeft());
-        let top = options.top.unwrap_or(self.ScrollTop());
-        self.scroll(left, top, options.parent.behavior);
+        let left = options.left.unwrap_or(self.ScrollLeft(can_gc));
+        let top = options.top.unwrap_or(self.ScrollTop(can_gc));
+        self.scroll(left, top, options.parent.behavior, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    fn Scroll_(&self, x: f64, y: f64) {
-        self.scroll(x, y, ScrollBehavior::Auto);
+    fn Scroll_(&self, x: f64, y: f64, can_gc: CanGc) {
+        self.scroll(x, y, ScrollBehavior::Auto, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollto
     fn ScrollTo(&self, options: &ScrollToOptions) {
-        self.Scroll(options);
+        self.Scroll(options, CanGc::note());
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollto
     fn ScrollTo_(&self, x: f64, y: f64) {
-        self.Scroll_(x, y);
+        self.Scroll_(x, y, CanGc::note());
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
-    fn ScrollBy(&self, options: &ScrollToOptions) {
+    fn ScrollBy(&self, options: &ScrollToOptions, can_gc: CanGc) {
         // Step 2
         let delta_left = options.left.unwrap_or(0.0f64);
         let delta_top = options.top.unwrap_or(0.0f64);
-        let left = self.ScrollLeft();
-        let top = self.ScrollTop();
-        self.scroll(left + delta_left, top + delta_top, options.parent.behavior);
+        let left = self.ScrollLeft(can_gc);
+        let top = self.ScrollTop(can_gc);
+        self.scroll(
+            left + delta_left,
+            top + delta_top,
+            options.parent.behavior,
+            can_gc,
+        );
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
-    fn ScrollBy_(&self, x: f64, y: f64) {
-        let left = self.ScrollLeft();
-        let top = self.ScrollTop();
-        self.scroll(left + x, top + y, ScrollBehavior::Auto);
+    fn ScrollBy_(&self, x: f64, y: f64, can_gc: CanGc) {
+        let left = self.ScrollLeft(can_gc);
+        let top = self.ScrollTop(can_gc);
+        self.scroll(left + x, top + y, ScrollBehavior::Auto, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn ScrollTop(&self) -> f64 {
+    fn ScrollTop(&self, can_gc: CanGc) -> f64 {
         let node = self.upcast::<Node>();
 
         // Step 1
@@ -2442,13 +2542,13 @@ impl ElementMethods for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
             return win.ScrollY() as f64;
         }
 
         // Step 8
-        if !self.has_css_layout_box() {
+        if !self.has_css_layout_box(can_gc) {
             return 0.0;
         }
 
@@ -2458,7 +2558,7 @@ impl ElementMethods for Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn SetScrollTop(&self, y_: f64) {
+    fn SetScrollTop(&self, y_: f64, can_gc: CanGc) {
         let behavior = ScrollBehavior::Auto;
 
         // Step 1, 2
@@ -2483,7 +2583,7 @@ impl ElementMethods for Element {
         // Step 7
         if *self.root_element() == *self {
             if doc.quirks_mode() != QuirksMode::Quirks {
-                win.scroll(win.ScrollX() as f64, y, behavior);
+                win.scroll(win.ScrollX() as f64, y, behavior, can_gc);
             }
 
             return;
@@ -2492,23 +2592,26 @@ impl ElementMethods for Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
-            win.scroll(win.ScrollX() as f64, y, behavior);
+            win.scroll(win.ScrollX() as f64, y, behavior, can_gc);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
+        if !self.has_css_layout_box(can_gc) ||
+            !self.has_scrolling_box(can_gc) ||
+            !self.has_overflow(can_gc)
+        {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, self.ScrollLeft(), y, behavior);
+        win.scroll_node(node, self.ScrollLeft(can_gc), y, behavior, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn ScrollLeft(&self) -> f64 {
+    fn ScrollLeft(&self, can_gc: CanGc) -> f64 {
         let node = self.upcast::<Node>();
 
         // Step 1
@@ -2538,13 +2641,13 @@ impl ElementMethods for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
             return win.ScrollX() as f64;
         }
 
         // Step 8
-        if !self.has_css_layout_box() {
+        if !self.has_css_layout_box(can_gc) {
             return 0.0;
         }
 
@@ -2554,7 +2657,7 @@ impl ElementMethods for Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
-    fn SetScrollLeft(&self, x_: f64) {
+    fn SetScrollLeft(&self, x_: f64, can_gc: CanGc) {
         let behavior = ScrollBehavior::Auto;
 
         // Step 1, 2
@@ -2582,73 +2685,81 @@ impl ElementMethods for Element {
                 return;
             }
 
-            win.scroll(x, win.ScrollY() as f64, behavior);
+            win.scroll(x, win.ScrollY() as f64, behavior, can_gc);
             return;
         }
 
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body()
+            !self.is_potentially_scrollable_body(can_gc)
         {
-            win.scroll(x, win.ScrollY() as f64, behavior);
+            win.scroll(x, win.ScrollY() as f64, behavior, can_gc);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
+        if !self.has_css_layout_box(can_gc) ||
+            !self.has_scrolling_box(can_gc) ||
+            !self.has_overflow(can_gc)
+        {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, x, self.ScrollTop(), behavior);
+        win.scroll_node(node, x, self.ScrollTop(can_gc), behavior, can_gc);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
-    fn ScrollWidth(&self) -> i32 {
-        self.upcast::<Node>().scroll_area().size.width
+    fn ScrollWidth(&self, can_gc: CanGc) -> i32 {
+        self.upcast::<Node>().scroll_area(can_gc).size.width
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
-    fn ScrollHeight(&self) -> i32 {
-        self.upcast::<Node>().scroll_area().size.height
+    fn ScrollHeight(&self, can_gc: CanGc) -> i32 {
+        self.upcast::<Node>().scroll_area(can_gc).size.height
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clienttop
-    fn ClientTop(&self) -> i32 {
-        self.client_rect().origin.y
+    fn ClientTop(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).origin.y
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientleft
-    fn ClientLeft(&self) -> i32 {
-        self.client_rect().origin.x
+    fn ClientLeft(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).origin.x
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientwidth
-    fn ClientWidth(&self) -> i32 {
-        self.client_rect().size.width
+    fn ClientWidth(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).size.width
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
-    fn ClientHeight(&self) -> i32 {
-        self.client_rect().size.height
+    fn ClientHeight(&self, can_gc: CanGc) -> i32 {
+        self.client_rect(can_gc).size.height
     }
 
-    /// <https://w3c.github.io/DOM-Parsing/#widl-Element-innerHTML>
+    /// <https://html.spec.whatwg.org/multipage/#dom-element-innerhtml>
     fn GetInnerHTML(&self) -> Fallible<DOMString> {
         let qname = QualName::new(
             self.prefix().clone(),
             self.namespace().clone(),
             self.local_name().clone(),
         );
-        if document_from_node(self).is_html_document() {
-            self.serialize(ChildrenOnly(Some(qname)))
+
+        let result = if self.owner_document().is_html_document() {
+            self.upcast::<Node>()
+                .html_serialize(ChildrenOnly(Some(qname)))
         } else {
-            self.xmlSerialize(XmlChildrenOnly(Some(qname)))
-        }
+            self.upcast::<Node>()
+                .xml_serialize(XmlChildrenOnly(Some(qname)))
+        };
+
+        Ok(result)
     }
 
-    /// <https://w3c.github.io/DOM-Parsing/#widl-Element-innerHTML>
+    /// <https://html.spec.whatwg.org/multipage/#dom-element-innerhtml>
     fn SetInnerHTML(&self, value: DOMString, can_gc: CanGc) -> ErrorResult {
         // Step 2.
         // https://github.com/w3c/DOM-Parsing/issues/1
@@ -2667,29 +2778,31 @@ impl ElementMethods for Element {
                 .iter()
                 .any(|c| matches!(*c, b'&' | b'\0' | b'<' | b'\r'))
         {
-            Node::SetTextContent(&target, Some(value));
+            Node::SetTextContent(&target, Some(value), can_gc);
             return Ok(());
         }
 
         // Step 1.
-        let frag = self.parse_fragment(value, CanGc::note())?;
+        let frag = self.parse_fragment(value, can_gc)?;
 
         Node::replace_all(Some(frag.upcast()), &target);
         Ok(())
     }
 
-    // https://dvcs.w3.org/hg/innerhtml/raw-file/tip/index.html#widl-Element-outerHTML
+    /// <https://html.spec.whatwg.org/multipage/#dom-element-outerhtml>
     fn GetOuterHTML(&self) -> Fallible<DOMString> {
-        if document_from_node(self).is_html_document() {
-            self.serialize(IncludeNode)
+        let result = if self.owner_document().is_html_document() {
+            self.upcast::<Node>().html_serialize(IncludeNode)
         } else {
-            self.xmlSerialize(XmlIncludeNode)
-        }
+            self.upcast::<Node>().xml_serialize(XmlIncludeNode)
+        };
+
+        Ok(result)
     }
 
-    // https://w3c.github.io/DOM-Parsing/#dom-element-outerhtml
+    /// <https://html.spec.whatwg.org/multipage/#dom-element-outerhtml>
     fn SetOuterHTML(&self, value: DOMString, can_gc: CanGc) -> ErrorResult {
-        let context_document = document_from_node(self);
+        let context_document = self.owner_document();
         let context_node = self.upcast::<Node>();
         // Step 1.
         let context_parent = match context_node.GetParentNode() {
@@ -2721,7 +2834,7 @@ impl ElementMethods for Element {
         };
 
         // Step 5.
-        let frag = parent.parse_fragment(value, CanGc::note())?;
+        let frag = parent.parse_fragment(value, can_gc)?;
         // Step 6.
         context_parent.ReplaceChild(frag.upcast(), context_node)?;
         Ok(())
@@ -2745,7 +2858,7 @@ impl ElementMethods for Element {
 
     // https://dom.spec.whatwg.org/#dom-parentnode-children
     fn Children(&self) -> DomRoot<HTMLCollection> {
-        let window = window_from_node(self);
+        let window = self.owner_window();
         HTMLCollection::children(&window, self.upcast())
     }
 
@@ -2768,18 +2881,18 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-prepend
-    fn Prepend(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().prepend(nodes)
+    fn Prepend(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().prepend(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-append
-    fn Append(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().append(nodes)
+    fn Append(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().append(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
-    fn ReplaceChildren(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().replace_children(nodes)
+    fn ReplaceChildren(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().replace_children(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
@@ -2795,18 +2908,18 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-before
-    fn Before(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().before(nodes)
+    fn Before(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().before(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-after
-    fn After(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().after(nodes)
+    fn After(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().after(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-replacewith
-    fn ReplaceWith(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().replace_with(nodes)
+    fn ReplaceWith(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().replace_with(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-remove
@@ -2816,7 +2929,7 @@ impl ElementMethods for Element {
 
     // https://dom.spec.whatwg.org/#dom-element-matches
     fn Matches(&self, selectors: DOMString) -> Fallible<bool> {
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
         let url = doc.url();
         let selectors = match SelectorParser::parse_author_origin_no_namespace(
             &selectors,
@@ -2839,7 +2952,7 @@ impl ElementMethods for Element {
 
     // https://dom.spec.whatwg.org/#dom-element-closest
     fn Closest(&self, selectors: DOMString) -> Fallible<Option<DomRoot<Element>>> {
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
         let url = doc.url();
         let selectors = match SelectorParser::parse_author_origin_no_namespace(
             &selectors,
@@ -2869,9 +2982,9 @@ impl ElementMethods for Element {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-insertadjacenttext
-    fn InsertAdjacentText(&self, where_: DOMString, data: DOMString) -> ErrorResult {
+    fn InsertAdjacentText(&self, where_: DOMString, data: DOMString, can_gc: CanGc) -> ErrorResult {
         // Step 1.
-        let text = Text::new(data, &document_from_node(self));
+        let text = Text::new(data, &self.owner_document(), can_gc);
 
         // Step 2.
         let where_ = where_.parse::<AdjacentPosition>()?;
@@ -2904,8 +3017,11 @@ impl ElementMethods for Element {
         };
 
         // Step 2.
-        let context =
-            Element::fragment_parsing_context(&context.owner_doc(), context.downcast::<Element>());
+        let context = Element::fragment_parsing_context(
+            &context.owner_doc(),
+            context.downcast::<Element>(),
+            can_gc,
+        );
 
         // Step 3.
         let fragment = context.parse_fragment(text, can_gc)?;
@@ -2937,368 +3053,390 @@ impl ElementMethods for Element {
     }
 
     // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
-    fn RequestFullscreen(&self) -> Rc<Promise> {
-        let doc = document_from_node(self);
-        doc.enter_fullscreen(self)
+    fn RequestFullscreen(&self, can_gc: CanGc) -> Rc<Promise> {
+        let doc = self.owner_document();
+        doc.enter_fullscreen(self, can_gc)
     }
 
-    // XXX Hidden under dom.shadowdom.enabled pref. Only exposed to be able
-    //     to test partial Shadow DOM support for UA widgets.
     // https://dom.spec.whatwg.org/#dom-element-attachshadow
-    fn AttachShadow(&self) -> Fallible<DomRoot<ShadowRoot>> {
-        self.attach_shadow(IsUserAgentWidget::No)
+    fn AttachShadow(&self, init: &ShadowRootInit) -> Fallible<DomRoot<ShadowRoot>> {
+        // Step 1. Run attach a shadow root with this, init["mode"], init["clonable"], init["serializable"],
+        // init["delegatesFocus"], and init["slotAssignment"].
+        let shadow_root = self.attach_shadow(IsUserAgentWidget::No, init.mode, init.clonable)?;
+
+        // Step 2. Return this’s shadow root.
+        Ok(shadow_root)
+    }
+
+    /// <https://dom.spec.whatwg.org/#dom-element-shadowroot>
+    fn GetShadowRoot(&self) -> Option<DomRoot<ShadowRoot>> {
+        // Step 1. Let shadow be this’s shadow root.
+        let shadow_or_none = self.shadow_root();
+
+        // Step 2. If shadow is null or its mode is "closed", then return null.
+        let shadow = shadow_or_none?;
+        if shadow.Mode() == ShadowRootMode::Closed {
+            return None;
+        }
+
+        // Step 3. Return shadow.
+        Some(shadow)
     }
 
     fn GetRole(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("role"))
     }
 
-    fn SetRole(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("role"), value);
+    fn SetRole(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("role"), value, can_gc);
     }
 
     fn GetAriaAtomic(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-atomic"))
     }
 
-    fn SetAriaAtomic(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-atomic"), value);
+    fn SetAriaAtomic(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-atomic"), value, can_gc);
     }
 
     fn GetAriaAutoComplete(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-autocomplete"))
     }
 
-    fn SetAriaAutoComplete(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-autocomplete"), value);
+    fn SetAriaAutoComplete(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-autocomplete"), value, can_gc);
     }
 
     fn GetAriaBrailleLabel(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-braillelabel"))
     }
 
-    fn SetAriaBrailleLabel(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-braillelabel"), value);
+    fn SetAriaBrailleLabel(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-braillelabel"), value, can_gc);
     }
 
     fn GetAriaBrailleRoleDescription(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-brailleroledescription"))
     }
 
-    fn SetAriaBrailleRoleDescription(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-brailleroledescription"), value);
+    fn SetAriaBrailleRoleDescription(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(
+            &local_name!("aria-brailleroledescription"),
+            value,
+            can_gc,
+        );
     }
 
     fn GetAriaBusy(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-busy"))
     }
 
-    fn SetAriaBusy(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-busy"), value);
+    fn SetAriaBusy(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-busy"), value, can_gc);
     }
 
     fn GetAriaChecked(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-checked"))
     }
 
-    fn SetAriaChecked(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-checked"), value);
+    fn SetAriaChecked(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-checked"), value, can_gc);
     }
 
     fn GetAriaColCount(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-colcount"))
     }
 
-    fn SetAriaColCount(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-colcount"), value);
+    fn SetAriaColCount(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-colcount"), value, can_gc);
     }
 
     fn GetAriaColIndex(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-colindex"))
     }
 
-    fn SetAriaColIndex(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-colindex"), value);
+    fn SetAriaColIndex(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-colindex"), value, can_gc);
     }
 
     fn GetAriaColIndexText(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-colindextext"))
     }
 
-    fn SetAriaColIndexText(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-colindextext"), value);
+    fn SetAriaColIndexText(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-colindextext"), value, can_gc);
     }
 
     fn GetAriaColSpan(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-colspan"))
     }
 
-    fn SetAriaColSpan(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-colspan"), value);
+    fn SetAriaColSpan(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-colspan"), value, can_gc);
     }
 
     fn GetAriaCurrent(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-current"))
     }
 
-    fn SetAriaCurrent(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-current"), value);
+    fn SetAriaCurrent(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-current"), value, can_gc);
     }
 
     fn GetAriaDescription(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-description"))
     }
 
-    fn SetAriaDescription(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-description"), value);
+    fn SetAriaDescription(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-description"), value, can_gc);
     }
 
     fn GetAriaDisabled(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-disabled"))
     }
 
-    fn SetAriaDisabled(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-disabled"), value);
+    fn SetAriaDisabled(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-disabled"), value, can_gc);
     }
 
     fn GetAriaExpanded(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-expanded"))
     }
 
-    fn SetAriaExpanded(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-expanded"), value);
+    fn SetAriaExpanded(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-expanded"), value, can_gc);
     }
 
     fn GetAriaHasPopup(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-haspopup"))
     }
 
-    fn SetAriaHasPopup(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-haspopup"), value);
+    fn SetAriaHasPopup(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-haspopup"), value, can_gc);
     }
 
     fn GetAriaHidden(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-hidden"))
     }
 
-    fn SetAriaHidden(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-hidden"), value);
+    fn SetAriaHidden(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-hidden"), value, can_gc);
     }
 
     fn GetAriaInvalid(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-invalid"))
     }
 
-    fn SetAriaInvalid(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-invalid"), value);
+    fn SetAriaInvalid(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-invalid"), value, can_gc);
     }
 
     fn GetAriaKeyShortcuts(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-keyshortcuts"))
     }
 
-    fn SetAriaKeyShortcuts(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-keyshortcuts"), value);
+    fn SetAriaKeyShortcuts(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-keyshortcuts"), value, can_gc);
     }
 
     fn GetAriaLabel(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-label"))
     }
 
-    fn SetAriaLabel(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-label"), value);
+    fn SetAriaLabel(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-label"), value, can_gc);
     }
 
     fn GetAriaLevel(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-level"))
     }
 
-    fn SetAriaLevel(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-level"), value);
+    fn SetAriaLevel(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-level"), value, can_gc);
     }
 
     fn GetAriaLive(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-live"))
     }
 
-    fn SetAriaLive(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-live"), value);
+    fn SetAriaLive(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-live"), value, can_gc);
     }
 
     fn GetAriaModal(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-modal"))
     }
 
-    fn SetAriaModal(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-modal"), value);
+    fn SetAriaModal(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-modal"), value, can_gc);
     }
 
     fn GetAriaMultiLine(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-multiline"))
     }
 
-    fn SetAriaMultiLine(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-multiline"), value);
+    fn SetAriaMultiLine(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-multiline"), value, can_gc);
     }
 
     fn GetAriaMultiSelectable(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-multiselectable"))
     }
 
-    fn SetAriaMultiSelectable(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-multiselectable"), value);
+    fn SetAriaMultiSelectable(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-multiselectable"), value, can_gc);
     }
 
     fn GetAriaOrientation(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-orientation"))
     }
 
-    fn SetAriaOrientation(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-orientation"), value);
+    fn SetAriaOrientation(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-orientation"), value, can_gc);
     }
 
     fn GetAriaPlaceholder(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-placeholder"))
     }
 
-    fn SetAriaPlaceholder(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-placeholder"), value);
+    fn SetAriaPlaceholder(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-placeholder"), value, can_gc);
     }
 
     fn GetAriaPosInSet(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-posinset"))
     }
 
-    fn SetAriaPosInSet(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-posinset"), value);
+    fn SetAriaPosInSet(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-posinset"), value, can_gc);
     }
 
     fn GetAriaPressed(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-pressed"))
     }
 
-    fn SetAriaPressed(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-pressed"), value);
+    fn SetAriaPressed(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-pressed"), value, can_gc);
     }
 
     fn GetAriaReadOnly(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-readonly"))
     }
 
-    fn SetAriaReadOnly(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-readonly"), value);
+    fn SetAriaReadOnly(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-readonly"), value, can_gc);
     }
 
     fn GetAriaRelevant(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-relevant"))
     }
 
-    fn SetAriaRelevant(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-relevant"), value);
+    fn SetAriaRelevant(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-relevant"), value, can_gc);
     }
 
     fn GetAriaRequired(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-required"))
     }
 
-    fn SetAriaRequired(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-required"), value);
+    fn SetAriaRequired(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-required"), value, can_gc);
     }
 
     fn GetAriaRoleDescription(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-roledescription"))
     }
 
-    fn SetAriaRoleDescription(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-roledescription"), value);
+    fn SetAriaRoleDescription(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-roledescription"), value, can_gc);
     }
 
     fn GetAriaRowCount(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-rowcount"))
     }
 
-    fn SetAriaRowCount(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-rowcount"), value);
+    fn SetAriaRowCount(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-rowcount"), value, can_gc);
     }
 
     fn GetAriaRowIndex(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-rowindex"))
     }
 
-    fn SetAriaRowIndex(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-rowindex"), value);
+    fn SetAriaRowIndex(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-rowindex"), value, can_gc);
     }
 
     fn GetAriaRowIndexText(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-rowindextext"))
     }
 
-    fn SetAriaRowIndexText(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-rowindextext"), value);
+    fn SetAriaRowIndexText(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-rowindextext"), value, can_gc);
     }
 
     fn GetAriaRowSpan(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-rowspan"))
     }
 
-    fn SetAriaRowSpan(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-rowspan"), value);
+    fn SetAriaRowSpan(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-rowspan"), value, can_gc);
     }
 
     fn GetAriaSelected(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-selected"))
     }
 
-    fn SetAriaSelected(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-selected"), value);
+    fn SetAriaSelected(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-selected"), value, can_gc);
     }
 
     fn GetAriaSetSize(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-setsize"))
     }
 
-    fn SetAriaSetSize(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-setsize"), value);
+    fn SetAriaSetSize(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-setsize"), value, can_gc);
     }
 
     fn GetAriaSort(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-sort"))
     }
 
-    fn SetAriaSort(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-sort"), value);
+    fn SetAriaSort(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-sort"), value, can_gc);
     }
 
     fn GetAriaValueMax(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-valuemax"))
     }
 
-    fn SetAriaValueMax(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-valuemax"), value);
+    fn SetAriaValueMax(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-valuemax"), value, can_gc);
     }
 
     fn GetAriaValueMin(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-valuemin"))
     }
 
-    fn SetAriaValueMin(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-valuemin"), value);
+    fn SetAriaValueMin(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-valuemin"), value, can_gc);
     }
 
     fn GetAriaValueNow(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-valuenow"))
     }
 
-    fn SetAriaValueNow(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-valuenow"), value);
+    fn SetAriaValueNow(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-valuenow"), value, can_gc);
     }
 
     fn GetAriaValueText(&self) -> Option<DOMString> {
         self.get_nullable_string_attribute(&local_name!("aria-valuetext"))
     }
 
-    fn SetAriaValueText(&self, value: Option<DOMString>) {
-        self.set_nullable_string_attribute(&local_name!("aria-valuetext"), value);
+    fn SetAriaValueText(&self, value: Option<DOMString>, can_gc: CanGc) {
+        self.set_nullable_string_attribute(&local_name!("aria-valuetext"), value, can_gc);
     }
 }
 
@@ -3325,7 +3463,7 @@ impl VirtualMethods for Element {
         let doc = node.owner_doc();
         match attr.local_name() {
             &local_name!("tabindex") | &local_name!("draggable") | &local_name!("hidden") => {
-                self.update_sequentially_focusable_status()
+                self.update_sequentially_focusable_status(CanGc::note())
             },
             &local_name!("style") => {
                 // Modifying the `style` attribute might change style.
@@ -3349,7 +3487,7 @@ impl VirtualMethods for Element {
                             attr.swap_value(&mut value);
                             block
                         } else {
-                            let win = window_from_node(self);
+                            let win = self.owner_window();
                             Arc::new(doc.style_shared_lock().wrap(parse_style_attribute(
                                 &attr.value(),
                                 &UrlExtraData(doc.base_url().get_arc()),
@@ -3373,8 +3511,9 @@ impl VirtualMethods for Element {
                         None
                     }
                 });
-                let containing_shadow_root = self.upcast::<Node>().containing_shadow_root();
-                if node.is_connected() {
+
+                let containing_shadow_root = self.containing_shadow_root();
+                if node.is_in_a_document_tree() || node.is_in_a_shadow_tree() {
                     let value = attr.value().as_atom().clone();
                     match mutation {
                         AttributeMutation::Set(old_value) => {
@@ -3475,33 +3614,27 @@ impl VirtualMethods for Element {
             f.bind_form_control_to_tree();
         }
 
-        let doc = document_from_node(self);
+        let doc = self.owner_document();
 
         if let Some(ref shadow_root) = self.shadow_root() {
-            doc.register_shadow_root(shadow_root);
-            let shadow_root = shadow_root.upcast::<Node>();
-            shadow_root.set_flag(NodeFlags::IS_CONNECTED, context.tree_connected);
-            for node in shadow_root.children() {
-                node.set_flag(NodeFlags::IS_CONNECTED, context.tree_connected);
-                node.bind_to_tree(context);
-            }
+            shadow_root.bind_to_tree(context);
         }
 
-        if !context.tree_connected {
+        if !context.is_in_tree() {
             return;
         }
 
-        self.update_sequentially_focusable_status();
+        self.update_sequentially_focusable_status(CanGc::note());
 
         if let Some(ref id) = *self.id_attribute.borrow() {
-            if let Some(shadow_root) = self.upcast::<Node>().containing_shadow_root() {
+            if let Some(shadow_root) = self.containing_shadow_root() {
                 shadow_root.register_element_id(self, id.clone());
             } else {
                 doc.register_element_id(self, id.clone());
             }
         }
         if let Some(ref name) = self.name_attribute() {
-            if self.upcast::<Node>().containing_shadow_root().is_none() {
+            if self.containing_shadow_root().is_none() {
                 doc.register_element_name(self, name.clone());
             }
         }
@@ -3520,33 +3653,33 @@ impl VirtualMethods for Element {
             f.unbind_form_control_from_tree();
         }
 
-        if !context.tree_connected {
+        if !context.tree_is_in_a_document_tree && !context.tree_is_in_a_shadow_tree {
             return;
         }
 
-        self.update_sequentially_focusable_status();
+        self.update_sequentially_focusable_status(CanGc::note());
 
-        let doc = document_from_node(self);
-
-        if let Some(ref shadow_root) = self.shadow_root() {
-            doc.unregister_shadow_root(shadow_root);
-            let shadow_root = shadow_root.upcast::<Node>();
-            shadow_root.set_flag(NodeFlags::IS_CONNECTED, false);
-            for node in shadow_root.children() {
-                node.set_flag(NodeFlags::IS_CONNECTED, false);
-                node.unbind_from_tree(context);
-            }
-        }
+        let doc = self.owner_document();
 
         let fullscreen = doc.GetFullscreenElement();
         if fullscreen.as_deref() == Some(self) {
-            doc.exit_fullscreen();
+            doc.exit_fullscreen(CanGc::note());
         }
         if let Some(ref value) = *self.id_attribute.borrow() {
-            doc.unregister_element_id(self, value.clone());
+            if let Some(ref shadow_root) = self.containing_shadow_root() {
+                // Only unregister the element id if the node was disconnected from it's shadow root
+                // (as opposed to the whole shadow tree being disconnected as a whole)
+                if !self.upcast::<Node>().is_in_a_shadow_tree() {
+                    shadow_root.unregister_element_id(self, value.clone());
+                }
+            } else {
+                doc.unregister_element_id(self, value.clone());
+            }
         }
         if let Some(ref value) = self.name_attribute() {
-            doc.unregister_element_name(self, value.clone());
+            if self.containing_shadow_root().is_none() {
+                doc.unregister_element_name(self, value.clone());
+            }
         }
         // This is used for layout optimization.
         doc.decrement_dom_count();
@@ -3582,7 +3715,7 @@ impl VirtualMethods for Element {
     fn adopting_steps(&self, old_doc: &Document) {
         self.super_type().unwrap().adopting_steps(old_doc);
 
-        if document_from_node(self).is_html_document() != old_doc.is_html_document() {
+        if self.owner_document().is_html_document() != old_doc.is_html_document() {
             self.tag_name.clear();
         }
     }
@@ -3608,8 +3741,7 @@ impl SelectorsElement for DomRoot<Element> {
     }
 
     fn containing_shadow_host(&self) -> Option<Self> {
-        self.upcast::<Node>()
-            .containing_shadow_root()
+        self.containing_shadow_root()
             .map(|shadow_root| shadow_root.Host())
     }
 
@@ -3848,7 +3980,7 @@ impl SelectorsElement for DomRoot<Element> {
 }
 
 impl Element {
-    fn client_rect(&self) -> Rect<i32> {
+    fn client_rect(&self, can_gc: CanGc) -> Rect<i32> {
         let doc = self.node.owner_doc();
 
         if let Some(rect) = self
@@ -3865,7 +3997,7 @@ impl Element {
             }
         }
 
-        let mut rect = self.upcast::<Node>().client_rect();
+        let mut rect = self.upcast::<Node>().client_rect(can_gc);
         let in_quirks_mode = doc.quirks_mode() == QuirksMode::Quirks;
 
         if (in_quirks_mode && doc.GetBody().as_deref() == self.downcast::<HTMLElement>()) ||
@@ -3875,7 +4007,7 @@ impl Element {
             rect.size = Size2D::<i32>::new(viewport_dimensions.width, viewport_dimensions.height);
         }
 
-        self.ensure_rare_data().client_rect = Some(window_from_node(self).cache_layout_value(rect));
+        self.ensure_rare_data().client_rect = Some(self.owner_window().cache_layout_value(rect));
         rect
     }
 
@@ -4044,7 +4176,7 @@ impl Element {
     // https://html.spec.whatwg.org/multipage/#language
     pub fn get_lang(&self) -> String {
         self.upcast::<Node>()
-            .inclusive_ancestors(ShadowIncluding::No)
+            .inclusive_ancestors(ShadowIncluding::Yes)
             .filter_map(|node| {
                 node.downcast::<Element>().and_then(|el| {
                     el.get_attribute(&ns!(xml), &local_name!("lang"))
@@ -4153,7 +4285,7 @@ impl Element {
 
     // https://html.spec.whatwg.org/multipage/#cannot-navigate
     pub fn cannot_navigate(&self) -> bool {
-        let document = document_from_node(self);
+        let document = self.owner_document();
 
         // Step 1.
         !document.is_fully_active() ||
@@ -4232,7 +4364,7 @@ pub enum AttributeMutation<'a> {
     Removed,
 }
 
-impl<'a> AttributeMutation<'a> {
+impl AttributeMutation<'_> {
     pub fn is_removal(&self) -> bool {
         match *self {
             AttributeMutation::Removed => true,
@@ -4312,13 +4444,13 @@ impl TaskOnce for ElementPerformFullscreenEnter {
     fn run_once(self) {
         let element = self.element.root();
         let promise = self.promise.root();
-        let document = document_from_node(&*element);
+        let document = element.owner_document();
 
         // Step 7.1
         if self.error || !element.fullscreen_element_ready_check() {
             document
                 .upcast::<EventTarget>()
-                .fire_event(atom!("fullscreenerror"));
+                .fire_event(atom!("fullscreenerror"), CanGc::note());
             promise.reject_error(Error::Type(String::from("fullscreen is not connected")));
             return;
         }
@@ -4327,14 +4459,11 @@ impl TaskOnce for ElementPerformFullscreenEnter {
         // Step 7.5
         element.set_fullscreen_state(true);
         document.set_fullscreen_element(Some(&element));
-        document
-            .window()
-            .reflow(ReflowGoal::Full, ReflowReason::ElementStateChanged);
 
         // Step 7.6
         document
             .upcast::<EventTarget>()
-            .fire_event(atom!("fullscreenchange"));
+            .fire_event(atom!("fullscreenchange"), CanGc::note());
 
         // Step 7.7
         promise.resolve_native(&());
@@ -4359,21 +4488,16 @@ impl TaskOnce for ElementPerformFullscreenExit {
     #[allow(crown::unrooted_must_root)]
     fn run_once(self) {
         let element = self.element.root();
-        let document = document_from_node(&*element);
+        let document = element.owner_document();
         // TODO Step 9.1-5
         // Step 9.6
         element.set_fullscreen_state(false);
-
-        document
-            .window()
-            .reflow(ReflowGoal::Full, ReflowReason::ElementStateChanged);
-
         document.set_fullscreen_element(None);
 
         // Step 9.8
         document
             .upcast::<EventTarget>()
-            .fire_event(atom!("fullscreenchange"));
+            .fire_event(atom!("fullscreenchange"), CanGc::note());
 
         // Step 9.10
         self.promise.root().resolve_native(&());
@@ -4393,9 +4517,9 @@ pub fn reflect_cross_origin_attribute(element: &Element) -> Option<DOMString> {
     None
 }
 
-pub fn set_cross_origin_attribute(element: &Element, value: Option<DOMString>) {
+pub fn set_cross_origin_attribute(element: &Element, value: Option<DOMString>, can_gc: CanGc) {
     match value {
-        Some(val) => element.set_string_attribute(&local_name!("crossorigin"), val),
+        Some(val) => element.set_string_attribute(&local_name!("crossorigin"), val, can_gc),
         None => {
             element.remove_attribute(&ns!(), &local_name!("crossorigin"));
         },
@@ -4423,11 +4547,11 @@ pub fn reflect_referrer_policy_attribute(element: &Element) -> DOMString {
     DOMString::new()
 }
 
-pub(crate) fn referrer_policy_for_element(element: &Element) -> Option<ReferrerPolicy> {
+pub(crate) fn referrer_policy_for_element(element: &Element) -> ReferrerPolicy {
     element
         .get_attribute_by_name(DOMString::from_string(String::from("referrerpolicy")))
-        .and_then(|attribute: DomRoot<Attr>| determine_policy_for_token(&attribute.Value()))
-        .or_else(|| document_from_node(element).get_referrer_policy())
+        .map(|attribute: DomRoot<Attr>| determine_policy_for_token(&attribute.Value()))
+        .unwrap_or(element.owner_document().get_referrer_policy())
 }
 
 pub(crate) fn cors_setting_for_element(element: &Element) -> Option<CorsSettings> {

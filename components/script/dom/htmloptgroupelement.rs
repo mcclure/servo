@@ -20,6 +20,7 @@ use crate::dom::node::{BindContext, Node, ShadowIncluding, UnbindContext};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct HTMLOptGroupElement {
@@ -48,6 +49,7 @@ impl HTMLOptGroupElement {
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLOptGroupElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLOptGroupElement::new_inherited(
@@ -55,6 +57,7 @@ impl HTMLOptGroupElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -72,7 +75,7 @@ impl HTMLOptGroupElement {
     }
 }
 
-impl HTMLOptGroupElementMethods for HTMLOptGroupElement {
+impl HTMLOptGroupElementMethods<crate::DomTypeHolder> for HTMLOptGroupElement {
     // https://html.spec.whatwg.org/multipage/#dom-optgroup-disabled
     make_bool_getter!(Disabled, "disabled");
 

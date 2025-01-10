@@ -8,6 +8,7 @@ use serde::Serialize;
 use servo_atoms::Atom;
 use servo_url::ServoUrl;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
 use crate::dom::bindings::codegen::Bindings::SecurityPolicyViolationEventBinding::{
     SecurityPolicyViolationEventDisposition, SecurityPolicyViolationEventInit,
@@ -19,6 +20,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::securitypolicyviolationevent::SecurityPolicyViolationEvent;
 use crate::dom::types::GlobalScope;
+use crate::script_runtime::CanGc;
 use crate::task::TaskOnce;
 
 pub struct CSPViolationReporter {
@@ -100,7 +102,7 @@ impl CSPViolationReporter {
         }
     }
 
-    fn fire_violation_event(&self) {
+    fn fire_violation_event(&self, can_gc: CanGc) {
         let target = self.target.root();
         let global = &target.global();
         let report = self.get_report(global);
@@ -110,10 +112,11 @@ impl CSPViolationReporter {
             Atom::from("securitypolicyviolation"),
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
-            &report.into(),
+            &report.convert(),
+            can_gc,
         );
 
-        event.upcast::<Event>().fire(&target);
+        event.upcast::<Event>().fire(&target, can_gc);
     }
 
     /// <https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>
@@ -142,26 +145,26 @@ impl TaskOnce for CSPViolationReporter {
         // > If target implements EventTarget, fire an event named securitypolicyviolation
         // > that uses the SecurityPolicyViolationEvent interface
         // > at target with its attributes initialized as follows:
-        self.fire_violation_event();
+        self.fire_violation_event(CanGc::note());
         // TODO: Support `report-to` directive that corresponds to 5.5.3.5.
     }
 }
 
-impl From<SecurityPolicyViolationReport> for SecurityPolicyViolationEventInit {
-    fn from(value: SecurityPolicyViolationReport) -> Self {
+impl Convert<SecurityPolicyViolationEventInit> for SecurityPolicyViolationReport {
+    fn convert(self) -> SecurityPolicyViolationEventInit {
         SecurityPolicyViolationEventInit {
-            sample: value.sample.unwrap_or_default().into(),
-            blockedURI: value.blocked_url.into(),
-            referrer: value.referrer.into(),
-            statusCode: value.status_code,
-            documentURI: value.document_url.into(),
-            sourceFile: value.source_file.into(),
-            violatedDirective: value.violated_directive.into(),
-            effectiveDirective: value.effective_directive.into(),
-            lineNumber: value.line_number,
-            columnNumber: value.column_number,
-            originalPolicy: value.original_policy.into(),
-            disposition: value.disposition,
+            sample: self.sample.unwrap_or_default().into(),
+            blockedURI: self.blocked_url.into(),
+            referrer: self.referrer.into(),
+            statusCode: self.status_code,
+            documentURI: self.document_url.into(),
+            sourceFile: self.source_file.into(),
+            violatedDirective: self.violated_directive.into(),
+            effectiveDirective: self.effective_directive.into(),
+            lineNumber: self.line_number,
+            columnNumber: self.column_number,
+            originalPolicy: self.original_policy.into(),
+            disposition: self.disposition,
             parent: EventInit::empty(),
         }
     }

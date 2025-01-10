@@ -3,25 +3,27 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use js::jsval::JSVal;
+use js::rust::MutableHandleValue;
 
 use crate::dom::bindings::codegen::Bindings::WorkerNavigatorBinding::WorkerNavigatorMethods;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::to_frozen_array;
-use crate::dom::gpu::GPU;
 use crate::dom::navigator::hardware_concurrency;
 use crate::dom::navigatorinfo;
 use crate::dom::permissions::Permissions;
+#[cfg(feature = "webgpu")]
+use crate::dom::webgpu::gpu::GPU;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 // https://html.spec.whatwg.org/multipage/#workernavigator
 #[dom_struct]
 pub struct WorkerNavigator {
     reflector_: Reflector,
     permissions: MutNullableDom<Permissions>,
+    #[cfg(feature = "webgpu")]
     gpu: MutNullableDom<GPU>,
 }
 
@@ -30,16 +32,21 @@ impl WorkerNavigator {
         WorkerNavigator {
             reflector_: Reflector::new(),
             permissions: Default::default(),
+            #[cfg(feature = "webgpu")]
             gpu: Default::default(),
         }
     }
 
     pub fn new(global: &WorkerGlobalScope) -> DomRoot<WorkerNavigator> {
-        reflect_dom_object(Box::new(WorkerNavigator::new_inherited()), global)
+        reflect_dom_object(
+            Box::new(WorkerNavigator::new_inherited()),
+            global,
+            CanGc::note(),
+        )
     }
 }
 
-impl WorkerNavigatorMethods for WorkerNavigator {
+impl WorkerNavigatorMethods<crate::DomTypeHolder> for WorkerNavigator {
     // https://html.spec.whatwg.org/multipage/#dom-navigator-product
     fn Product(&self) -> DOMString {
         navigatorinfo::Product()
@@ -97,8 +104,8 @@ impl WorkerNavigatorMethods for WorkerNavigator {
 
     // https://html.spec.whatwg.org/multipage/#dom-navigator-languages
     #[allow(unsafe_code)]
-    fn Languages(&self, cx: JSContext) -> JSVal {
-        to_frozen_array(&[self.Language()], cx)
+    fn Languages(&self, cx: JSContext, retval: MutableHandleValue) {
+        to_frozen_array(&[self.Language()], cx, retval)
     }
 
     // https://w3c.github.io/permissions/#navigator-and-workernavigator-extension
@@ -108,6 +115,7 @@ impl WorkerNavigatorMethods for WorkerNavigator {
     }
 
     // https://gpuweb.github.io/gpuweb/#dom-navigator-gpu
+    #[cfg(feature = "webgpu")]
     fn Gpu(&self) -> DomRoot<GPU> {
         self.gpu.or_init(|| GPU::new(&self.global()))
     }

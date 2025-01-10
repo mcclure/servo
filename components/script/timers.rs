@@ -10,43 +10,39 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use deny_public_fields::DenyPublicFields;
-use ipc_channel::ipc::IpcSender;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::HandleValue;
-use script_traits::{TimerEvent, TimerEventId, TimerEventRequest, TimerSchedulerMsg, TimerSource};
 use servo_config::pref;
+use timers::{BoxedTimerCallback, TimerEvent, TimerEventId, TimerEventRequest, TimerSource};
 
 use crate::dom::bindings::callback::ExceptionHandling::Report;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::FakeRequestAnimationFrameCallback;
 use crate::dom::eventsource::EventSourceTimeoutCallback;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlmetaelement::RefreshRedirectDue;
 use crate::dom::testbinding::TestBindingCallback;
+use crate::dom::types::{Window, WorkerGlobalScope};
 use crate::dom::xmlhttprequest::XHRTimeoutCallback;
 use crate::script_module::ScriptFetchOptions;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
+use crate::task_source::SendableTaskSource;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
 pub struct OneshotTimerHandle(i32);
 
 #[derive(DenyPublicFields, JSTraceable, MallocSizeOf)]
 pub struct OneshotTimers {
+    global_scope: DomRoot<GlobalScope>,
     js_timers: JsTimers,
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
-    /// The sender, to be cloned for each timer,
-    /// on which the timer scheduler in the constellation can send an event
-    /// when the timer is due.
-    timer_event_chan: DomRefCell<Option<IpcSender<TimerEvent>>>,
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
-    /// The sender to the timer scheduler in the constellation.
-    scheduler_chan: IpcSender<TimerSchedulerMsg>,
     next_timer_handle: Cell<OneshotTimerHandle>,
     timers: DomRefCell<Vec<OneshotTimer>>,
     suspended_since: Cell<Option<Instant>>,
@@ -88,14 +84,14 @@ pub enum OneshotTimerCallback {
 }
 
 impl OneshotTimerCallback {
-    fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers) {
+    fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers, can_gc: CanGc) {
         match self {
-            OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(),
+            OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(can_gc),
             OneshotTimerCallback::EventSourceTimeout(callback) => callback.invoke(),
-            OneshotTimerCallback::JsTimer(task) => task.invoke(this, js_timers),
+            OneshotTimerCallback::JsTimer(task) => task.invoke(this, js_timers, can_gc),
             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(),
-            OneshotTimerCallback::FakeRequestAnimationFrame(callback) => callback.invoke(),
-            OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(),
+            OneshotTimerCallback::FakeRequestAnimationFrame(callback) => callback.invoke(can_gc),
+            OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(can_gc),
         }
     }
 }
@@ -123,23 +119,16 @@ impl PartialEq for OneshotTimer {
 }
 
 impl OneshotTimers {
-    pub fn new(scheduler_chan: IpcSender<TimerSchedulerMsg>) -> OneshotTimers {
+    pub fn new(global_scope: &GlobalScope) -> OneshotTimers {
         OneshotTimers {
+            global_scope: DomRoot::from_ref(global_scope),
             js_timers: JsTimers::default(),
-            timer_event_chan: DomRefCell::new(None),
-            scheduler_chan,
             next_timer_handle: Cell::new(OneshotTimerHandle(1)),
             timers: DomRefCell::new(Vec::new()),
             suspended_since: Cell::new(None),
             suspension_offset: Cell::new(Duration::ZERO),
             expected_event_id: Cell::new(TimerEventId(0)),
         }
-    }
-
-    pub fn setup_scheduling(&self, timer_event_chan: IpcSender<TimerEvent>) {
-        let mut chan = self.timer_event_chan.borrow_mut();
-        assert!(chan.is_none());
-        *chan = Some(timer_event_chan);
     }
 
     pub fn schedule_callback(
@@ -190,7 +179,7 @@ impl OneshotTimers {
         }
     }
 
-    pub fn fire_timer(&self, id: TimerEventId, global: &GlobalScope) {
+    pub fn fire_timer(&self, id: TimerEventId, global: &GlobalScope, can_gc: CanGc) {
         let expected_id = self.expected_event_id.get();
         if expected_id != id {
             debug!(
@@ -233,7 +222,7 @@ impl OneshotTimers {
                 return;
             }
             let callback = timer.callback;
-            callback.invoke(global, &self.js_timers);
+            callback.invoke(global, &self.js_timers, can_gc);
         }
 
         self.schedule_timer_call();
@@ -290,24 +279,29 @@ impl OneshotTimers {
         }
 
         let timers = self.timers.borrow();
+        let Some(timer) = timers.last() else {
+            return;
+        };
 
-        if let Some(timer) = timers.last() {
-            let expected_event_id = self.invalidate_expected_event_id();
-
-            let delay = timer.scheduled_for - Instant::now();
-            let request = TimerEventRequest(
-                self.timer_event_chan
-                    .borrow()
-                    .clone()
-                    .expect("Timer event chan not setup to schedule timers."),
-                timer.source,
-                expected_event_id,
-                delay,
-            );
-            self.scheduler_chan
-                .send(TimerSchedulerMsg(request))
-                .unwrap();
+        let callback = TimerListener {
+            context: Trusted::new(&*self.global_scope),
+            task_source: self
+                .global_scope
+                .task_manager()
+                .timer_task_source()
+                .to_sendable(),
         }
+        .into_callback();
+
+        let expected_event_id = self.invalidate_expected_event_id();
+        let event_request = TimerEventRequest {
+            callback,
+            source: timer.source,
+            id: expected_event_id,
+            duration: timer.scheduled_for - Instant::now(),
+        };
+
+        self.global_scope.schedule_timer(event_request);
     }
 
     fn invalidate_expected_event_id(&self) -> TimerEventId {
@@ -536,7 +530,7 @@ fn clamp_duration(nesting_level: u32, unclamped: Duration) -> Duration {
 
 impl JsTimerTask {
     // see https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
-    pub fn invoke<T: DomObject>(self, this: &T, timers: &JsTimers) {
+    pub fn invoke<T: DomObject>(self, this: &T, timers: &JsTimers, can_gc: CanGc) {
         // step 4.1 can be ignored, because we proactively prevent execution
         // of this task when its scheduled execution is canceled.
 
@@ -557,11 +551,13 @@ impl JsTimerTask {
                     rval.handle_mut(),
                     ScriptFetchOptions::default_classic_script(&global),
                     global.api_base_url(),
+                    can_gc,
                 );
             },
             InternalTimerCallback::FunctionTimerCallback(ref function, ref arguments) => {
                 let arguments = self.collect_heap_args(arguments);
-                let _ = function.Call_(this, arguments, Report);
+                rooted!(in(*GlobalScope::get_cx()) let mut value: JSVal);
+                let _ = function.Call_(this, arguments, value.handle_mut(), Report);
             },
         };
         ScriptThread::set_user_interacting(was_user_interacting);
@@ -586,5 +582,42 @@ impl JsTimerTask {
         args.iter()
             .map(|arg| unsafe { HandleValue::from_raw(arg.handle()) })
             .collect()
+    }
+}
+
+/// A wrapper between timer events coming in over IPC, and the event-loop.
+#[derive(Clone)]
+struct TimerListener {
+    task_source: SendableTaskSource,
+    context: Trusted<GlobalScope>,
+}
+
+impl TimerListener {
+    /// Handle a timer-event coming from the [`timers::TimerScheduler`]
+    /// by queuing the appropriate task on the relevant event-loop.
+    fn handle(&self, event: TimerEvent) {
+        let context = self.context.clone();
+        // Step 18, queue a task,
+        // https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
+        self.task_source.queue(task!(timer_event: move || {
+                let global = context.root();
+                let TimerEvent(source, id) = event;
+                match source {
+                    TimerSource::FromWorker => {
+                        global.downcast::<WorkerGlobalScope>().expect("Window timer delivered to worker");
+                    },
+                    TimerSource::FromWindow(pipeline) => {
+                        assert_eq!(pipeline, global.pipeline_id());
+                        global.downcast::<Window>().expect("Worker timer delivered to window");
+                    },
+                };
+                // Step 7, substeps run in a task.
+                global.fire_timer(id, CanGc::note());
+            })
+        );
+    }
+
+    fn into_callback(self) -> BoxedTimerCallback {
+        Box::new(move |timer_event| self.handle(timer_event))
     }
 }
