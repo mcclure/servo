@@ -2106,12 +2106,6 @@ where
             FromLayoutMsg::PendingPaintMetric(pipeline_id, epoch) => {
                 self.handle_pending_paint_metric(pipeline_id, epoch);
             },
-            // Forward cutout to Cuervo
-            FromLayoutMsg::CuervoReportStrings(v) => {
-                self
-                    .embedder_proxy
-                    .send((None, EmbedderMsg::CuervoReportStrings(v)));
-            }
         }
     }
 

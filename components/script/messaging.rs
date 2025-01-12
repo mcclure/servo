@@ -89,6 +89,7 @@ impl MixedMessage {
                 ConstellationControlMsg::SetWebGPUPort(..) => None,
                 ConstellationControlMsg::SetScrollStates(id, ..) => Some(id),
                 ConstellationControlMsg::SetEpochPaintTime(id, ..) => Some(id),
+                ConstellationControlMsg::CuervoReportStrings(id, ..) => Some(id),
             },
             MixedMessage::FromScript(ref inner_msg) => match *inner_msg {
                 MainThreadScriptMsg::Common(CommonScriptMsg::Task(_, _, pipeline_id, _)) => {
@@ -104,6 +105,7 @@ impl MixedMessage {
             MixedMessage::FromDevtools(_) | MixedMessage::TimerFired => None,
             #[cfg(feature = "webgpu")]
             MixedMessage::FromWebGPUServer(..) => None,
+
         }
     }
 }

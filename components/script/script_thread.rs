@@ -1962,6 +1962,12 @@ impl ScriptThread {
             ConstellationControlMsg::SetEpochPaintTime(pipeline_id, epoch, time) => {
                 self.handle_set_epoch_paint_time(pipeline_id, epoch, time)
             },
+            // Forward cutout to Cuervo
+            ConstellationControlMsg::CuervoReportStrings(pipeline_id, v) => {
+                self.documents.borrow().find_window(pipeline_id).unwrap()
+                    .send_to_embedder(EmbedderMsg::CuervoReportStrings(v));
+            }
+
         }
     }
 

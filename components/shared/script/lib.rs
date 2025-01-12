@@ -406,6 +406,8 @@ pub enum ConstellationControlMsg {
     SetScrollStates(PipelineId, Vec<ScrollState>),
     /// Send the paint time for a specific epoch.
     SetEpochPaintTime(PipelineId, Epoch, CrossProcessInstant),
+    /// Special message for hacked Cuervo text browser
+    CuervoReportStrings(PipelineId, Vec<String>),
 }
 
 impl fmt::Debug for ConstellationControlMsg {
@@ -447,6 +449,7 @@ impl fmt::Debug for ConstellationControlMsg {
             SetWebGPUPort(..) => "SetWebGPUPort",
             SetScrollStates(..) => "SetScrollStates",
             SetEpochPaintTime(..) => "SetEpochPaintTime",
+            CuervoReportStrings(..) => "CuervoReportStrings",
         };
         write!(formatter, "ConstellationControlMsg::{}", variant)
     }

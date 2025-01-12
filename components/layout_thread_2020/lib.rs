@@ -759,6 +759,7 @@ impl LayoutThread {
         };
 
         if token.should_traverse() {
+            use log::warn;
             #[cfg(feature = "tracing")]
             let _span =
                 tracing::trace_span!("driver::traverse_dom", servo_profiling = true).entered();
@@ -768,12 +769,13 @@ impl LayoutThread {
             let root_node = root_element.as_node();
             let mut box_tree = self.box_tree.borrow_mut();
             let box_tree = &mut *box_tree;
-            let closure_constellation_chan = self.constellation_chan.to_owned();
+            let closure_constellation_chan = self.script_chan.to_owned();
+            let id = self.id;
             let mut build_box_tree = || {
                 if !BoxTree::update(traversal.context(), dirty_root) {
                     {
                         let text_vec = traversal.vec.read().unwrap().clone();
-                        let msg = ConstellationMsg::CuervoReportStrings(text_vec);
+                        let msg = ConstellationControlMsg::CuervoReportStrings(id, text_vec);
                         (move || { // Black magic to move closure_constellation_chan but not box_tree
                             if let Err(e) = closure_constellation_chan.send(msg) {
                                 warn!("Sending event to constellation failed ({:?}).", e);

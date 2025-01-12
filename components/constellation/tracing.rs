@@ -259,7 +259,6 @@ mod from_layout {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::PendingPaintMetric(..) => target!("PendingPaintMetric"),
-                Self::CuervoReportStrings(..) => target!("CuervoReportStrings"),
             }
         }
     }
