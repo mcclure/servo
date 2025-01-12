@@ -33,7 +33,7 @@ use layout::query::{
     process_node_geometry_request, process_node_scroll_area_request, process_offset_parent_query,
     process_resolved_font_style_query, process_resolved_style_request, process_text_index_request,
 };
-use layout::traversal::{RecalcStyle, RecalcCuervo};
+use layout::traversal::RecalcCuervo;
 use layout::{layout_debug, BoxTree, FragmentTree};
 use log::{debug, error};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -771,7 +771,7 @@ impl LayoutThread {
             let box_tree = &mut *box_tree;
             let closure_constellation_chan = self.script_chan.to_owned();
             let id = self.id;
-            let mut build_box_tree = || {
+            let build_box_tree = || {
                 if !BoxTree::update(traversal.context(), dirty_root) {
                     {
                         let text_vec = traversal.vec.read().unwrap().clone();
