@@ -1964,8 +1964,10 @@ impl ScriptThread {
             },
             // Forward cutout to Cuervo
             ConstellationControlMsg::CuervoReportStrings(pipeline_id, v) => {
-                self.documents.borrow().find_window(pipeline_id).unwrap()
-                    .send_to_embedder(EmbedderMsg::CuervoReportStrings(v));
+                if let Some(window) = self.documents.borrow().find_window(pipeline_id) {
+                    // FIXME: What does the "None" case mean? Should failure be reported?
+                    window.send_to_embedder(EmbedderMsg::CuervoReportStrings(v));
+                }
             }
 
         }
